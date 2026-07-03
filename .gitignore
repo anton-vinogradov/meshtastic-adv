@@ -1,0 +1,17 @@
+# PlatformIO
+.pio/
+.pioenvs/
+.piolibdeps/
+*.pyc
+
+# Build artifacts / flashable images
+*.bin
+*.elf
+*.map
+*.hex
+
+# Editors / OS
+.vscode/
+.idea/
+.DS_Store
+*.swp

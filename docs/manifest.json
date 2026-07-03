@@ -7,7 +7,7 @@
       "chipFamily": "ESP32-S3",
       "parts": [
         {
-          "path": "https://github.com/anton-vinogradov/meshtastic-adv/releases/latest/download/firmware.factory.bin",
+          "path": "firmware.factory.bin",
           "offset": 0
         }
       ]

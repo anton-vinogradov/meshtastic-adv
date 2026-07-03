@@ -9,6 +9,8 @@
 *.elf
 *.map
 *.hex
+# ...except the installer image, served same-origin by GitHub Pages
+!docs/firmware.factory.bin
 
 # Editors / OS
 .vscode/

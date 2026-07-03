@@ -1,3 +1,4 @@
 [submodule "firmware"]
 	path = firmware
-	url = https://github.com/meshtastic/firmware.git
+	url = https://github.com/anton-vinogradov/meshtastic-adv-firmware.git
+	branch = advui

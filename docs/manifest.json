@@ -1,0 +1,16 @@
+{
+  "name": "meshtastic-adv",
+  "version": "2.8.0-m0-baseline (stock)",
+  "new_install_prompt_erase": true,
+  "builds": [
+    {
+      "chipFamily": "ESP32-S3",
+      "parts": [
+        {
+          "path": "https://github.com/anton-vinogradov/meshtastic-adv/releases/latest/download/firmware.factory.bin",
+          "offset": 0
+        }
+      ]
+    }
+  ]
+}

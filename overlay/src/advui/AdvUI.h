@@ -94,6 +94,8 @@ class AdvUI : public concurrency::OSThread
 
     char msgBuf[200] = {0};   // compose buffer (MODE_COMPOSE)
     uint8_t msgLen = 0;
+    bool ruMode = false;      // transliterated Cyrillic input layer (Fn+L)
+    char pendingLat = 0;      // last Latin letter that may still start a digraph (sh/ya/...)
 
     char nameBuf[25] = {0};   // node-name editor buffer (MODE_SETNAME)
     uint8_t nameLen = 0;

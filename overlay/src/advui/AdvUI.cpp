@@ -541,6 +541,86 @@ void msgTimePrefix(uint32_t rxTime, int32_t tzOff, char *out, int cap)
     snprintf(out, cap, "%02u:%02u ", (unsigned)((local / 3600u) % 24u), (unsigned)((local / 60u) % 60u));
 }
 
+// --- Transliterated Cyrillic input (Fn+L) --------------------------------------
+// Phonetic Latin->Cyrillic with the usual digraphs (sh ш, zh ж, ch ч, ya/yu/yo/ye)
+// and singles w->щ, j->й, x->ъ, '->ь. A letter is emitted immediately and morphed
+// in place when it turns out to be the head of a digraph.
+uint16_t translitSingle(char l)
+{
+    switch (l) {
+    case 'a': return 0x430; case 'b': return 0x431; case 'v': return 0x432; case 'g': return 0x433;
+    case 'd': return 0x434; case 'e': return 0x435; case 'z': return 0x437; case 'i': return 0x438;
+    case 'j': return 0x439; case 'k': return 0x43A; case 'l': return 0x43B; case 'm': return 0x43C;
+    case 'n': return 0x43D; case 'o': return 0x43E; case 'p': return 0x43F; case 'r': return 0x440;
+    case 's': return 0x441; case 't': return 0x442; case 'u': return 0x443; case 'f': return 0x444;
+    case 'h': return 0x445; case 'c': return 0x446; case 'y': return 0x44B; case 'w': return 0x449;
+    case 'x': return 0x44A; case 'q': return 0x44F;
+    default: return 0;
+    }
+}
+uint16_t translitDigraph(char a, char b)
+{
+    if (b == 'h') {
+        if (a == 's') return 0x448; // ш
+        if (a == 'z') return 0x436; // ж
+        if (a == 'c') return 0x447; // ч
+    }
+    if (a == 'y') {
+        if (b == 'a') return 0x44F; // я
+        if (b == 'u') return 0x44E; // ю
+        if (b == 'o') return 0x451; // ё
+        if (b == 'e') return 0x44D; // э
+    }
+    return 0;
+}
+inline char lowerc(char c) { return (c >= 'A' && c <= 'Z') ? c + 32 : c; }
+inline bool isUp(char c) { return c >= 'A' && c <= 'Z'; }
+uint16_t translitCase(uint16_t cp, bool upper)
+{
+    if (!upper) return cp;
+    if (cp == 0x451) return 0x401; // ё -> Ё
+    if (cp >= 0x430 && cp <= 0x44F) return cp - 0x20;
+    return cp;
+}
+void appendCp(char *buf, uint8_t &len, size_t cap, uint16_t cp)
+{
+    if ((size_t)len + 2 >= cap) return;
+    buf[len++] = 0xC0 | (cp >> 6);
+    buf[len++] = 0x80 | (cp & 0x3F);
+    buf[len] = 0;
+}
+// Feeds one typed key through the translit layer; may morph the previous letter.
+void translitFeed(char *buf, uint8_t &len, size_t cap, char raw, char &pending)
+{
+    if (pending) {
+        uint16_t cp = translitDigraph(lowerc(pending), lowerc(raw));
+        if (cp) {
+            if (len >= 2) { // drop the single already emitted, replace with the digraph
+                len -= 2;
+                buf[len] = 0;
+            }
+            appendCp(buf, len, cap, translitCase(cp, isUp(pending)));
+            pending = 0;
+            return;
+        }
+        pending = 0;
+    }
+    if (raw == '\'') {
+        appendCp(buf, len, cap, 0x44C); // ь
+        return;
+    }
+    uint16_t cp = translitSingle(lowerc(raw));
+    if (cp) {
+        appendCp(buf, len, cap, translitCase(cp, isUp(raw)));
+        char l = lowerc(raw);
+        pending = (l == 's' || l == 'z' || l == 'c' || l == 'y') ? raw : 0;
+    } else if ((size_t)len + 1 < cap) {
+        buf[len++] = raw; // digits / punctuation pass through literally
+        buf[len] = 0;
+        pending = 0;
+    }
+}
+
 constexpr int kEmoteAdv = 18; // on-screen advance for a 16px emoji glyph (+2px gap)
 
 // Curated palette shown in the emoji picker (labels match graphics::emotes[] exactly).
@@ -1243,14 +1323,20 @@ void AdvUI::drawNode()
         char cbuf[210];
         snprintf(cbuf, sizeof(cbuf), "%s_", msgBuf);
         const char *shown = cbuf; // drop leading tokens so the cursor stays visible
-        while (lineWidthEmotes(g, shown) > 232) {
+        while (lineWidthEmotes(g, shown) > 212) { // leave room for the RU/EN badge
             const graphics::Emote *em = nullptr;
             int el = emoteMatch(shown, &em);
             shown += el > 0 ? el : utf8Len((unsigned char)*shown);
         }
         printLineEmotes(g, 4, 118, shown, 0xFFE0); // yellow, emoji inline
+        g->fillRect(216, 116, 24, 13, 0x0000); // input-mode badge (Fn+L toggles)
+        g->setFont(&lgfx::fonts::Font0);
+        g->setTextSize(1);
+        g->setTextColor(ruMode ? 0x07FF : 0x630C);
+        g->setCursor(220, 119);
+        g->print(ruMode ? "RU" : "EN");
     } else {
-        drawFooter(g, "up/dn scroll  Tab emoji  ESC back");
+        drawFooter(g, "type reply  Tab emoji  Fn+L RU/EN");
     }
 
     if (haveCanvas)
@@ -1621,6 +1707,12 @@ void AdvUI::handleKey(char ch)
         return;
     }
 
+    if (c == AdvKeyboard::kLang) { // Fn+L: toggle transliterated Cyrillic input
+        ruMode = !ruMode;
+        pendingLat = 0;
+        return;
+    }
+
     if (mode == MODE_SETNAME) {
         unsigned maxLen = editMax(editTarget);
         bool numeric = (editTarget == 2);
@@ -1631,8 +1723,15 @@ void AdvUI::handleKey(char ch)
             if (!rebooting)
                 mode = nameReturn;
         } else if (bksp) {
-            if (nameLen)
-                nameBuf[--nameLen] = 0;
+            pendingLat = 0;
+            if (nameLen) {
+                while (nameLen > 0 && ((unsigned char)nameBuf[nameLen - 1] & 0xC0) == 0x80)
+                    nameBuf[--nameLen] = 0; // whole UTF-8 char (Cyrillic is 2 bytes)
+                if (nameLen)
+                    nameBuf[--nameLen] = 0;
+            }
+        } else if (ruMode && !numeric && printable && nameLen + 2 < sizeof(nameBuf)) {
+            translitFeed(nameBuf, nameLen, sizeof(nameBuf), c, pendingLat);
         } else if (printable && nameLen < maxLen && (!numeric || (c >= '0' && c <= '9') || c == '.')) {
             nameBuf[nameLen++] = c;
             nameBuf[nameLen] = 0;
@@ -1735,9 +1834,15 @@ void AdvUI::handleKey(char ch)
             mode = MODE_EMOJI;
         } else if (printable) {
             chatScroll = 0; // jump to the bottom to compose in context
-            msgBuf[0] = c; // start composing a reply to this node
-            msgBuf[1] = 0;
-            msgLen = 1;
+            msgBuf[0] = 0;  // start composing a reply to this node
+            msgLen = 0;
+            pendingLat = 0;
+            if (ruMode)
+                translitFeed(msgBuf, msgLen, sizeof(msgBuf), c, pendingLat);
+            else {
+                msgBuf[msgLen++] = c;
+                msgBuf[msgLen] = 0;
+            }
             mode = MODE_COMPOSE;
         }
         return;
@@ -1786,13 +1891,17 @@ void AdvUI::handleKey(char ch)
             }
             msgLen = 0;
             msgBuf[0] = 0;
+            pendingLat = 0;
             chatScroll = 0; // show the just-sent message at the bottom
             mode = MODE_NODE;
         } else if (bksp) {
+            pendingLat = 0;
             while (msgLen > 0 && ((unsigned char)msgBuf[msgLen - 1] & 0xC0) == 0x80)
                 msgBuf[--msgLen] = 0; // drop UTF-8 continuation bytes, then the lead byte
             if (msgLen)
                 msgBuf[--msgLen] = 0;
+        } else if (ruMode && printable && msgLen + 2 < sizeof(msgBuf)) {
+            translitFeed(msgBuf, msgLen, sizeof(msgBuf), c, pendingLat);
         } else if (printable && msgLen < sizeof(msgBuf) - 1) {
             msgBuf[msgLen++] = c;
             msgBuf[msgLen] = 0;

@@ -3,60 +3,135 @@
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <title>meshtastic-adv · installer</title>
+  <title>Meshtastic ADV · installer</title>
+  <meta name="description" content="Keyboard-first Meshtastic client for the M5Stack Cardputer ADV. Flash it from your browser." />
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Press+Start+2P&family=VT323&display=swap" rel="stylesheet">
   <script type="module" src="https://unpkg.com/esp-web-tools@10/dist/web/install-button.js?module"></script>
   <style>
-    :root { color-scheme: dark; }
-    body {
-      margin: 0; min-height: 100vh; display: grid; place-items: center;
-      background: #0b0d12; color: #e6e9ef;
-      font: 15px/1.6 -apple-system, "Segoe UI", Roboto, sans-serif;
+    :root{
+      color-scheme: dark;
+      --bg:#05060a; --panel:#0b0f18; --ink:#e8ecf2; --dim:#8b93a7;
+      --cyan:#37e1ff; --cyanD:#0aa7c8; --amber:#ffcf3f; --red:#ff4d4d; --green:#42e06a;
+      --line:#1c2333;
     }
-    main { width: min(560px, 92vw); padding: 40px 0; }
-    h1 { margin: 0 0 4px; font-size: 28px; letter-spacing: .3px; }
-    .sub { color: #9aa4b2; margin: 0 0 28px; }
-    .card { background: #12151d; border: 1px solid #232833; border-radius: 14px; padding: 22px; }
-    esp-web-install-button { display: block; }
-    button[slot="activate"] {
-      appearance: none; cursor: pointer; width: 100%;
-      background: #3b82f6; color: #fff; border: 0; border-radius: 10px;
-      padding: 14px 18px; font-size: 16px; font-weight: 600;
+    *{ box-sizing:border-box; }
+    html,body{ margin:0; }
+    body{
+      background:var(--bg); color:var(--ink);
+      font-family:"VT323", ui-monospace, monospace; font-size:22px; line-height:1.35;
+      min-height:100vh; padding:28px 16px 60px;
+      background-image:
+        radial-gradient(120% 80% at 50% -10%, rgba(55,225,255,.10), transparent 60%),
+        repeating-linear-gradient(0deg, rgba(255,255,255,.028) 0 2px, transparent 2px 4px);
     }
-    button[slot="activate"]:hover { background: #2f6fe0; }
-    h2 { font-size: 13px; text-transform: uppercase; letter-spacing: .12em; color: #9aa4b2; margin: 28px 0 10px; }
-    ul { margin: 0; padding-left: 18px; color: #c4ccd8; }
-    li { margin: 6px 0; }
-    b { color: #e6e9ef; }
-    .warn { color: #f3b955; }
-    a { color: #6ea8fe; }
-    footer { margin-top: 28px; color: #6b7482; font-size: 13px; }
+    main{ width:min(760px, 100%); margin:0 auto; }
+    .pixel{ font-family:"Press Start 2P", monospace; }
+    img{ image-rendering: pixelated; }
+
+    /* --- header --- */
+    header{ text-align:center; margin:18px 0 26px; }
+    h1{ margin:0; line-height:1.25; }
+    h1 .m{ font-size:30px; color:var(--ink); text-shadow:3px 3px 0 #000; }
+    h1 .adv{ display:block; font-size:44px; color:var(--cyan); margin-top:10px;
+             text-shadow:3px 3px 0 #003743, 0 0 18px rgba(55,225,255,.35); }
+    .tag{ margin:16px auto 0; max-width:34ch; color:var(--dim); font-size:22px; }
+
+    /* --- panels (square, pixel-bevel) --- */
+    .panel{ background:var(--panel); border:3px solid var(--line);
+            box-shadow: 6px 6px 0 rgba(0,0,0,.6); padding:20px; margin:22px 0; }
+    .panel h2{ font-size:12px; margin:0 0 16px; color:var(--cyan);
+               letter-spacing:1px; text-transform:uppercase; }
+
+    /* --- install button --- */
+    esp-web-install-button{ display:block; }
+    button[slot="activate"]{
+      appearance:none; cursor:pointer; width:100%;
+      font-family:"Press Start 2P", monospace; font-size:15px; color:#04121a;
+      background:var(--cyan); border:0; padding:20px 18px;
+      box-shadow: 0 6px 0 var(--cyanD), 0 6px 0 3px #04121a;
+      transition:transform .05s, box-shadow .05s;
+    }
+    button[slot="activate"]:hover{ background:#5eeaff; }
+    button[slot="activate"]:active{ transform:translateY(6px);
+      box-shadow: 0 0 0 var(--cyanD), 0 0 0 3px #04121a; }
+    .unsupported,.blocked{ display:block; color:var(--amber); font-size:20px; }
+
+    /* --- gallery --- */
+    .shots{ display:grid; grid-template-columns:1fr 1fr; gap:14px; }
+    .shots figure{ margin:0; border:3px solid var(--line); background:#000; box-shadow:5px 5px 0 rgba(0,0,0,.6); }
+    .shots img{ width:100%; display:block; }
+    .shots figcaption{ padding:6px 10px; color:var(--dim); font-size:19px; border-top:3px solid var(--line); }
+
+    /* --- lists --- */
+    ul{ margin:0; padding:0; list-style:none; }
+    li{ margin:10px 0; padding-left:26px; position:relative; }
+    li::before{ content:"▸"; position:absolute; left:0; color:var(--cyan); }
+    li.warn::before{ content:"!"; color:var(--red); font-family:"Press Start 2P"; font-size:13px; }
+    b{ color:var(--ink); }
+    kbd{ font-family:"Press Start 2P"; font-size:11px; background:#000; border:2px solid var(--line);
+         padding:3px 6px; color:var(--amber); }
+    a{ color:var(--cyan); text-decoration:none; border-bottom:2px dotted var(--cyanD); }
+    a:hover{ color:#7cf0ff; }
+    footer{ text-align:center; color:#5a6377; font-size:19px; margin-top:30px; line-height:1.5; }
+
+    @media (max-width:560px){
+      h1 .adv{ font-size:34px; } h1 .m{ font-size:22px; }
+      .shots{ grid-template-columns:1fr; }
+    }
   </style>
 </head>
 <body>
   <main>
-    <h1>meshtastic-adv</h1>
-    <p class="sub">Keyboard-first Meshtastic client for the M5Stack Cardputer ADV (Cap LoRa-1262).</p>
+    <header>
+      <h1 class="pixel"><span class="m">Meshtastic</span><span class="adv">ADV</span></h1>
+      <p class="tag">Keyboard-first Meshtastic for the M5Stack Cardputer ADV. Message the mesh — no phone.</p>
+    </header>
 
-    <div class="card">
+    <div class="panel">
+      <h2>▚ Flash it now</h2>
       <esp-web-install-button manifest="./manifest.json">
-        <button slot="activate">Connect &amp; Install</button>
-        <span slot="unsupported">Web Serial isn't supported here — open this page in desktop <b>Chrome</b> or <b>Edge</b>.</span>
-        <span slot="not-allowed">Serial access was blocked by the browser.</span>
+        <button slot="activate">CONNECT &amp; INSTALL</button>
+        <span slot="unsupported" class="unsupported">Web Serial isn't supported here — open this page in desktop <b>Chrome</b> or <b>Edge</b>.</span>
+        <span slot="not-allowed" class="blocked">Serial access was blocked by the browser.</span>
       </esp-web-install-button>
     </div>
 
-    <h2>Before you click</h2>
-    <ul>
-      <li>Desktop <b>Chrome</b> or <b>Edge</b> only (Web Serial API).</li>
-      <li class="warn">Attach the LoRa antenna to the Cap first — never power the PA without it.</li>
-      <li>Use a <b>data</b> USB-C cable, plugged straight into the computer (no hub).</li>
-      <li>If the device isn't listed: hold <b>G0 / BOOT</b> while connecting, then release.</li>
-      <li>After flashing, set your LoRa region &amp; channel (see the project README).</li>
-    </ul>
+    <div class="panel">
+      <h2>▚ On the screen</h2>
+      <div class="shots">
+        <figure><img src="img/nodes.png" alt="Node list"><figcaption>node list · signal · hops · age</figcaption></figure>
+        <figure><img src="img/chat.png" alt="Conversation"><figcaption>chat · cyrillic · emoji · status</figcaption></figure>
+        <figure><img src="img/emoji.png" alt="Emoji palette"><figcaption>emoji palette · Tab</figcaption></figure>
+        <figure><img src="img/settings.png" alt="Settings"><figcaption>on-device settings</figcaption></figure>
+      </div>
+    </div>
+
+    <div class="panel">
+      <h2>▚ Before you click</h2>
+      <ul>
+        <li class="warn">Attach the <b>LoRa antenna</b> to the Cap first — never power the PA without it.</li>
+        <li>Desktop <b>Chrome</b> or <b>Edge</b> only (Web Serial API).</li>
+        <li>Use a <b>data</b> USB-C cable, straight into the computer — no hub.</li>
+        <li>Not listed? Hold <kbd>G0</kbd> / <kbd>BOOT</kbd> while connecting, then release.</li>
+        <li>After flashing: long-press <kbd>ESC</kbd> → set your <b>Region</b> &amp; <b>UTC</b>.</li>
+      </ul>
+    </div>
+
+    <div class="panel">
+      <h2>▚ Drive it</h2>
+      <ul>
+        <li><kbd>type</kbd> on the list to search · <kbd>ENTER</kbd> opens a chat</li>
+        <li><kbd>&larr;</kbd><kbd>&rarr;</kbd> favourite a contact · <kbd>&uarr;</kbd><kbd>&darr;</kbd> move / scroll</li>
+        <li>In a chat: <kbd>type</kbd> then <kbd>ENTER</kbd> to send · <kbd>Tab</kbd> for emoji</li>
+        <li>Long-press <kbd>ESC</kbd> anywhere → Settings</li>
+      </ul>
+    </div>
 
     <footer>
-      Source: <a href="https://github.com/anton-vinogradov/meshtastic-adv">github.com/anton-vinogradov/meshtastic-adv</a>
-      · Unofficial community project. Meshtastic® is a registered trademark of Meshtastic LLC.
+      <a href="https://github.com/anton-vinogradov/meshtastic-adv">github.com/anton-vinogradov/meshtastic-adv</a><br>
+      Unofficial community project. Meshtastic® is a registered trademark of Meshtastic LLC.
     </footer>
   </main>
 </body>

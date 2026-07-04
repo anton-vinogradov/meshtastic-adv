@@ -52,6 +52,10 @@ class AdvUI : public concurrency::OSThread
     void drawPickList();
     void drawReboot();
     void drawEmoji();
+#ifdef ADVUI_SCREENSHOT
+    void screenshot(const char *name); // dump the current canvas over serial
+    void runDemoDump();                // render each screen with sample data + dump, then reboot
+#endif
     bool applyName(); // returns true if it scheduled a reboot (frequency/channel)
     void applyLoRa(int target, int value);
     void rebuildFiltered();

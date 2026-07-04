@@ -1010,6 +1010,7 @@ int32_t AdvUI::runOnce()
         handleFromRadio(api.lastFromRadio()); // pick out incoming text messages
     }
 
+    kb.setNavKeys(mode != MODE_SETNAME); // , ; . / are symbols while typing, arrows otherwise
     kb.trigger();
     bool keyDuringSplash = false;
     while (kb.hasEvent()) {

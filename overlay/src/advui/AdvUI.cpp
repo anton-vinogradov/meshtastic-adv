@@ -1,4 +1,5 @@
 #include "AdvUI.h"
+#include "CyrillicFont.h"
 #include "PowerStatus.h"
 #include "configuration.h"
 #include "mesh/Channels.h"
@@ -20,6 +21,9 @@ namespace advui
 
 namespace
 {
+
+// LovyanGFX wrapper for the embedded Cyrillic font — used for message text.
+const lgfx::U8g2font cyrFont(u8g2_font_9x15_t_cyrillic);
 
 const char *nodeName(const meshtastic_NodeInfoLite *n)
 {
@@ -181,9 +185,9 @@ void fitWidth(lgfx::LGFXBase *g, char *s, int budget)
 // SNR -> 0..4 signal bars. 0 means no direct SNR (node heard only via relays).
 int sigLevel(const meshtastic_NodeInfoLite *n)
 {
-    if (!n->snr_q4)
-        return 0;
-    float snr = n->snr_q4 / 4.0f;
+    float snr = n->snr; // live SNR is in the float field; snr_q4 is the on-disk form, zeroed in RAM
+    if (snr == 0)
+        return 0; // no direct SNR (heard only via relays / never directly)
     if (snr >= 5)
         return 4;
     if (snr >= 0)
@@ -303,9 +307,9 @@ void drawNodeRow(lgfx::LGFXBase *g, const meshtastic_NodeInfoLite *n, int y, boo
     int level = self ? -1 : sigLevel(n);
     int barBase = y + rowH - 3;
     const int bh[4] = {4, 7, 10, 13};
-    uint16_t sigCol = level >= 3 ? 0x07E0 : level == 2 ? 0xFFE0 : level == 1 ? 0xFD20 : 0x2124;
+    const uint16_t barCol[4] = {0xF800, 0xFD20, 0xFFE0, 0x07E0}; // red -> orange -> yellow -> green
     for (int i = 0; i < nbars; i++) {
-        uint16_t c = (level > 0 && i < level) ? sigCol : 0x2124; // dim for empty/relayed
+        uint16_t c = (level > 0 && i < level) ? barCol[i] : 0x4208; // dim gray for empty/relayed
         g->fillRect(xBars + i * (barW + barGap), barBase - bh[i], barW, bh[i], c);
     }
 
@@ -691,31 +695,20 @@ void AdvUI::drawNode()
 
     markReadFrom(selectedNum); // opening the thread clears its unread
 
-    g->setFont(&lgfx::fonts::Font0);
-    g->setTextSize(1);
-    g->setTextColor(0x07FF); // cyan
-    g->setCursor(4, 3);
-    if (node && nodeName(node)[0])
-        g->printf("%-.30s", nodeName(node));
-    else
-        g->printf("!%08x", (unsigned)selectedNum);
-    g->drawFastHLine(0, 13, 240, 0x39C7);
-
-    // compact status line
-    g->setTextColor(0x8410); // gray
-    g->setCursor(4, 17);
+    // header: the node's row (name + signal + hops + age + role), like the contact list
     if (node) {
-        g->printf("!%08x", (unsigned)node->num);
-        if (node->has_hops_away)
-            g->printf("  %uh", node->hops_away);
-        if (node->snr_q4)
-            g->printf("  %.0fdB", node->snr_q4 / 4.0f);
+        drawNodeRow(g, node, 2, false);
     } else {
-        g->print("(node no longer in DB)");
+        g->setFont(&lgfx::fonts::Font0);
+        g->setTextSize(1);
+        g->setTextColor(0x8410);
+        g->setCursor(4, 6);
+        g->printf("!%08x  (left DB)", (unsigned)selectedNum);
     }
+    g->drawFastHLine(0, 21, 240, 0x39C7);
 
     // message thread (chronological, most recent at the bottom)
-    const int fy0 = 30, lh = 17; // FreeSans line height, same as the contact list
+    const int fy0 = 24, lh = 17;
     int bottom = (mode == MODE_COMPOSE) ? 112 : 122; // leave room for the compose bar
     int maxLines = (bottom - fy0) / lh;
     int matched[kMaxMsgs], mc = 0;
@@ -729,7 +722,7 @@ void AdvUI::drawNode()
         g->setCursor(4, fy0);
         g->print("(no messages yet)");
     } else {
-        g->setFont(&lgfx::fonts::FreeSansBold9pt7b);
+        g->setFont(&cyrFont); // Cyrillic-capable, so Russian message text renders
         g->setTextSize(1);
         int start = mc > maxLines ? mc - maxLines : 0;
         int y = fy0;
@@ -750,7 +743,7 @@ void AdvUI::drawNode()
                 const char *en = errName(m.err);
                 g->setCursor(238 - g->textWidth(en), y + 4);
                 g->print(en);
-                g->setFont(&lgfx::fonts::FreeSansBold9pt7b); // restore for the next line
+                g->setFont(&cyrFont); // restore for the next line
             } else if (out) {
                 drawMsgStatus(g, 220, y, m.status);
             }
@@ -760,7 +753,7 @@ void AdvUI::drawNode()
 
     if (mode == MODE_COMPOSE) {
         g->drawFastHLine(0, 114, 240, 0x39C7);
-        g->setFont(&lgfx::fonts::FreeSansBold9pt7b);
+        g->setFont(&cyrFont);
         g->setTextSize(1);
         g->setTextColor(0xFFE0); // yellow
         char cbuf[210];

@@ -1482,6 +1482,110 @@ void AdvUI::drawEmoji()
         canvas.pushSprite(0, 0);
 }
 
+#ifdef ADVUI_SCREENSHOT
+// Dumps the current canvas (rgb332) as hex over serial, framed by markers, so a host
+// script can rebuild a PNG. Dev-only: gated out of the release build.
+void AdvUI::screenshot(const char *name)
+{
+    if (!haveCanvas)
+        return;
+    Serial.setTxTimeoutMs(1000); // blocking TX: the USB-CDC guard (0) drops bytes on big writes
+    const uint8_t *buf = (const uint8_t *)canvas.getBuffer();
+    int w = display.width(), h = display.height();
+    int stride = (int)(canvas.bufferLength() / h);
+    Serial.printf("\n@@SHOT %s %d %d\n", name, w, h);
+    static const char hexd[] = "0123456789abcdef";
+    char line[512];
+    for (int y = 0; y < h; y++) {
+        int p = 0;
+        for (int x = 0; x < w; x++) {
+            uint8_t v = buf[y * stride + x];
+            line[p++] = hexd[v >> 4];
+            line[p++] = hexd[v & 0xF];
+        }
+        line[p] = 0;
+        Serial.println(line);
+        Serial.flush(); // one row at a time so nothing is dropped
+    }
+    Serial.println("@@END");
+    Serial.flush();
+    Serial.setTxTimeoutMs(0); // restore the USB-CDC guard
+    delay(30);
+}
+
+// Renders each screen with sample data and dumps it, then restores all state in RAM
+// (nothing is persisted — saveMsgs is never called, and the message ring is snapshotted
+// and put back). No reboot, so the USB CDC stays up for the host to read.
+void AdvUI::runDemoDump()
+{
+    uint32_t me = nodeDB ? nodeDB->getNodeNum() : 0;
+
+    static Msg backup[kMaxMsgs];
+    memcpy(backup, g_msgs, sizeof(g_msgs));
+    int bCount = g_msgCount, bNext = g_msgNext;
+    bool bDirty = g_msgsDirty;
+    Mode bMode = mode;
+    uint32_t bSel = selectedNum;
+    int bChan = selectedChannel, bScroll = chatScroll;
+
+    drawSplash();
+    screenshot("splash");
+
+    mode = MODE_NODES;
+    sel = 0;
+    scrollTop = 0;
+    rebuildFiltered();
+    drawNodeList();
+    screenshot("nodes");
+
+    // sample conversation with the first listed node (Cyrillic + emoji + statuses)
+    uint32_t peer = (filteredCount > 0 && nodeDB) ? nodeDB->getMeshNodeByIndex(filtered[0])->num : me;
+    uint32_t t = 1751720400;
+    addMsg(peer, me, 0, t, false, "Привет! Как слышно?", 0, MSG_IN);
+    addMsg(me, peer, 0, t + 60, false, "Чётко, 5/5 \U0001F44D", 1, MSG_DELIVERED);
+    addMsg(peer, me, 0, t + 120, false, "Выезжаем через 10, го \U0001F525", 0, MSG_IN);
+    addMsg(me, peer, 0, t + 180, false, "Ок, буду \U0001F642", 2, MSG_SENDING);
+    selectedChannel = -1;
+    selectedNum = peer;
+    chatScroll = 0;
+    mode = MODE_NODE;
+    drawNode();
+    screenshot("chat");
+
+    emojiSel = 0;
+    mode = MODE_EMOJI;
+    drawEmoji();
+    screenshot("emoji");
+
+    setSel = 0;
+    mode = MODE_SETTINGS;
+    drawSettings();
+    screenshot("settings");
+
+    pickTarget = 2;
+    pickSel = optIndex(kUtcOpts, kUtcCount, 180); // Moscow, for a nice sample
+    pickScroll = pickSel > 3 ? pickSel - 3 : 0;
+    mode = MODE_PICKLIST;
+    drawPickList();
+    screenshot("utc");
+
+    Serial.println("@@DONE");
+    Serial.flush();
+
+    memcpy(g_msgs, backup, sizeof(g_msgs)); // put the real conversation ring back
+    g_msgCount = bCount;
+    g_msgNext = bNext;
+    g_msgsDirty = bDirty;
+    mode = bMode;
+    selectedNum = bSel;
+    selectedChannel = bChan;
+    chatScroll = bScroll;
+    rebuildFiltered();
+    while (Serial.available())
+        Serial.read(); // drop any buffered triggers so we don't dump again in a burst
+}
+#endif
+
 // Applies a LoRa setting (0 = region, 1 = preset), persists it, and schedules the
 // reboot the radio needs to re-init on the new parameters.
 void AdvUI::applyLoRa(int target, int value)
@@ -1785,6 +1889,12 @@ int32_t AdvUI::runOnce()
         initHardware();
         inited = true;
     }
+
+#ifdef ADVUI_SCREENSHOT
+    while (Serial.available())
+        if (Serial.read() == 'S')
+            runDemoDump(); // host sends 'S' -> dump every screen, then reboot
+#endif
 
     while (api.available() && api.getFromRadio(fromRadioBuf) > 0) {
         handleFromRadio(api.lastFromRadio()); // pick out incoming text messages

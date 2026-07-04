@@ -63,6 +63,7 @@ class AdvUI : public concurrency::OSThread
     int buildChannels(const char *query);
     void drawChannelRow(int chIdx, int y);
     void openEntry(int s); // open the combined-list entry at index s (channel or node)
+    int firstUnreadIdx();  // ring index of the first unread message in the open thread, or -1
     void favEntry(int s, bool on);
     void handleFromRadio(const meshtastic_FromRadio &fr);
     void sendMessage(uint32_t to, const char *text);
@@ -88,6 +89,7 @@ class AdvUI : public concurrency::OSThread
     uint32_t selectedNum = 0; // node chosen with Enter (MODE_NODE)
     int selectedChannel = -1; // >= 0 when the open thread is a channel (else a node DM)
     int chatScroll = 0;       // thread view: lines scrolled up from the bottom (0 = newest)
+    int chatAnchorMsgIdx = -1; // on open: ring index to scroll to (first unread), -1 = bottom
     int emojiSel = 0;         // emoji picker cursor (MODE_EMOJI)
     Mode emojiReturn = MODE_COMPOSE; // where ESC in the emoji picker returns
     Mode nodeReturn = MODE_NODES; // where the node view returns on ESC (home or picker)

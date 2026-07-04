@@ -1028,12 +1028,32 @@ void AdvUI::drawChannelRow(int chIdx, int y)
 }
 
 // Opens the combined-list entry (channels first, then filtered nodes).
+// Ring index of the first (chronological) unread message in the currently open thread,
+// or -1 if there are none. Read the read flag BEFORE markRead*, i.e. call on open.
+int AdvUI::firstUnreadIdx()
+{
+    bool isChan = selectedChannel >= 0;
+    for (int i = 0; i < g_msgCount; i++) {
+        int idx = (g_msgCount == kMaxMsgs) ? (g_msgNext + i) % kMaxMsgs : i;
+        Msg &m = g_msgs[idx];
+        if (m.read)
+            continue;
+        bool match = isChan ? (m.to == NODENUM_BROADCAST && m.ch == selectedChannel)
+                            : (m.from == selectedNum && m.to != NODENUM_BROADCAST);
+        if (match)
+            return idx;
+    }
+    return -1;
+}
+
 void AdvUI::openEntry(int s)
 {
     nodeReturn = (mode == MODE_PICKER) ? MODE_PICKER : MODE_NODES;
-    chatScroll = 0; // open threads pinned to the newest message
+    chatScroll = 0;          // default: pinned to the newest message
+    chatAnchorMsgIdx = -1;
     if (s < chanCount) {
         selectedChannel = chanList[s];
+        chatAnchorMsgIdx = firstUnreadIdx(); // capture the first unread before clearing it
         markReadChannel(selectedChannel);
         mode = MODE_NODE;
     } else if (nodeDB) {
@@ -1041,6 +1061,7 @@ void AdvUI::openEntry(int s)
         if (node) {
             selectedChannel = -1;
             selectedNum = node->num;
+            chatAnchorMsgIdx = firstUnreadIdx(); // markReadFrom() runs later in drawNode
             mode = MODE_NODE;
         }
     }
@@ -1269,6 +1290,7 @@ void AdvUI::drawNode()
         int32_t tzOff = g_utcOffsetMin * 60; // user-set UTC offset (Settings > UTC)
         static DLine dl[80]; // single-threaded UI: static keeps it off the stack
         int dlCount = 0;
+        int anchorLine = -1; // dl index of the first unread message's first line (on open)
         for (int i = 0; i < mc; i++) {
             Msg &m = g_msgs[matched[i]];
             bool out = (m.from == me);
@@ -1279,12 +1301,16 @@ void AdvUI::drawNode()
             uint8_t tlen = (uint8_t)strlen(tpre);
             char full[188];
             snprintf(full, sizeof(full), "%s%s%s", tpre, out ? "> " : "< ", m.text);
+            if (matched[i] == chatAnchorMsgIdx)
+                anchorLine = dlCount; // this message's first line
             const char *p = full;
             bool first = true;
             do {
                 if (dlCount >= (int)(sizeof(dl) / sizeof(dl[0]))) { // drop the oldest line
                     memmove(dl, dl + 1, sizeof(dl) - sizeof(dl[0]));
                     dlCount--;
+                    if (anchorLine >= 0)
+                        anchorLine--; // the anchor shifted up with the dropped line
                 }
                 DLine &d = dl[dlCount++];
                 p += wrapLine(g, p, wrapW, d.text, sizeof(d.text));
@@ -1299,6 +1325,10 @@ void AdvUI::drawNode()
         }
         // chatScroll counts lines scrolled up from the bottom (0 = pinned to newest).
         int maxScroll = dlCount > maxLines ? dlCount - maxLines : 0;
+        if (chatAnchorMsgIdx >= 0) { // first render after opening: jump to the first unread
+            chatScroll = (anchorLine >= 0 && anchorLine <= maxScroll) ? maxScroll - anchorLine : 0;
+            chatAnchorMsgIdx = -1;
+        }
         if (chatScroll > maxScroll)
             chatScroll = maxScroll;
         if (chatScroll < 0)

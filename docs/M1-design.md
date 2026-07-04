@@ -20,20 +20,24 @@ This is exactly the phone-app model, so we inherit the full feature set for free
 decoupled from engine internals. Bonus: the same UI can later run as a BLE *companion* to a
 separate node by swapping the transport.
 
-## Build / fork model
+## Build model — additive overlay, no fork
 
-A UI replacement inevitably touches `main.cpp`, so the `firmware` submodule tracks our
-**`advui` branch** (a fork of `meshtastic/firmware`), kept rebaseable on upstream. Rules:
+The `firmware` submodule stays **byte-identical to upstream** `meshtastic/firmware`.
+Our code lives in `overlay/` and is copied into the firmware tree at build time by
+`scripts/sync-overlay.sh`, which also applies three idempotent, marker-guarded (`advui-inject`)
+injections. Nothing is committed into the submodule, so updating upstream is
+`git -C firmware checkout -- . && git -C firmware pull` then re-sync — no merge conflicts.
 
-- All our code lives under `firmware/src/advui/` (isolated, obviously ours).
-- Edits to upstream files are minimal and guarded by `-D MESHTASTIC_ADV_UI`
-  (set in the `m5stack-cardputer-adv` variant `platformio.ini`).
-- `src/advui/` is picked up by the default `build_src_filter` automatically.
+- `overlay/src/advui/` → `firmware/src/advui/` (our UI; compiled by the default src filter).
+- `overlay/variants/esp32s3/m5stack_cardputer_adv_advui/platformio.ini` → a **new** env
+  `m5stack-cardputer-adv-advui` (extends the stock env, adds `-D MESHTASTIC_EXCLUDE_SCREEN`
+  + the LovyanGFX dep). A new file, so the `variants/*/*/platformio.ini` glob picks it up.
+- Injections: `main.cpp` gets `#include "advui/AdvUI.h"` + a `advui::advuiSetup();` call after
+  `setupModules()`; `CardputerKeyboard.cpp` gets the `InputBroker.h` include it loses when the
+  stock Screen is excluded.
 
-### Hook points in `firmware/src/main.cpp`
-- include: after `#include "graphics/Screen.h"` (guarded).
-- init: after `setupModules()` — engine + `service` exist → `advui::advUI.setup()`.
-- pump: top of `loop()` → `advui::advUI.loop()`.
+`AdvUI` is a `concurrency::OSThread`, so once `advuiSetup()` creates it the scheduler drives
+`runOnce()` — no main-loop edit. Build with `-e m5stack-cardputer-adv-advui`.
 
 ## Hardware (from the variant)
 
@@ -45,11 +49,8 @@ A UI replacement inevitably touches `main.cpp`, so the `firmware` submodule trac
 
 ## Steps
 
-- **M1a — pipeline proof (this step):** `InternalAPI` + minimal `AdvUI` that starts the API
-  and drains `FromRadio`, logging throughput. No display changes. Proves our code compiles
-  into and runs alongside the engine. *(On-device verify blocked until USB flashing is sorted.)*
-- **M1b — display:** force `HAS_SCREEN 0` for our build to compile out the entire stock UI,
-  and drive the ST7789 ourselves (LovyanGFX/M5GFX). Decode `FromRadio` → render node list +
-  incoming messages. RGB/sound on receive.
-- **M1c — input + send:** read the TCA8418 keyboard, compose text, send via `ToRadio`
-  (`handleToRadio`), show ACK status.
+- **M1a — pipeline:** `InternalAPI` drains the `FromRadio` stream in-process. ✅
+- **M1b — display:** own ST7789 via LovyanGFX (double-buffered), node list (name / SNR /
+  hops), header with node count + battery. Stock screen off via `MESHTASTIC_EXCLUDE_SCREEN`. ✅
+- **M1c — input:** ESC-activated contact picker (favourites → recent senders → all),
+  type-to-filter, via the stock `InputBroker`; then compose + send via `handleToRadio`.

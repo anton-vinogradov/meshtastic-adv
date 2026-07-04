@@ -10,11 +10,14 @@
 set -euo pipefail
 
 PIO="${PIO:-$HOME/.pio-core-venv/bin/pio}"
-ENV="m5stack-cardputer-adv"
+ENV="m5stack-cardputer-adv-advui"
 REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 BUILD_DIR="$REPO_ROOT/firmware/.pio/build/$ENV"
 
 VERSION="${1:?usage: publish-firmware.sh <version-label>}"
+
+echo ">> syncing overlay into the pristine firmware tree"
+"$REPO_ROOT/scripts/sync-overlay.sh"
 
 echo ">> building $ENV"
 ( cd "$REPO_ROOT/firmware" && "$PIO" run -e "$ENV" )

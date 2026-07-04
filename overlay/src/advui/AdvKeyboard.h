@@ -20,6 +20,10 @@ class AdvKeyboard : public TCA8418KeyboardBase
     void begin();           // init the TCA8418 over the keyboard I2C bus (GPIO 8/9)
     void trigger() override; // poll the FIFO; queues chars, read via hasEvent()/dequeueEvent()
 
+    // The , ; . / keys double as arrows. In navigation they emit arrow codes; while
+    // typing set this false so they emit their literal symbols (so '.' etc. work).
+    void setNavKeys(bool on) { navKeys = on; }
+
   protected:
     void pressed(uint8_t key) override;
     void released() override;
@@ -38,6 +42,7 @@ class AdvKeyboard : public TCA8418KeyboardBase
     uint32_t escPressMs = 0;   // when the ESC key went down, for long-press detection
     bool escDown = false;      // ESC currently held
     bool escLongFired = false; // long-press already emitted for this hold
+    bool navKeys = true;       // , ; . / emit arrows (nav) vs literal symbols (typing)
 };
 
 } // namespace advui

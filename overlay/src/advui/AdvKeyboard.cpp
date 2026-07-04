@@ -212,10 +212,10 @@ void AdvKeyboard::released()
         return;
     }
 
-    // Esc + the four arrow keys always emit their navigation code (stock does this
-    // only in menuMode; we have no stock menu, so it's unconditional).
-    if (modifierFlag == 0 &&
-        (last_key == 0 || last_key == 43 || last_key == 46 || last_key == 47 || last_key == 51)) {
+    // The four arrow keys (, ; . /) emit their arrow code while navigating, but their
+    // literal symbol while typing (navKeys == false) — otherwise '.' etc. are untypable.
+    if (modifierFlag == 0 && navKeys &&
+        (last_key == 43 || last_key == 46 || last_key == 47 || last_key == 51)) {
         modifierFlag = modifierFn;
     }
 

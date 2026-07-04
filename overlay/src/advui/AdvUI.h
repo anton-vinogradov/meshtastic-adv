@@ -30,7 +30,16 @@ class AdvUI : public concurrency::OSThread
     int32_t runOnce() override;
 
   private:
-    enum Mode : uint8_t { MODE_NODES, MODE_PICKER, MODE_NODE, MODE_SETNAME, MODE_SETTINGS, MODE_PICKLIST, MODE_REBOOT };
+    enum Mode : uint8_t {
+        MODE_NODES,
+        MODE_PICKER,
+        MODE_NODE,
+        MODE_COMPOSE,
+        MODE_SETNAME,
+        MODE_SETTINGS,
+        MODE_PICKLIST,
+        MODE_REBOOT
+    };
 
     void initHardware();
     void drawSplash();
@@ -46,6 +55,7 @@ class AdvUI : public concurrency::OSThread
     void rebuildFiltered();
     int buildNodeList(uint16_t *out, int max, const char *query);
     void handleFromRadio(const meshtastic_FromRadio &fr);
+    void sendMessage(uint32_t to, const char *text);
     void handleKey(char c);
 
     InternalAPI api;
@@ -63,6 +73,10 @@ class AdvUI : public concurrency::OSThread
     int sel = 0;          // selection cursor into filtered[]
     int scrollTop = 0;    // first visible row
     uint32_t selectedNum = 0; // node chosen with Enter (MODE_NODE)
+    Mode nodeReturn = MODE_NODES; // where the node view returns on ESC (home or picker)
+
+    char msgBuf[200] = {0};   // compose buffer (MODE_COMPOSE)
+    uint8_t msgLen = 0;
 
     char nameBuf[25] = {0};   // node-name editor buffer (MODE_SETNAME)
     uint8_t nameLen = 0;

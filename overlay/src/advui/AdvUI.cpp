@@ -4,6 +4,8 @@
 #include "mesh/Channels.h"
 #include "mesh/MeshService.h"
 #include "mesh/NodeDB.h"
+#include "mesh/Router.h"
+#include "mesh/mesh-pb-constants.h"
 #include "modules/NodeInfoModule.h"
 #include <algorithm>
 #include <cctype>
@@ -49,31 +51,81 @@ bool ciContains(const char *hay, const char *needle)
 
 // Incoming text messages, kept in a small RAM ring (oldest overwritten). Enough
 // to show a node's recent thread and to know who we've talked to for sorting.
+enum MsgStatus : uint8_t { MSG_IN = 0, MSG_SENDING = 1, MSG_DELIVERED = 2, MSG_FAILED = 3 };
+
 struct Msg {
     uint32_t from;
     uint32_t to; // 0xFFFFFFFF = broadcast/channel, else a DM to that node
     uint32_t rxTime;
+    uint32_t id;     // our packet id (outgoing only), to match the delivery ACK
+    uint8_t status;  // MsgStatus
+    uint8_t err;     // routing error code when status == MSG_FAILED
     bool read;
     char text[160];
 };
+
+// Short names for meshtastic_Routing_Error, shown next to a failed message.
+const char *errName(uint8_t e)
+{
+    switch (e) {
+    case 1:
+        return "no route";
+    case 2:
+        return "nak";
+    case 3:
+        return "timeout";
+    case 4:
+        return "no iface";
+    case 5:
+        return "no ack";
+    case 6:
+        return "no chan";
+    case 7:
+        return "too big";
+    case 8:
+        return "no resp";
+    case 9:
+        return "duty lim";
+    case 12:
+        return "pki fail";
+    case 13:
+        return "no pubkey";
+    default:
+        return "fail";
+    }
+}
 constexpr int kMaxMsgs = 32;
 constexpr int kNumSettings = 6; // Name, Short, Region, Preset, Frequency, Channel
 Msg g_msgs[kMaxMsgs];
 int g_msgCount = 0; // populated slots (grows to kMaxMsgs)
 int g_msgNext = 0;  // next write slot (ring head)
 
-void addMsg(uint32_t from, uint32_t to, uint32_t rxTime, bool unread, const char *text)
+void addMsg(uint32_t from, uint32_t to, uint32_t rxTime, bool unread, const char *text, uint32_t id, uint8_t status)
 {
     Msg &m = g_msgs[g_msgNext];
     m.from = from;
     m.to = to;
     m.rxTime = rxTime;
+    m.id = id;
+    m.status = status;
+    m.err = 0;
     m.read = !unread;
     strncpy(m.text, text, sizeof(m.text) - 1);
     m.text[sizeof(m.text) - 1] = 0;
     g_msgNext = (g_msgNext + 1) % kMaxMsgs;
     if (g_msgCount < kMaxMsgs)
         g_msgCount++;
+}
+
+// Mark the sent message whose id matches an incoming ACK/routing response.
+void ackMsg(uint32_t reqId, uint8_t status, uint8_t err)
+{
+    for (int i = 0; i < g_msgCount; i++)
+        if (g_msgs[i].id == reqId && g_msgs[i].id != 0) {
+            g_msgs[i].status = status;
+            g_msgs[i].err = err;
+            return;
+        }
 }
 
 int unreadCount()
@@ -326,6 +378,20 @@ void drawFooter(lgfx::LGFXBase *g, const char *hint)
     g->print(hint);
 }
 
+// Delivery-status glyph for an outgoing message, drawn at the right of its line.
+void drawMsgStatus(lgfx::LGFXBase *g, int x, int y, uint8_t status)
+{
+    if (status == MSG_SENDING) {
+        g->fillCircle(x + 6, y + 6, 2, 0xFFE0); // yellow dot: in flight
+    } else if (status == MSG_DELIVERED) {
+        g->drawLine(x + 2, y + 6, x + 5, y + 9, 0x07E0); // green check: acked
+        g->drawLine(x + 5, y + 9, x + 12, y + 2, 0x07E0);
+    } else if (status == MSG_FAILED) {
+        g->drawLine(x + 3, y + 2, x + 11, y + 10, 0xF800); // red x: failed
+        g->drawLine(x + 11, y + 2, x + 3, y + 10, 0xF800);
+    }
+}
+
 } // namespace
 
 AdvUI::AdvUI() : concurrency::OSThread("advui") {}
@@ -339,7 +405,10 @@ void AdvUI::initHardware()
     display.setRotation(1); // landscape 240x135
     display.fillScreen(0x0000);
 
-    canvas.setColorDepth(16);
+    // 8-bit (rgb332) frame buffer: 32KB instead of 64KB. The full 16-bit buffer
+    // starved the internal DMA pool so PKI crypto (esp-aes) couldn't allocate and
+    // DMs failed to send. Colours coarsen slightly but stay recognisable.
+    canvas.setColorDepth(8);
     haveCanvas = (canvas.createSprite(display.width(), display.height()) != nullptr);
     LOG_INFO("advui: UI up init=%d %dx%d canvas=%d", (int)ok, display.width(), display.height(),
              (int)haveCanvas);
@@ -392,6 +461,20 @@ void AdvUI::handleFromRadio(const meshtastic_FromRadio &fr)
     const meshtastic_MeshPacket &p = fr.packet;
     if (p.which_payload_variant != meshtastic_MeshPacket_decoded_tag)
         return;
+
+    // A routing response carrying our request id is the ACK/NAK for a sent message.
+    // Decode it: error_reason NONE = delivered, anything else (no route, no ack,
+    // max retransmit, ...) = failed. Route request/reply variants aren't acks.
+    if (p.decoded.portnum == meshtastic_PortNum_ROUTING_APP && p.decoded.request_id) {
+        meshtastic_Routing routing = meshtastic_Routing_init_zero;
+        bool ok = pb_decode_from_bytes(p.decoded.payload.bytes, p.decoded.payload.size, &meshtastic_Routing_msg, &routing);
+        if (ok && routing.which_variant == meshtastic_Routing_error_reason_tag) {
+            bool delivered = routing.error_reason == meshtastic_Routing_Error_NONE;
+            ackMsg(p.decoded.request_id, delivered ? MSG_DELIVERED : MSG_FAILED, (uint8_t)routing.error_reason);
+        }
+        return;
+    }
+
     if (p.decoded.portnum != meshtastic_PortNum_TEXT_MESSAGE_APP)
         return;
 
@@ -404,7 +487,39 @@ void AdvUI::handleFromRadio(const meshtastic_FromRadio &fr)
 
     uint32_t me = nodeDB ? nodeDB->getNodeNum() : 0;
     bool unread = (p.to == me && p.from != me); // a DM addressed to us (not a broadcast, not our echo)
-    addMsg(p.from, p.to, p.rx_time, unread, text);
+    addMsg(p.from, p.to, p.rx_time, unread, text, 0, MSG_IN);
+}
+
+// Sends a text DM to a node and adds it to our own thread immediately (status
+// "sending"); the delivery ACK later flips it to "delivered" via ackMsg().
+void AdvUI::sendMessage(uint32_t to, const char *text)
+{
+    if (!router || !service)
+        return;
+    meshtastic_MeshPacket *p = router->allocForSending();
+    p->to = to;
+    p->want_ack = true;
+    p->decoded.portnum = meshtastic_PortNum_TEXT_MESSAGE_APP;
+    p->decoded.dest = to;
+    size_t n = strlen(text);
+    if (n > sizeof(p->decoded.payload.bytes))
+        n = sizeof(p->decoded.payload.bytes);
+    memcpy(p->decoded.payload.bytes, text, n);
+    p->decoded.payload.size = n;
+
+    // A DM to a key-capable node must be PKI-encrypted (stock forces this); without
+    // it the recipient on a modern mesh won't accept/ack the message.
+    meshtastic_NodeInfoLite *node = nodeDB ? nodeDB->getMeshNode(to) : nullptr;
+    if (node && node->public_key.size == 32) {
+        p->pki_encrypted = true;
+        p->channel = 0;
+    }
+
+    uint32_t id = p->id;
+    service->sendToMesh(p, RX_SRC_LOCAL, false);
+
+    uint32_t me = nodeDB ? nodeDB->getNodeNum() : 0;
+    addMsg(me, to, 0, false, text, id, MSG_SENDING);
 }
 
 // Fills out[] with node-DB indices matching query (all if query is null/empty),
@@ -414,11 +529,14 @@ int AdvUI::buildNodeList(uint16_t *out, int max, const char *query)
     int count = 0;
     if (!nodeDB)
         return 0;
+    uint32_t me = nodeDB->getNodeNum();
     size_t total = nodeDB->getNumMeshNodes();
     for (size_t i = 0; i < total && count < max; i++) {
         meshtastic_NodeInfoLite *node = nodeDB->getMeshNodeByIndex(i);
         if (!node)
             continue;
+        if (node->num == me)
+            continue; // don't list ourselves — you don't message yourself
         if (query && query[0]) {
             const char *name = nodeName(node);
             if (!ciContains(name[0] ? name : "", query))
@@ -478,19 +596,30 @@ void AdvUI::drawNodeList()
 
     g->drawFastHLine(0, 13, 240, 0x39C7);
 
-    uint16_t order[kMaxFiltered];
-    int count = buildNodeList(order, kMaxFiltered, nullptr);
+    rebuildFiltered(); // fills filtered[]/filteredCount (empty query here), clamps sel
     const int top = 15, rowH = 18, maxRows = (124 - top) / rowH;
+    if (sel < scrollTop)
+        scrollTop = sel;
+    if (sel >= scrollTop + maxRows)
+        scrollTop = sel - maxRows + 1;
+    if (scrollTop < 0)
+        scrollTop = 0;
+
     int y = top;
-    for (int r = 0; r < maxRows && r < count; r++) {
-        meshtastic_NodeInfoLite *node = nodeDB->getMeshNodeByIndex(order[r]);
+    for (int r = 0; r < maxRows; r++) {
+        int idx = scrollTop + r;
+        if (idx >= filteredCount)
+            break;
+        meshtastic_NodeInfoLite *node = nodeDB->getMeshNodeByIndex(filtered[idx]);
         if (!node)
             continue;
+        if (idx == sel)
+            g->fillRect(0, y - 1, 240, rowH, 0x2945); // cursor highlight
         drawNodeRow(g, node, y, node->num == me);
         y += rowH;
     }
 
-    drawFooter(g, "type a name to find a contact");
+    drawFooter(g, "up/dn move  ENTER open  type: find");
 
     if (haveCanvas)
         canvas.pushSprite(0, 0);
@@ -586,7 +715,9 @@ void AdvUI::drawNode()
     }
 
     // message thread (chronological, most recent at the bottom)
-    const int fy0 = 30, lh = 11, maxLines = (120 - fy0) / lh;
+    const int fy0 = 30, lh = 17; // FreeSans line height, same as the contact list
+    int bottom = (mode == MODE_COMPOSE) ? 112 : 122; // leave room for the compose bar
+    int maxLines = (bottom - fy0) / lh;
     int matched[kMaxMsgs], mc = 0;
     for (int i = 0; i < g_msgCount; i++) {
         int idx = (g_msgCount == kMaxMsgs) ? (g_msgNext + i) % kMaxMsgs : i;
@@ -598,6 +729,8 @@ void AdvUI::drawNode()
         g->setCursor(4, fy0);
         g->print("(no messages yet)");
     } else {
+        g->setFont(&lgfx::fonts::FreeSansBold9pt7b);
+        g->setTextSize(1);
         int start = mc > maxLines ? mc - maxLines : 0;
         int y = fy0;
         for (int i = start; i < mc; i++) {
@@ -605,15 +738,41 @@ void AdvUI::drawNode()
             bool out = (m.from == me);
             char line[180];
             snprintf(line, sizeof(line), "%s%s", out ? "> " : "< ", m.text);
-            fitWidth(g, line, 232);
+            bool failed = out && m.status == MSG_FAILED;
+            fitWidth(g, line, failed ? 150 : (out ? 214 : 232));
             g->setTextColor(out ? 0x07FF : 0xFFFF); // outgoing cyan, incoming white
             g->setCursor(4, y);
             g->print(line);
+            if (failed) {
+                g->setFont(&lgfx::fonts::Font0); // red error name at the right
+                g->setTextSize(1);
+                g->setTextColor(0xF800);
+                const char *en = errName(m.err);
+                g->setCursor(238 - g->textWidth(en), y + 4);
+                g->print(en);
+                g->setFont(&lgfx::fonts::FreeSansBold9pt7b); // restore for the next line
+            } else if (out) {
+                drawMsgStatus(g, 220, y, m.status);
+            }
             y += lh;
         }
     }
 
-    drawFooter(g, selectedNum == me ? "ENTER: rename   ESC: back" : "ESC: back");
+    if (mode == MODE_COMPOSE) {
+        g->drawFastHLine(0, 114, 240, 0x39C7);
+        g->setFont(&lgfx::fonts::FreeSansBold9pt7b);
+        g->setTextSize(1);
+        g->setTextColor(0xFFE0); // yellow
+        char cbuf[210];
+        snprintf(cbuf, sizeof(cbuf), "%s_", msgBuf);
+        char *shown = cbuf; // drop leading chars so the cursor stays visible
+        while (*shown && g->textWidth(shown) > 232)
+            shown++;
+        g->setCursor(4, 120);
+        g->print(shown);
+    } else {
+        drawFooter(g, "type to reply   ESC: back");
+    }
 
     if (haveCanvas)
         canvas.pushSprite(0, 0);
@@ -928,31 +1087,68 @@ void AdvUI::handleKey(char ch)
 
     if (mode == MODE_NODE) {
         if (esc || bksp) {
-            mode = MODE_PICKER;
-        } else if (enter && nodeDB && selectedNum == nodeDB->getNodeNum()) {
-            // our own node: open the long-name editor, pre-filled with the current name
-            editTarget = 0;
-            strncpy(nameBuf, owner.long_name, sizeof(nameBuf));
-            nameBuf[sizeof(nameBuf) - 1] = 0;
-            nameLen = strlen(nameBuf);
-            nameReturn = MODE_NODE;
-            mode = MODE_SETNAME;
+            mode = nodeReturn;
+        } else if (printable) {
+            msgBuf[0] = c; // start composing a reply to this node
+            msgBuf[1] = 0;
+            msgLen = 1;
+            mode = MODE_COMPOSE;
         }
         return;
     }
 
-    // Node list: any interaction opens the picker.
+    if (mode == MODE_COMPOSE) {
+        if (esc) {
+            mode = MODE_NODE;
+        } else if (enter) {
+            if (msgLen)
+                sendMessage(selectedNum, msgBuf);
+            msgLen = 0;
+            msgBuf[0] = 0;
+            mode = MODE_NODE;
+        } else if (bksp) {
+            if (msgLen)
+                msgBuf[--msgLen] = 0;
+        } else if (printable && msgLen < sizeof(msgBuf) - 1) {
+            msgBuf[msgLen++] = c;
+            msgBuf[msgLen] = 0;
+        }
+        return;
+    }
+
+    // Home node list: navigable directly (cursor + scroll); typing opens the filter.
     if (mode == MODE_NODES) {
-        if (!(esc || printable || up || down || enter))
+        rebuildFiltered();
+        if (up) {
+            if (sel > 0)
+                sel--;
             return;
+        }
+        if (down) {
+            if (sel < filteredCount - 1)
+                sel++;
+            return;
+        }
+        if (enter) {
+            if (sel < filteredCount) {
+                meshtastic_NodeInfoLite *node = nodeDB ? nodeDB->getMeshNodeByIndex(filtered[sel]) : nullptr;
+                if (node) {
+                    selectedNum = node->num;
+                    nodeReturn = MODE_NODES;
+                    mode = MODE_NODE;
+                }
+            }
+            return;
+        }
+        if (!printable)
+            return; // short ESC / anything else: nothing at the root
+        // a printable char: switch to the filter picker and let it consume the char below
         mode = MODE_PICKER;
         queryLen = 0;
         query[0] = 0;
         sel = 0;
         scrollTop = 0;
-        if (esc)
-            return; // opened an empty picker
-        // fall through so a printable/arrow acts immediately
+        // fall through to MODE_PICKER handling
     }
 
     // MODE_PICKER
@@ -960,6 +1156,8 @@ void AdvUI::handleKey(char ch)
         mode = MODE_NODES;
         queryLen = 0;
         query[0] = 0;
+        sel = 0;
+        scrollTop = 0;
         return;
     }
 
@@ -980,6 +1178,7 @@ void AdvUI::handleKey(char ch)
             meshtastic_NodeInfoLite *node = nodeDB ? nodeDB->getMeshNodeByIndex(filtered[sel]) : nullptr;
             if (node) {
                 selectedNum = node->num;
+                nodeReturn = MODE_PICKER;
                 mode = MODE_NODE;
             }
         }
@@ -1011,7 +1210,7 @@ int32_t AdvUI::runOnce()
         handleFromRadio(api.lastFromRadio()); // pick out incoming text messages
     }
 
-    kb.setNavKeys(mode != MODE_SETNAME); // , ; . / are symbols while typing, arrows otherwise
+    kb.setNavKeys(mode != MODE_SETNAME && mode != MODE_COMPOSE); // symbols while typing, arrows otherwise
     kb.trigger();
     bool keyDuringSplash = false;
     while (kb.hasEvent()) {
@@ -1037,7 +1236,7 @@ int32_t AdvUI::runOnce()
         drawSplash();
     else if (mode == MODE_PICKER)
         drawPicker();
-    else if (mode == MODE_NODE)
+    else if (mode == MODE_NODE || mode == MODE_COMPOSE)
         drawNode();
     else if (mode == MODE_SETNAME)
         drawSetName();

@@ -1,6 +1,6 @@
 {
   "name": "meshtastic-adv",
-  "version": "2.8.0-m2c-cyrillic (advui)",
+  "version": "2.8.0-persist-fav (advui)",
   "new_install_prompt_erase": true,
   "builds": [
     {

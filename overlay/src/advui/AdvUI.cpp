@@ -1,5 +1,6 @@
 #include "AdvUI.h"
 #include "CyrillicFont.h"
+#include "FSCommon.h"
 #include "PowerStatus.h"
 #include "configuration.h"
 #include "mesh/Channels.h"
@@ -101,8 +102,10 @@ const char *errName(uint8_t e)
 constexpr int kMaxMsgs = 32;
 constexpr int kNumSettings = 6; // Name, Short, Region, Preset, Frequency, Channel
 Msg g_msgs[kMaxMsgs];
-int g_msgCount = 0; // populated slots (grows to kMaxMsgs)
-int g_msgNext = 0;  // next write slot (ring head)
+int g_msgCount = 0;         // populated slots (grows to kMaxMsgs)
+int g_msgNext = 0;          // next write slot (ring head)
+bool g_msgsDirty = false;   // ring changed since the last flash save
+uint32_t g_lastSaveMs = 0;  // when we last wrote the ring to flash
 
 void addMsg(uint32_t from, uint32_t to, uint32_t rxTime, bool unread, const char *text, uint32_t id, uint8_t status)
 {
@@ -119,6 +122,7 @@ void addMsg(uint32_t from, uint32_t to, uint32_t rxTime, bool unread, const char
     g_msgNext = (g_msgNext + 1) % kMaxMsgs;
     if (g_msgCount < kMaxMsgs)
         g_msgCount++;
+    g_msgsDirty = true;
 }
 
 // Mark the sent message whose id matches an incoming ACK/routing response.
@@ -128,6 +132,7 @@ void ackMsg(uint32_t reqId, uint8_t status, uint8_t err)
         if (g_msgs[i].id == reqId && g_msgs[i].id != 0) {
             g_msgs[i].status = status;
             g_msgs[i].err = err;
+            g_msgsDirty = true;
             return;
         }
 }
@@ -144,17 +149,60 @@ int unreadCount()
 void markReadFrom(uint32_t nodeNum)
 {
     for (int i = 0; i < g_msgCount; i++)
-        if (g_msgs[i].from == nodeNum)
+        if (g_msgs[i].from == nodeNum && !g_msgs[i].read) {
             g_msgs[i].read = true;
+            g_msgsDirty = true;
+        }
 }
 
-// True for nodes we've heard from or messaged — they sort ahead of plain neighbours.
-bool hasConversation(uint32_t nodeNum)
+// True if there's an unread message from this node (drives the envelope marker).
+bool hasUnreadFrom(uint32_t nodeNum)
 {
     for (int i = 0; i < g_msgCount; i++)
-        if (g_msgs[i].from == nodeNum || g_msgs[i].to == nodeNum)
+        if (g_msgs[i].from == nodeNum && !g_msgs[i].read)
             return true;
     return false;
+}
+
+// Persist the message ring (with delivery status + read flags) to flash, so a
+// reboot keeps the conversation. Written debounced from runOnce.
+constexpr uint32_t kMsgMagic = 0x41565331; // "AVS1" — bump if Msg layout changes
+const char *kMsgPath = "/advui_msgs.bin";
+
+void saveMsgs()
+{
+    auto f = FSCom.open(kMsgPath, FILE_O_WRITE);
+    if (!f)
+        return;
+    uint32_t magic = kMsgMagic;
+    int32_t cnt = g_msgCount, nxt = g_msgNext;
+    f.write((const uint8_t *)&magic, sizeof(magic));
+    f.write((const uint8_t *)&cnt, sizeof(cnt));
+    f.write((const uint8_t *)&nxt, sizeof(nxt));
+    f.write((const uint8_t *)g_msgs, sizeof(g_msgs));
+    f.close();
+}
+
+void loadMsgs()
+{
+    auto f = FSCom.open(kMsgPath, FILE_O_READ);
+    if (!f)
+        return;
+    uint32_t magic = 0;
+    int32_t cnt = 0, nxt = 0;
+    f.read((uint8_t *)&magic, sizeof(magic));
+    f.read((uint8_t *)&cnt, sizeof(cnt));
+    f.read((uint8_t *)&nxt, sizeof(nxt));
+    size_t n = f.read((uint8_t *)g_msgs, sizeof(g_msgs));
+    f.close();
+    if (magic != kMsgMagic || n != sizeof(g_msgs) || cnt < 0 || cnt > kMaxMsgs || nxt < 0 || nxt >= kMaxMsgs)
+        return;
+    g_msgCount = cnt;
+    g_msgNext = nxt;
+    // an outgoing message still "sending" before the reboot can't get its ACK now
+    for (int i = 0; i < g_msgCount; i++)
+        if (g_msgs[i].status == MSG_SENDING)
+            g_msgs[i].status = MSG_FAILED;
 }
 
 // Default node ordering: favourites first, then nodes we have a conversation with,
@@ -164,7 +212,7 @@ bool nodeLess(uint16_t a, uint16_t b)
 {
     const meshtastic_NodeInfoLite *na = nodeDB->getMeshNodeByIndex(a);
     const meshtastic_NodeInfoLite *nb = nodeDB->getMeshNodeByIndex(b);
-    auto bucket = [](const meshtastic_NodeInfoLite *n) { return isFav(n) ? 0 : hasConversation(n->num) ? 1 : 2; };
+    auto bucket = [](const meshtastic_NodeInfoLite *n) { return hasUnreadFrom(n->num) ? 0 : isFav(n) ? 1 : 2; };
     int ba = bucket(na), bb = bucket(nb);
     if (ba != bb)
         return ba < bb;
@@ -357,19 +405,29 @@ void drawNodeRow(lgfx::LGFXBase *g, const meshtastic_NodeInfoLite *n, int y, boo
     g->setCursor(xRole, metaY);
     g->print(roleTag(n));
 
+    // envelope marker for a node with unread messages, before the name
+    int nameX = 4;
+    if (!self && hasUnreadFrom(n->num)) {
+        int ex = 4, ey = y + 5;
+        g->drawRect(ex, ey, 11, 8, 0xF800); // red envelope
+        g->drawLine(ex, ey, ex + 5, ey + 4, 0xF800);
+        g->drawLine(ex + 10, ey, ex + 5, ey + 4, 0xF800);
+        nameX = 18;
+    }
+
     bool fav = isFav(n);
     char nm[28];
     const char *name = nodeName(n);
     if (name[0])
-        snprintf(nm, sizeof(nm), "%s%s", fav ? "*" : "", name);
+        snprintf(nm, sizeof(nm), "%s", name);
     else
         snprintf(nm, sizeof(nm), "!%08x", (unsigned)n->num);
 
     g->setFont(&lgfx::fonts::FreeSansBold9pt7b);
     g->setTextSize(1);
-    fitWidth(g, nm, xBars - 10);
-    g->setTextColor(self ? 0xFFE0 : (fav ? 0xFD20 : 0xFFFF));
-    g->setCursor(4, y + 2);
+    fitWidth(g, nm, xBars - 6 - nameX);
+    g->setTextColor(fav ? 0xFFE0 : 0xFFFF); // favourite = yellow
+    g->setCursor(nameX, y + 2);
     g->print(nm);
 }
 
@@ -421,6 +479,7 @@ void AdvUI::initHardware()
     kb.begin();
     LOG_INFO("advui: keyboard ready");
 
+    loadMsgs(); // restore the saved conversation from flash
     bootMs = millis();
     drawSplash(); // branded splash instead of black while the mesh comes up
 }
@@ -623,7 +682,7 @@ void AdvUI::drawNodeList()
         y += rowH;
     }
 
-    drawFooter(g, "up/dn move  ENTER open  type: find");
+    drawFooter(g, "up/dn  </>fav  ENTER open  type find");
 
     if (haveCanvas)
         canvas.pushSprite(0, 0);
@@ -678,7 +737,7 @@ void AdvUI::drawPicker()
         y += rowH;
     }
 
-    drawFooter(g, "up/dn move  ENTER open  ESC back");
+    drawFooter(g, "up/dn  </>fav  ENTER open  ESC back");
 
     if (haveCanvas)
         canvas.pushSprite(0, 0);
@@ -984,6 +1043,8 @@ void AdvUI::handleKey(char ch)
     bool enter = c == 0x0d; // SELECT
     bool up = c == 0xb5;    // UP
     bool down = c == 0xb6;  // DOWN
+    bool left = c == 0xb4;  // LEFT  -> favourite
+    bool right = c == 0xb7; // RIGHT -> unfavourite
     bool printable = c >= 0x20 && c < 0x7f;
 
     if (c == AdvKeyboard::kLongEsc) { // long-press ESC opens settings from anywhere
@@ -1133,6 +1194,14 @@ void AdvUI::handleKey(char ch)
             }
             return;
         }
+        if (left || right) { // favourite / unfavourite the selected node (persists in nodeDB)
+            if (sel < filteredCount && nodeDB) {
+                meshtastic_NodeInfoLite *node = nodeDB->getMeshNodeByIndex(filtered[sel]);
+                if (node)
+                    nodeDB->set_favorite(left, node->num);
+            }
+            return;
+        }
         if (!printable)
             return; // short ESC / anything else: nothing at the root
         // a printable char: switch to the filter picker and let it consume the char below
@@ -1174,6 +1243,14 @@ void AdvUI::handleKey(char ch)
                 nodeReturn = MODE_PICKER;
                 mode = MODE_NODE;
             }
+        }
+        return;
+    }
+    if (left || right) { // favourite / unfavourite the selected node
+        if (sel < filteredCount && nodeDB) {
+            meshtastic_NodeInfoLite *node = nodeDB->getMeshNodeByIndex(filtered[sel]);
+            if (node)
+                nodeDB->set_favorite(left, node->num);
         }
         return;
     }
@@ -1223,6 +1300,13 @@ int32_t AdvUI::runOnce()
     if (splashDone && !announced && nodeInfoModule) {
         nodeInfoModule->sendOurNodeInfo(NODENUM_BROADCAST, false);
         announced = true;
+    }
+
+    // Persist the conversation, debounced, so we don't hammer the flash.
+    if (g_msgsDirty && millis() - g_lastSaveMs > 3000) {
+        saveMsgs();
+        g_msgsDirty = false;
+        g_lastSaveMs = millis();
     }
 
     if (!splashDone)

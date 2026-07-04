@@ -4,6 +4,7 @@
 #include "mesh/Channels.h"
 #include "mesh/MeshService.h"
 #include "mesh/NodeDB.h"
+#include "modules/NodeInfoModule.h"
 #include <algorithm>
 #include <cctype>
 #include <cstdio>
@@ -1025,6 +1026,12 @@ int32_t AdvUI::runOnce()
 
     if (!splashDone && (keyDuringSplash || millis() - bootMs > 2000))
         splashDone = true;
+
+    // Announce ourselves early so neighbours see us right away — stock waits ~30s.
+    if (splashDone && !announced && nodeInfoModule) {
+        nodeInfoModule->sendOurNodeInfo(NODENUM_BROADCAST, false);
+        announced = true;
+    }
 
     if (!splashDone)
         drawSplash();

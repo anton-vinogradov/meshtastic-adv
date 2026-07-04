@@ -70,7 +70,7 @@ const unsigned char TapMap[kNumKeys][3] = {{'`', '~', Key::ESC},
                                            {'m', 'M', Key::MUTE_TOGGLE},
                                            {'0', ')', 0x00},
                                            {'p', 'P', Key::SEND_PING},
-                                           {'l', 'L', 0x00},
+                                           {'l', 'L', AdvKeyboard::kLang}, // Fn+L: RU/EN input toggle
                                            {',', '<', Key::LEFT},
                                            {'_', '-', 0x00},
                                            {'[', '{', 0x00},

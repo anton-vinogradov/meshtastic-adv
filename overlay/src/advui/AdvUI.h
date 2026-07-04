@@ -13,11 +13,13 @@ namespace advui
 /**
  * Our own UI layer, replacing the stock graphics::Screen — additive overlay.
  *
- * Runs as an OSThread (scheduler-driven, no main-loop edits). Two screens:
- *  - node list (default)
- *  - contact picker (ESC / start typing): a query bar + filtered node list.
- * Keyboard input comes from our own AdvKeyboard (TCA8418), polled here — the
- * stock InputBroker/keyboard is disabled.
+ * Runs as an OSThread (scheduler-driven, no main-loop edits). Screens:
+ *  - splash (branded boot screen while the mesh comes up)
+ *  - node list (overview): sorted favourites -> conversations -> by hops
+ *  - contact picker (ESC / type): query bar + filtered node list, a moving
+ *    selection cursor (up/down), Enter opens the node
+ *  - node view (per-node detail; the future conversation lives here)
+ * Keyboard input comes from our own AdvKeyboard (TCA8418), polled here.
  */
 class AdvUI : public concurrency::OSThread
 {
@@ -28,11 +30,15 @@ class AdvUI : public concurrency::OSThread
     int32_t runOnce() override;
 
   private:
-    enum Mode : uint8_t { MODE_NODES, MODE_PICKER };
+    enum Mode : uint8_t { MODE_NODES, MODE_PICKER, MODE_NODE };
 
     void initHardware();
+    void drawSplash();
     void drawNodeList();
     void drawPicker();
+    void drawNode();
+    void rebuildFiltered();
+    int buildNodeList(uint16_t *out, int max, const char *query);
     void handleKey(char c);
 
     InternalAPI api;
@@ -44,9 +50,17 @@ class AdvUI : public concurrency::OSThread
     char query[24] = {0};
     uint8_t queryLen = 0;
 
+    static constexpr int kMaxFiltered = 128;
+    uint16_t filtered[kMaxFiltered]; // node DB indices, sorted + query-matched (picker)
+    int filteredCount = 0;
+    int sel = 0;          // selection cursor into filtered[]
+    int scrollTop = 0;    // first visible row
+    uint32_t selectedNum = 0; // node chosen with Enter (MODE_NODE)
+
     bool inited = false;
     bool haveCanvas = false;
-    uint32_t fromRadioCount = 0;
+    bool splashDone = false;
+    uint32_t bootMs = 0;
     uint8_t fromRadioBuf[MAX_TO_FROM_RADIO_SIZE]; // sized by PhoneAPI.h
 };
 

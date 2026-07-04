@@ -15,8 +15,8 @@ class AdvDisplay : public lgfx::LGFX_Device
     lgfx::Panel_ST7789 _panel;
     lgfx::Bus_SPI _bus;
     // Backlight/power-rail (GPIO38) is driven as a steady digital HIGH in
-    // AdvUI::setup() — on this board pin 38 is a power-enable, not a dimmable
-    // backlight, so PWM leaves the rail under-powered.
+    // AdvUI::initHardware() — on this board pin 38 is a power-enable, not a
+    // dimmable backlight, so PWM leaves the rail under-powered.
 
   public:
     AdvDisplay()

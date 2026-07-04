@@ -5,7 +5,10 @@ Keyboard-first **Meshtastic** client for the **M5Stack Cardputer ADV** with the 
 A from-scratch UI focused on one thing: making it genuinely comfortable to *message people* on the mesh
 from a pocket QWERTY device — while keeping the full feature set of stock Meshtastic.
 
-> Status: **WIP — M0 (bring-up)**. Nothing to flash yet.
+> Status: **WIP — M1 (read path)**. The custom UI runs on-device: a branded splash, a sorted
+> node list (signal · hops · last-heard · role), and a keyboard-driven contact picker. Sending
+> messages is next. See the [interface guide](docs/interface.md) for what's on screen and how
+> to drive it.
 
 ## Idea
 

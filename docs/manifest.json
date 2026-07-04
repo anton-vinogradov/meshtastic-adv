@@ -1,6 +1,6 @@
 {
   "name": "meshtastic-adv",
-  "version": "2.8.0-m2a (advui)",
+  "version": "2.8.0-m2a2 (advui)",
   "new_install_prompt_erase": true,
   "builds": [
     {

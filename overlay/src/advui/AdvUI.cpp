@@ -7,6 +7,7 @@
 #include <algorithm>
 #include <cctype>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 
 extern uint32_t rebootAtMsec; // main.cpp: set to a future millis() to schedule a reboot
@@ -222,6 +223,16 @@ int optIndex(const EnumOpt *opts, int cnt, int value)
         if (opts[i].value == value)
             return i;
     return 0;
+}
+
+// Text-editor (MODE_SETNAME) targets: 0 long name, 1 short name, 2 frequency, 3 channel.
+unsigned editMax(int t)
+{
+    return t == 1 ? 4 : t == 2 ? 9 : t == 3 ? 11 : 24;
+}
+const char *editTitle(int t)
+{
+    return t == 1 ? "Set short name" : t == 2 ? "Set frequency (MHz)" : t == 3 ? "Set channel name" : "Set long name";
 }
 
 // The node row (list and picker): proportional name on the left, then a compact
@@ -617,7 +628,7 @@ void AdvUI::drawSetName()
     g->setTextSize(1);
     g->setTextColor(0x07FF); // cyan
     g->setCursor(4, 3);
-    g->print(editShort ? "Set short name" : "Set long name");
+    g->print(editTitle(editTarget));
     g->drawFastHLine(0, 13, 240, 0x39C7);
 
     g->setFont(&lgfx::fonts::FreeSansBold9pt7b);
@@ -632,7 +643,7 @@ void AdvUI::drawSetName()
     g->setTextSize(1);
     g->setTextColor(0x8410); // gray
     g->setCursor(6, 74);
-    g->printf("%u / %u", (unsigned)nameLen, editShort ? 4u : 24u);
+    g->printf("%u / %u", (unsigned)nameLen, editMax(editTarget));
 
     drawFooter(g, "type   ENTER save   ESC cancel");
 
@@ -642,22 +653,43 @@ void AdvUI::drawSetName()
 
 // Writes the edited name into the engine's owner and broadcasts it — the same
 // path AdminModule::handleSetOwner takes, but driven from our UI.
-void AdvUI::applyName()
+bool AdvUI::applyName()
 {
-    if (editShort) {
+    if (editTarget == 2) { // frequency (MHz) -> override_frequency; radio restart to apply
+        config.lora.override_frequency = strtof(nameBuf, nullptr);
+        if (nodeDB)
+            nodeDB->saveToDisk(SEGMENT_CONFIG);
+        rebootAtMsec = millis() + 1500;
+        mode = MODE_REBOOT;
+        return true;
+    }
+    if (editTarget == 3) { // primary channel name; radio restart to apply
+        meshtastic_Channel ch = channels.getByIndex(0);
+        strncpy(ch.settings.name, nameBuf, sizeof(ch.settings.name));
+        ch.settings.name[sizeof(ch.settings.name) - 1] = 0;
+        channels.setChannel(ch);
+        channels.onConfigChanged();
+        if (nodeDB)
+            nodeDB->saveToDisk(SEGMENT_CHANNELS);
+        rebootAtMsec = millis() + 1500;
+        mode = MODE_REBOOT;
+        return true;
+    }
+
+    // name (long / short): applied live, no reboot
+    if (editTarget == 1) {
         strncpy(owner.short_name, nameBuf, sizeof(owner.short_name));
         owner.short_name[sizeof(owner.short_name) - 1] = 0;
     } else {
         strncpy(owner.long_name, nameBuf, sizeof(owner.long_name));
         owner.long_name[sizeof(owner.long_name) - 1] = 0;
     }
-
     snprintf(owner.id, sizeof(owner.id), "!%08x", (unsigned)(nodeDB ? nodeDB->getNodeNum() : 0));
-
     if (service)
         service->reloadOwner(true); // update local node DB + broadcast NodeInfo
     if (nodeDB)
         nodeDB->saveToDisk(SEGMENT_DEVICESTATE | SEGMENT_NODEDATABASE); // persist across reboots
+    return false;
 }
 
 void AdvUI::drawSettings()
@@ -808,17 +840,18 @@ void AdvUI::handleKey(char ch)
     }
 
     if (mode == MODE_SETNAME) {
-        unsigned maxLen = editShort ? 4 : (unsigned)(sizeof(nameBuf) - 1);
+        unsigned maxLen = editMax(editTarget);
+        bool numeric = (editTarget == 2);
         if (esc) {
             mode = nameReturn;
         } else if (enter) {
-            if (nameLen)
-                applyName();
-            mode = nameReturn;
+            bool rebooting = nameLen && applyName();
+            if (!rebooting)
+                mode = nameReturn;
         } else if (bksp) {
             if (nameLen)
                 nameBuf[--nameLen] = 0;
-        } else if (printable && nameLen < maxLen) {
+        } else if (printable && nameLen < maxLen && (!numeric || (c >= '0' && c <= '9') || c == '.')) {
             nameBuf[nameLen++] = c;
             nameBuf[nameLen] = 0;
         }
@@ -835,8 +868,8 @@ void AdvUI::handleKey(char ch)
             if (setSel < kNumSettings - 1)
                 setSel++;
         } else if (enter && setSel <= 1) { // 0 = long name, 1 = short name
-            editShort = (setSel == 1);
-            const char *cur = editShort ? owner.short_name : owner.long_name;
+            editTarget = setSel;
+            const char *cur = (setSel == 1) ? owner.short_name : owner.long_name;
             strncpy(nameBuf, cur, sizeof(nameBuf));
             nameBuf[sizeof(nameBuf) - 1] = 0;
             nameLen = strlen(nameBuf);
@@ -852,8 +885,23 @@ void AdvUI::handleKey(char ch)
             pickSel = optIndex(kPresetOpts, kPresetCount, (int)config.lora.modem_preset);
             pickScroll = 0;
             mode = MODE_PICKLIST;
+        } else if (enter && setSel == 4) { // Frequency (MHz)
+            editTarget = 2;
+            if (config.lora.override_frequency > 0)
+                snprintf(nameBuf, sizeof(nameBuf), "%.3f", (double)config.lora.override_frequency);
+            else
+                nameBuf[0] = 0;
+            nameLen = strlen(nameBuf);
+            nameReturn = MODE_SETTINGS;
+            mode = MODE_SETNAME;
+        } else if (enter && setSel == 5) { // Channel name
+            editTarget = 3;
+            strncpy(nameBuf, channels.getByIndex(0).settings.name, sizeof(nameBuf));
+            nameBuf[sizeof(nameBuf) - 1] = 0;
+            nameLen = strlen(nameBuf);
+            nameReturn = MODE_SETTINGS;
+            mode = MODE_SETNAME;
         }
-        // setSel 4 (Frequency) and 5 (Channel) get their editors next.
         return;
     }
 
@@ -882,7 +930,7 @@ void AdvUI::handleKey(char ch)
             mode = MODE_PICKER;
         } else if (enter && nodeDB && selectedNum == nodeDB->getNodeNum()) {
             // our own node: open the long-name editor, pre-filled with the current name
-            editShort = false;
+            editTarget = 0;
             strncpy(nameBuf, owner.long_name, sizeof(nameBuf));
             nameBuf[sizeof(nameBuf) - 1] = 0;
             nameLen = strlen(nameBuf);

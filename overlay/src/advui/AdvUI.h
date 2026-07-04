@@ -41,7 +41,7 @@ class AdvUI : public concurrency::OSThread
     void drawSetName();
     void drawPickList();
     void drawReboot();
-    void applyName();
+    bool applyName(); // returns true if it scheduled a reboot (frequency/channel)
     void applyLoRa(int target, int value);
     void rebuildFiltered();
     int buildNodeList(uint16_t *out, int max, const char *query);
@@ -66,7 +66,7 @@ class AdvUI : public concurrency::OSThread
 
     char nameBuf[25] = {0};   // node-name editor buffer (MODE_SETNAME)
     uint8_t nameLen = 0;
-    bool editShort = false;   // MODE_SETNAME edits the short name (else the long name)
+    int editTarget = 0;       // MODE_SETNAME target: 0 long name, 1 short, 2 frequency, 3 channel
     Mode nameReturn = MODE_SETTINGS; // where the name editor returns on save/cancel
     int setSel = 0;           // settings-menu cursor (MODE_SETTINGS)
     int pickTarget = 0;       // MODE_PICKLIST: 0 = region, 1 = preset

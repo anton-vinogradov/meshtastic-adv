@@ -1,11 +1,15 @@
 #include "AdvUI.h"
 #include "PowerStatus.h"
 #include "configuration.h"
+#include "mesh/Channels.h"
+#include "mesh/MeshService.h"
 #include "mesh/NodeDB.h"
 #include <algorithm>
 #include <cctype>
 #include <cstdio>
 #include <cstring>
+
+extern uint32_t rebootAtMsec; // main.cpp: set to a future millis() to schedule a reboot
 
 namespace advui
 {
@@ -41,10 +45,57 @@ bool ciContains(const char *hay, const char *needle)
     return false;
 }
 
-// Placeholder until direct messages land (M1b-3): true for nodes we've exchanged
-// messages with, so they sort ahead of plain neighbours.
-bool hasConversation(const meshtastic_NodeInfoLite *)
+// Incoming text messages, kept in a small RAM ring (oldest overwritten). Enough
+// to show a node's recent thread and to know who we've talked to for sorting.
+struct Msg {
+    uint32_t from;
+    uint32_t to; // 0xFFFFFFFF = broadcast/channel, else a DM to that node
+    uint32_t rxTime;
+    bool read;
+    char text[160];
+};
+constexpr int kMaxMsgs = 32;
+constexpr int kNumSettings = 6; // Name, Short, Region, Preset, Frequency, Channel
+Msg g_msgs[kMaxMsgs];
+int g_msgCount = 0; // populated slots (grows to kMaxMsgs)
+int g_msgNext = 0;  // next write slot (ring head)
+
+void addMsg(uint32_t from, uint32_t to, uint32_t rxTime, bool unread, const char *text)
 {
+    Msg &m = g_msgs[g_msgNext];
+    m.from = from;
+    m.to = to;
+    m.rxTime = rxTime;
+    m.read = !unread;
+    strncpy(m.text, text, sizeof(m.text) - 1);
+    m.text[sizeof(m.text) - 1] = 0;
+    g_msgNext = (g_msgNext + 1) % kMaxMsgs;
+    if (g_msgCount < kMaxMsgs)
+        g_msgCount++;
+}
+
+int unreadCount()
+{
+    int c = 0;
+    for (int i = 0; i < g_msgCount; i++)
+        if (!g_msgs[i].read)
+            c++;
+    return c;
+}
+
+void markReadFrom(uint32_t nodeNum)
+{
+    for (int i = 0; i < g_msgCount; i++)
+        if (g_msgs[i].from == nodeNum)
+            g_msgs[i].read = true;
+}
+
+// True for nodes we've heard from or messaged — they sort ahead of plain neighbours.
+bool hasConversation(uint32_t nodeNum)
+{
+    for (int i = 0; i < g_msgCount; i++)
+        if (g_msgs[i].from == nodeNum || g_msgs[i].to == nodeNum)
+            return true;
     return false;
 }
 
@@ -55,7 +106,7 @@ bool nodeLess(uint16_t a, uint16_t b)
 {
     const meshtastic_NodeInfoLite *na = nodeDB->getMeshNodeByIndex(a);
     const meshtastic_NodeInfoLite *nb = nodeDB->getMeshNodeByIndex(b);
-    auto bucket = [](const meshtastic_NodeInfoLite *n) { return isFav(n) ? 0 : hasConversation(n) ? 1 : 2; };
+    auto bucket = [](const meshtastic_NodeInfoLite *n) { return isFav(n) ? 0 : hasConversation(n->num) ? 1 : 2; };
     int ba = bucket(na), bb = bucket(nb);
     if (ba != bb)
         return ba < bb;
@@ -106,6 +157,71 @@ const char *roleTag(const meshtastic_NodeInfoLite *n)
     default:
         return "CLI";
     }
+}
+
+const char *regionName(meshtastic_Config_LoRaConfig_RegionCode r)
+{
+    switch (r) {
+    case meshtastic_Config_LoRaConfig_RegionCode_UNSET:
+        return "UNSET";
+    case meshtastic_Config_LoRaConfig_RegionCode_US:
+        return "US";
+    case meshtastic_Config_LoRaConfig_RegionCode_EU_868:
+        return "EU_868";
+    case meshtastic_Config_LoRaConfig_RegionCode_RU:
+        return "RU";
+    default: {
+        static char buf[8];
+        snprintf(buf, sizeof(buf), "R%d", (int)r);
+        return buf;
+    }
+    }
+}
+
+const char *presetName(meshtastic_Config_LoRaConfig_ModemPreset p)
+{
+    switch (p) {
+    case meshtastic_Config_LoRaConfig_ModemPreset_LONG_FAST:
+        return "LongFast";
+    case meshtastic_Config_LoRaConfig_ModemPreset_LONG_SLOW:
+        return "LongSlow";
+    case meshtastic_Config_LoRaConfig_ModemPreset_LONG_MODERATE:
+        return "LongMod";
+    case meshtastic_Config_LoRaConfig_ModemPreset_MEDIUM_SLOW:
+        return "MedSlow";
+    case meshtastic_Config_LoRaConfig_ModemPreset_MEDIUM_FAST:
+        return "MediumFast";
+    case meshtastic_Config_LoRaConfig_ModemPreset_SHORT_SLOW:
+        return "ShortSlow";
+    case meshtastic_Config_LoRaConfig_ModemPreset_SHORT_FAST:
+        return "ShortFast";
+    case meshtastic_Config_LoRaConfig_ModemPreset_SHORT_TURBO:
+        return "ShortTurbo";
+    default:
+        return "custom";
+    }
+}
+
+// Pickable enum values for the settings list-pickers (name + raw enum value).
+struct EnumOpt {
+    const char *name;
+    int value;
+};
+const EnumOpt kRegionOpts[] = {{"UNSET", 0},   {"US", 1},      {"EU_433", 2}, {"EU_868", 3}, {"CN", 4},
+                               {"JP", 5},       {"ANZ", 6},     {"KR", 7},     {"TW", 8},     {"RU", 9},
+                               {"IN", 10},      {"NZ_865", 11}, {"TH", 12},    {"UA_433", 14},
+                               {"UA_868", 15},  {"KZ_433", 23}, {"KZ_863", 24}};
+const EnumOpt kPresetOpts[] = {{"LongFast", 0},  {"LongSlow", 1},  {"LongMod", 7},    {"MedSlow", 3},
+                               {"MediumFast", 4}, {"ShortSlow", 5}, {"ShortFast", 6},  {"ShortTurbo", 8}};
+constexpr int kRegionCount = sizeof(kRegionOpts) / sizeof(kRegionOpts[0]);
+constexpr int kPresetCount = sizeof(kPresetOpts) / sizeof(kPresetOpts[0]);
+
+int optIndex(const EnumOpt *opts, int cnt, int value)
+{
+    for (int i = 0; i < cnt; i++)
+        if (opts[i].value == value)
+            return i;
+    return 0;
 }
 
 // The node row (list and picker): proportional name on the left, then a compact
@@ -255,6 +371,30 @@ void AdvUI::drawSplash()
         canvas.pushSprite(0, 0);
 }
 
+// Picks incoming text messages out of the FromRadio stream and files them in the
+// ring. Everything else (config, node DB, telemetry, ...) is ignored here.
+void AdvUI::handleFromRadio(const meshtastic_FromRadio &fr)
+{
+    if (fr.which_payload_variant != meshtastic_FromRadio_packet_tag)
+        return;
+    const meshtastic_MeshPacket &p = fr.packet;
+    if (p.which_payload_variant != meshtastic_MeshPacket_decoded_tag)
+        return;
+    if (p.decoded.portnum != meshtastic_PortNum_TEXT_MESSAGE_APP)
+        return;
+
+    char text[160];
+    size_t n = p.decoded.payload.size;
+    if (n > sizeof(text) - 1)
+        n = sizeof(text) - 1;
+    memcpy(text, p.decoded.payload.bytes, n);
+    text[n] = 0;
+
+    uint32_t me = nodeDB ? nodeDB->getNodeNum() : 0;
+    bool unread = (p.to == me && p.from != me); // a DM addressed to us (not a broadcast, not our echo)
+    addMsg(p.from, p.to, p.rx_time, unread, text);
+}
+
 // Fills out[] with node-DB indices matching query (all if query is null/empty),
 // in the default sorted order. Returns the count (capped at max).
 int AdvUI::buildNodeList(uint16_t *out, int max, const char *query)
@@ -311,6 +451,18 @@ void AdvUI::drawNodeList()
     g->setTextColor(bcol);
     g->setCursor(238 - bw, 3);
     g->print(bbuf);
+
+    int uc = unreadCount();
+    if (uc > 0) {
+        char ub[12];
+        snprintf(ub, sizeof(ub), "%d new", uc);
+        int tw = g->textWidth(ub);
+        int px = 238 - bw - 8 - (tw + 6);
+        g->fillRoundRect(px, 2, tw + 6, 10, 2, 0xF800); // red unread badge
+        g->setTextColor(0xFFFF);
+        g->setCursor(px + 3, 3);
+        g->print(ub);
+    }
 
     g->drawFastHLine(0, 13, 240, 0x39C7);
 
@@ -394,6 +546,9 @@ void AdvUI::drawNode()
     g->fillScreen(0x0000);
 
     meshtastic_NodeInfoLite *node = nodeDB ? nodeDB->getMeshNode(selectedNum) : nullptr;
+    uint32_t me = nodeDB ? nodeDB->getNodeNum() : 0;
+
+    markReadFrom(selectedNum); // opening the thread clears its unread
 
     g->setFont(&lgfx::fonts::Font0);
     g->setTextSize(1);
@@ -405,35 +560,235 @@ void AdvUI::drawNode()
         g->printf("!%08x", (unsigned)selectedNum);
     g->drawFastHLine(0, 13, 240, 0x39C7);
 
-    g->setTextColor(0xFFFF);
+    // compact status line
+    g->setTextColor(0x8410); // gray
+    g->setCursor(4, 17);
     if (node) {
-        g->setCursor(4, 20);
         g->printf("!%08x", (unsigned)node->num);
-        g->setCursor(4, 34);
-        if (node->snr_q4)
-            g->printf("SNR %.1f dB", node->snr_q4 / 4.0f);
-        else
-            g->print("SNR  -");
-        g->setCursor(4, 48);
         if (node->has_hops_away)
-            g->printf("hops %u", node->hops_away);
-        else
-            g->print("hops ?");
-        g->setCursor(4, 62);
-        g->printf("seen %us ago", (unsigned)sinceLastSeen(node));
+            g->printf("  %uh", node->hops_away);
+        if (node->snr_q4)
+            g->printf("  %.0fdB", node->snr_q4 / 4.0f);
     } else {
-        g->setCursor(4, 20);
         g->print("(node no longer in DB)");
     }
 
-    g->setTextColor(0x9CD3);
-    g->setCursor(4, 84);
-    g->print("(no messages yet)");
+    // message thread (chronological, most recent at the bottom)
+    const int fy0 = 30, lh = 11, maxLines = (120 - fy0) / lh;
+    int matched[kMaxMsgs], mc = 0;
+    for (int i = 0; i < g_msgCount; i++) {
+        int idx = (g_msgCount == kMaxMsgs) ? (g_msgNext + i) % kMaxMsgs : i;
+        if (g_msgs[idx].from == selectedNum || g_msgs[idx].to == selectedNum)
+            matched[mc++] = idx;
+    }
+    if (mc == 0) {
+        g->setTextColor(0x630C);
+        g->setCursor(4, fy0);
+        g->print("(no messages yet)");
+    } else {
+        int start = mc > maxLines ? mc - maxLines : 0;
+        int y = fy0;
+        for (int i = start; i < mc; i++) {
+            Msg &m = g_msgs[matched[i]];
+            bool out = (m.from == me);
+            char line[180];
+            snprintf(line, sizeof(line), "%s%s", out ? "> " : "< ", m.text);
+            fitWidth(g, line, 232);
+            g->setTextColor(out ? 0x07FF : 0xFFFF); // outgoing cyan, incoming white
+            g->setCursor(4, y);
+            g->print(line);
+            y += lh;
+        }
+    }
 
-    drawFooter(g, "ESC: back");
+    drawFooter(g, selectedNum == me ? "ENTER: rename   ESC: back" : "ESC: back");
 
     if (haveCanvas)
         canvas.pushSprite(0, 0);
+}
+
+void AdvUI::drawSetName()
+{
+    lgfx::LGFXBase *g = haveCanvas ? static_cast<lgfx::LGFXBase *>(&canvas) : static_cast<lgfx::LGFXBase *>(&display);
+
+    g->fillScreen(0x0000);
+
+    g->setFont(&lgfx::fonts::Font0);
+    g->setTextSize(1);
+    g->setTextColor(0x07FF); // cyan
+    g->setCursor(4, 3);
+    g->print(editShort ? "Set short name" : "Set long name");
+    g->drawFastHLine(0, 13, 240, 0x39C7);
+
+    g->setFont(&lgfx::fonts::FreeSansBold9pt7b);
+    g->setTextSize(1);
+    g->setTextColor(0xFFFF);
+    char field[27];
+    snprintf(field, sizeof(field), "%s_", nameBuf);
+    g->setCursor(6, 44);
+    g->print(field);
+
+    g->setFont(&lgfx::fonts::Font0);
+    g->setTextSize(1);
+    g->setTextColor(0x8410); // gray
+    g->setCursor(6, 74);
+    g->printf("%u / %u", (unsigned)nameLen, editShort ? 4u : 24u);
+
+    drawFooter(g, "type   ENTER save   ESC cancel");
+
+    if (haveCanvas)
+        canvas.pushSprite(0, 0);
+}
+
+// Writes the edited name into the engine's owner and broadcasts it — the same
+// path AdminModule::handleSetOwner takes, but driven from our UI.
+void AdvUI::applyName()
+{
+    if (editShort) {
+        strncpy(owner.short_name, nameBuf, sizeof(owner.short_name));
+        owner.short_name[sizeof(owner.short_name) - 1] = 0;
+    } else {
+        strncpy(owner.long_name, nameBuf, sizeof(owner.long_name));
+        owner.long_name[sizeof(owner.long_name) - 1] = 0;
+    }
+
+    snprintf(owner.id, sizeof(owner.id), "!%08x", (unsigned)(nodeDB ? nodeDB->getNodeNum() : 0));
+
+    if (service)
+        service->reloadOwner(true); // update local node DB + broadcast NodeInfo
+    if (nodeDB)
+        nodeDB->saveToDisk(SEGMENT_DEVICESTATE | SEGMENT_NODEDATABASE); // persist across reboots
+}
+
+void AdvUI::drawSettings()
+{
+    lgfx::LGFXBase *g = haveCanvas ? static_cast<lgfx::LGFXBase *>(&canvas) : static_cast<lgfx::LGFXBase *>(&display);
+
+    g->fillScreen(0x0000);
+
+    g->setFont(&lgfx::fonts::Font0);
+    g->setTextSize(1);
+    g->setTextColor(0x07FF); // cyan
+    g->setCursor(4, 3);
+    g->print("Settings");
+    g->drawFastHLine(0, 13, 240, 0x39C7);
+
+    const char *labels[kNumSettings] = {"Name", "Short", "Region", "Preset", "Frequency", "Channel"};
+    char vals[kNumSettings][24];
+    snprintf(vals[0], sizeof(vals[0]), "%s", owner.long_name[0] ? owner.long_name : "(unset)");
+    snprintf(vals[1], sizeof(vals[1]), "%s", owner.short_name[0] ? owner.short_name : "(unset)");
+    snprintf(vals[2], sizeof(vals[2]), "%s", regionName(config.lora.region));
+    snprintf(vals[3], sizeof(vals[3]), "%s", config.lora.use_preset ? presetName(config.lora.modem_preset) : "custom");
+    if (config.lora.override_frequency > 0)
+        snprintf(vals[4], sizeof(vals[4]), "%.3f", (double)config.lora.override_frequency);
+    else
+        strcpy(vals[4], "auto");
+    snprintf(vals[5], sizeof(vals[5]), "%s", channels.getName(0));
+
+    const int rowH = 18, top = 15;
+    for (int i = 0; i < kNumSettings; i++) {
+        int y = top + i * rowH;
+        if (i == setSel)
+            g->fillRect(0, y - 1, 240, rowH, 0x2945); // selection highlight
+
+        g->setFont(&lgfx::fonts::FreeSansBold9pt7b); // same size as the contact list
+        g->setTextSize(1);
+        g->setTextColor(0xFFFF);
+        g->setCursor(6, y + 1);
+        g->print(labels[i]);
+        int lw = g->textWidth(labels[i]);
+
+        fitWidth(g, vals[i], 230 - (6 + lw));
+        g->setTextColor(0x9CD3);
+        g->setCursor(236 - g->textWidth(vals[i]), y + 1);
+        g->print(vals[i]);
+    }
+
+    drawFooter(g, "up/dn   ENTER edit   ESC back");
+
+    if (haveCanvas)
+        canvas.pushSprite(0, 0);
+}
+
+void AdvUI::drawPickList()
+{
+    lgfx::LGFXBase *g = haveCanvas ? static_cast<lgfx::LGFXBase *>(&canvas) : static_cast<lgfx::LGFXBase *>(&display);
+
+    g->fillScreen(0x0000);
+
+    const EnumOpt *opts = pickTarget == 0 ? kRegionOpts : kPresetOpts;
+    int cnt = pickTarget == 0 ? kRegionCount : kPresetCount;
+
+    g->setFont(&lgfx::fonts::Font0);
+    g->setTextSize(1);
+    g->setTextColor(0x07FF); // cyan
+    g->setCursor(4, 3);
+    g->print(pickTarget == 0 ? "Region" : "Preset");
+    g->drawFastHLine(0, 13, 240, 0x39C7);
+
+    const int rowH = 18, top = 15, maxRows = (124 - top) / rowH;
+    if (pickSel < pickScroll)
+        pickScroll = pickSel;
+    if (pickSel >= pickScroll + maxRows)
+        pickScroll = pickSel - maxRows + 1;
+    if (pickScroll < 0)
+        pickScroll = 0;
+
+    int y = top;
+    for (int r = 0; r < maxRows; r++) {
+        int i = pickScroll + r;
+        if (i >= cnt)
+            break;
+        if (i == pickSel)
+            g->fillRect(0, y - 1, 240, rowH, 0x2945);
+        g->setFont(&lgfx::fonts::FreeSansBold9pt7b);
+        g->setTextSize(1);
+        g->setTextColor(0xFFFF);
+        g->setCursor(8, y + 1);
+        g->print(opts[i].name);
+        y += rowH;
+    }
+
+    drawFooter(g, "up/dn   ENTER select   ESC back");
+
+    if (haveCanvas)
+        canvas.pushSprite(0, 0);
+}
+
+void AdvUI::drawReboot()
+{
+    lgfx::LGFXBase *g = haveCanvas ? static_cast<lgfx::LGFXBase *>(&canvas) : static_cast<lgfx::LGFXBase *>(&display);
+
+    g->fillScreen(0x0000);
+    g->setFont(&lgfx::fonts::FreeSansBold9pt7b);
+    g->setTextSize(1);
+    g->setTextColor(0xFFE0); // yellow
+    const char *t1 = "Applying settings";
+    g->setCursor((240 - g->textWidth(t1)) / 2, 50);
+    g->print(t1);
+    g->setTextColor(0x8410);
+    const char *t2 = "rebooting...";
+    g->setCursor((240 - g->textWidth(t2)) / 2, 74);
+    g->print(t2);
+
+    if (haveCanvas)
+        canvas.pushSprite(0, 0);
+}
+
+// Applies a LoRa setting (0 = region, 1 = preset), persists it, and schedules the
+// reboot the radio needs to re-init on the new parameters.
+void AdvUI::applyLoRa(int target, int value)
+{
+    if (target == 0) {
+        config.lora.region = (meshtastic_Config_LoRaConfig_RegionCode)value;
+    } else {
+        config.lora.use_preset = true;
+        config.lora.modem_preset = (meshtastic_Config_LoRaConfig_ModemPreset)value;
+    }
+    if (nodeDB)
+        nodeDB->saveToDisk(SEGMENT_CONFIG);
+    rebootAtMsec = millis() + 1500;
+    mode = MODE_REBOOT;
 }
 
 void AdvUI::handleKey(char ch)
@@ -446,9 +801,94 @@ void AdvUI::handleKey(char ch)
     bool down = c == 0xb6;  // DOWN
     bool printable = c >= 0x20 && c < 0x7f;
 
+    if (c == AdvKeyboard::kLongEsc) { // long-press ESC opens settings from anywhere
+        setSel = 0;
+        mode = MODE_SETTINGS;
+        return;
+    }
+
+    if (mode == MODE_SETNAME) {
+        unsigned maxLen = editShort ? 4 : (unsigned)(sizeof(nameBuf) - 1);
+        if (esc) {
+            mode = nameReturn;
+        } else if (enter) {
+            if (nameLen)
+                applyName();
+            mode = nameReturn;
+        } else if (bksp) {
+            if (nameLen)
+                nameBuf[--nameLen] = 0;
+        } else if (printable && nameLen < maxLen) {
+            nameBuf[nameLen++] = c;
+            nameBuf[nameLen] = 0;
+        }
+        return;
+    }
+
+    if (mode == MODE_SETTINGS) {
+        if (esc) {
+            mode = MODE_NODES;
+        } else if (up) {
+            if (setSel > 0)
+                setSel--;
+        } else if (down) {
+            if (setSel < kNumSettings - 1)
+                setSel++;
+        } else if (enter && setSel <= 1) { // 0 = long name, 1 = short name
+            editShort = (setSel == 1);
+            const char *cur = editShort ? owner.short_name : owner.long_name;
+            strncpy(nameBuf, cur, sizeof(nameBuf));
+            nameBuf[sizeof(nameBuf) - 1] = 0;
+            nameLen = strlen(nameBuf);
+            nameReturn = MODE_SETTINGS;
+            mode = MODE_SETNAME;
+        } else if (enter && setSel == 2) { // Region
+            pickTarget = 0;
+            pickSel = optIndex(kRegionOpts, kRegionCount, (int)config.lora.region);
+            pickScroll = 0;
+            mode = MODE_PICKLIST;
+        } else if (enter && setSel == 3) { // Preset
+            pickTarget = 1;
+            pickSel = optIndex(kPresetOpts, kPresetCount, (int)config.lora.modem_preset);
+            pickScroll = 0;
+            mode = MODE_PICKLIST;
+        }
+        // setSel 4 (Frequency) and 5 (Channel) get their editors next.
+        return;
+    }
+
+    if (mode == MODE_PICKLIST) {
+        int cnt = pickTarget == 0 ? kRegionCount : kPresetCount;
+        if (esc) {
+            mode = MODE_SETTINGS;
+        } else if (up) {
+            if (pickSel > 0)
+                pickSel--;
+        } else if (down) {
+            if (pickSel < cnt - 1)
+                pickSel++;
+        } else if (enter) {
+            const EnumOpt *opts = pickTarget == 0 ? kRegionOpts : kPresetOpts;
+            applyLoRa(pickTarget, opts[pickSel].value); // sets config, saves, schedules reboot
+        }
+        return;
+    }
+
+    if (mode == MODE_REBOOT)
+        return; // rebooting shortly; ignore input
+
     if (mode == MODE_NODE) {
-        if (esc || bksp)
+        if (esc || bksp) {
             mode = MODE_PICKER;
+        } else if (enter && nodeDB && selectedNum == nodeDB->getNodeNum()) {
+            // our own node: open the long-name editor, pre-filled with the current name
+            editShort = false;
+            strncpy(nameBuf, owner.long_name, sizeof(nameBuf));
+            nameBuf[sizeof(nameBuf) - 1] = 0;
+            nameLen = strlen(nameBuf);
+            nameReturn = MODE_NODE;
+            mode = MODE_SETNAME;
+        }
         return;
     }
 
@@ -519,7 +959,7 @@ int32_t AdvUI::runOnce()
     }
 
     while (api.available() && api.getFromRadio(fromRadioBuf) > 0) {
-        // drain the FromRadio stream in-process: config, node DB, then live packets
+        handleFromRadio(api.lastFromRadio()); // pick out incoming text messages
     }
 
     kb.trigger();
@@ -543,6 +983,14 @@ int32_t AdvUI::runOnce()
         drawPicker();
     else if (mode == MODE_NODE)
         drawNode();
+    else if (mode == MODE_SETNAME)
+        drawSetName();
+    else if (mode == MODE_SETTINGS)
+        drawSettings();
+    else if (mode == MODE_PICKLIST)
+        drawPickList();
+    else if (mode == MODE_REBOOT)
+        drawReboot();
     else
         drawNodeList();
 

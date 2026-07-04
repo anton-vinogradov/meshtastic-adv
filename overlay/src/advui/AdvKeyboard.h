@@ -13,6 +13,9 @@ namespace advui
 class AdvKeyboard : public TCA8418KeyboardBase
 {
   public:
+    // Emitted when ESC is held past the long-press threshold (short ESC stays "back").
+    static constexpr uint8_t kLongEsc = 0x1c;
+
     AdvKeyboard();
     void begin();           // init the TCA8418 over the keyboard I2C bus (GPIO 8/9)
     void trigger() override; // poll the FIFO; queues chars, read via hasEvent()/dequeueEvent()
@@ -32,6 +35,9 @@ class AdvKeyboard : public TCA8418KeyboardBase
     uint32_t last_tap = 0;
     uint8_t char_idx = 0;
     uint32_t tap_interval = 0;
+    uint32_t escPressMs = 0;   // when the ESC key went down, for long-press detection
+    bool escDown = false;      // ESC currently held
+    bool escLongFired = false; // long-press already emitted for this hold
 };
 
 } // namespace advui

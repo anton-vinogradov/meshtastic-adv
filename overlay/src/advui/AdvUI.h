@@ -30,15 +30,22 @@ class AdvUI : public concurrency::OSThread
     int32_t runOnce() override;
 
   private:
-    enum Mode : uint8_t { MODE_NODES, MODE_PICKER, MODE_NODE };
+    enum Mode : uint8_t { MODE_NODES, MODE_PICKER, MODE_NODE, MODE_SETNAME, MODE_SETTINGS, MODE_PICKLIST, MODE_REBOOT };
 
     void initHardware();
     void drawSplash();
     void drawNodeList();
     void drawPicker();
     void drawNode();
+    void drawSettings();
+    void drawSetName();
+    void drawPickList();
+    void drawReboot();
+    void applyName();
+    void applyLoRa(int target, int value);
     void rebuildFiltered();
     int buildNodeList(uint16_t *out, int max, const char *query);
+    void handleFromRadio(const meshtastic_FromRadio &fr);
     void handleKey(char c);
 
     InternalAPI api;
@@ -56,6 +63,15 @@ class AdvUI : public concurrency::OSThread
     int sel = 0;          // selection cursor into filtered[]
     int scrollTop = 0;    // first visible row
     uint32_t selectedNum = 0; // node chosen with Enter (MODE_NODE)
+
+    char nameBuf[25] = {0};   // node-name editor buffer (MODE_SETNAME)
+    uint8_t nameLen = 0;
+    bool editShort = false;   // MODE_SETNAME edits the short name (else the long name)
+    Mode nameReturn = MODE_SETTINGS; // where the name editor returns on save/cancel
+    int setSel = 0;           // settings-menu cursor (MODE_SETTINGS)
+    int pickTarget = 0;       // MODE_PICKLIST: 0 = region, 1 = preset
+    int pickSel = 0;          // list-picker cursor
+    int pickScroll = 0;       // first visible list-picker row
 
     bool inited = false;
     bool haveCanvas = false;

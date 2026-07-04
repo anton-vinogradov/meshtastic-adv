@@ -24,33 +24,40 @@ separate node by swapping the transport.
 
 The `firmware` submodule stays **byte-identical to upstream** `meshtastic/firmware`.
 Our code lives in `overlay/` and is copied into the firmware tree at build time by
-`scripts/sync-overlay.sh`, which also applies three idempotent, marker-guarded (`advui-inject`)
+`scripts/sync-overlay.sh`, which also applies two idempotent, marker-guarded (`advui-inject`)
 injections. Nothing is committed into the submodule, so updating upstream is
 `git -C firmware checkout -- . && git -C firmware pull` then re-sync — no merge conflicts.
 
 - `overlay/src/advui/` → `firmware/src/advui/` (our UI; compiled by the default src filter).
 - `overlay/variants/esp32s3/m5stack_cardputer_adv_advui/platformio.ini` → a **new** env
-  `m5stack-cardputer-adv-advui` (extends the stock env, adds `-D MESHTASTIC_EXCLUDE_SCREEN`
-  + the LovyanGFX dep). A new file, so the `variants/*/*/platformio.ini` glob picks it up.
-- Injections: `main.cpp` gets `#include "advui/AdvUI.h"` + a `advui::advuiSetup();` call after
-  `setupModules()`; `CardputerKeyboard.cpp` gets the `InputBroker.h` include it loses when the
-  stock Screen is excluded.
+  `m5stack-cardputer-adv-advui` (extends the stock env, adds the LovyanGFX dep,
+  `-D MESHTASTIC_EXCLUDE_SCREEN` and `-D MESHTASTIC_EXCLUDE_INPUTBROKER`, and drops the stock
+  keyboard sources — `CardputerKeyboard.cpp`, `kbI2cBase.cpp`, `cardKbI2cImpl.cpp` — via
+  `build_src_filter`). A new file, so the `variants/*/*/platformio.ini` glob picks it up.
+- Injections: two, both in `main.cpp` — `#include "advui/AdvUI.h"` and an `advui::advuiSetup();`
+  call after `setupModules()`.
 
 `AdvUI` is a `concurrency::OSThread`, so once `advuiSetup()` creates it the scheduler drives
 `runOnce()` — no main-loop edit. Build with `-e m5stack-cardputer-adv-advui`.
 
 ## Hardware (from the variant)
 
-- Display: **ST7789** TFT 240×135 (classic `graphics::Screen`, *not* LVGL `device-ui` —
-  the variant doesn't pull the `device-ui` lib). Pins: NSS 37, DC 34, MOSI 35, SCK 36,
-  RST 33, backlight 38, SPI2_HOST @ 40 MHz.
-- Keyboard: **TCA8418** I2C matrix controller (INT on GPIO 11), `HAS_PHYSICAL_KEYBOARD`.
+- Display: **ST7789** TFT 240×135, driven by our own LovyanGFX `AdvDisplay` (double-buffered
+  via an `LGFX_Sprite`), *not* the stock `graphics::Screen` (compiled out). Pins: NSS 37,
+  DC 34, MOSI 35, SCK 36, RST 33, power/backlight rail 38 (steady digital HIGH). Runs on a
+  **dedicated SPI3/HSPI bus @ 40 MHz** — the LoRa SX1262 owns SPI2/FSPI (Arduino `SPI`), so a
+  separate peripheral keeps the display from corrupting radio SPI.
+- Keyboard: **TCA8418** I2C matrix controller (addr 0x34, I2C on GPIO 8/9). We read the key
+  FIFO ourselves in `AdvKeyboard`, polled each `runOnce()` — no INT line, no `InputBroker`.
 - NeoPixel: 1× on GPIO 21. I2S audio (ES8311). GPS, BMI270 IMU, battery on GPIO 10.
 
 ## Steps
 
 - **M1a — pipeline:** `InternalAPI` drains the `FromRadio` stream in-process. ✅
-- **M1b — display:** own ST7789 via LovyanGFX (double-buffered), node list (name / SNR /
-  hops), header with node count + battery. Stock screen off via `MESHTASTIC_EXCLUDE_SCREEN`. ✅
-- **M1c — input:** ESC-activated contact picker (favourites → recent senders → all),
-  type-to-filter, via the stock `InputBroker`; then compose + send via `handleToRadio`.
+- **M1b — display:** own ST7789 via LovyanGFX (double-buffered). Branded splash on boot, then a
+  node list — proportional name + signal bars + hops (`→N`) + last-heard age + role — with a
+  header (node count + our battery). Rows sorted favourites → conversations → by hops. Stock
+  screen off via `MESHTASTIC_EXCLUDE_SCREEN`. ✅
+- **M1c — input:** our own TCA8418 reader (`AdvKeyboard`; stock `InputBroker` excluded).
+  ESC / typing opens the contact picker (same sorted+filtered list, type-to-filter, arrows +
+  Enter to open a node). Still to do: compose + send outgoing text via `handleToRadio`. 🚧

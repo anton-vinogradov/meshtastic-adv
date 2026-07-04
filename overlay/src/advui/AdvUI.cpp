@@ -8,6 +8,9 @@
 #include "mesh/NodeDB.h"
 #include "mesh/Router.h"
 #include "mesh/mesh-pb-constants.h"
+#include "gps/RTC.h" // getTime() for message timestamps
+#include "graphics/emotes.h" // UTF-8 -> bitmap emoji table (forced in via EmotesData.cpp)
+#include "main.h" // audioThread (I2S beep)
 #include "modules/NodeInfoModule.h"
 #include <algorithm>
 #include <cctype>
@@ -56,7 +59,9 @@ bool ciContains(const char *hay, const char *needle)
 
 // Incoming text messages, kept in a small RAM ring (oldest overwritten). Enough
 // to show a node's recent thread and to know who we've talked to for sorting.
-enum MsgStatus : uint8_t { MSG_IN = 0, MSG_SENDING = 1, MSG_DELIVERED = 2, MSG_FAILED = 3 };
+// MSG_SENT = handed to the mesh as a broadcast (no per-recipient ack possible),
+// distinct from MSG_DELIVERED which is an ack-confirmed DM.
+enum MsgStatus : uint8_t { MSG_IN = 0, MSG_SENDING = 1, MSG_DELIVERED = 2, MSG_FAILED = 3, MSG_SENT = 4 };
 
 struct Msg {
     uint32_t from;
@@ -65,6 +70,7 @@ struct Msg {
     uint32_t id;     // our packet id (outgoing only), to match the delivery ACK
     uint8_t status;  // MsgStatus
     uint8_t err;     // routing error code when status == MSG_FAILED
+    uint8_t ch;      // channel index for broadcasts (to == 0xFFFFFFFF)
     bool read;
     char text[160];
 };
@@ -100,18 +106,20 @@ const char *errName(uint8_t e)
     }
 }
 constexpr int kMaxMsgs = 32;
-constexpr int kNumSettings = 6; // Name, Short, Region, Preset, Frequency, Channel
+constexpr int kNumSettings = 7; // Name, Short, Region, Preset, Frequency, Channel, UTC
 Msg g_msgs[kMaxMsgs];
 int g_msgCount = 0;         // populated slots (grows to kMaxMsgs)
 int g_msgNext = 0;          // next write slot (ring head)
 bool g_msgsDirty = false;   // ring changed since the last flash save
 uint32_t g_lastSaveMs = 0;  // when we last wrote the ring to flash
 
-void addMsg(uint32_t from, uint32_t to, uint32_t rxTime, bool unread, const char *text, uint32_t id, uint8_t status)
+void addMsg(uint32_t from, uint32_t to, uint8_t ch, uint32_t rxTime, bool unread, const char *text, uint32_t id,
+           uint8_t status)
 {
     Msg &m = g_msgs[g_msgNext];
     m.from = from;
     m.to = to;
+    m.ch = ch;
     m.rxTime = rxTime;
     m.id = id;
     m.status = status;
@@ -159,14 +167,53 @@ void markReadFrom(uint32_t nodeNum)
 bool hasUnreadFrom(uint32_t nodeNum)
 {
     for (int i = 0; i < g_msgCount; i++)
-        if (g_msgs[i].from == nodeNum && !g_msgs[i].read)
+        if (g_msgs[i].from == nodeNum && g_msgs[i].to != NODENUM_BROADCAST && !g_msgs[i].read)
             return true;
     return false;
 }
 
+// Channel favourites are our own state (Meshtastic channels carry no favourite flag).
+uint8_t g_favChannels = 0; // bitmask, bit i set = channel i favourited
+bool chanFav(int i) { return g_favChannels & (1u << i); }
+
+// User-set UTC offset (minutes) for message timestamps; the device has no GPS/tz.
+int32_t g_utcOffsetMin = 0;
+
+#ifdef HAS_I2S
+// Our own single-note alert, played over the I2S codec (the stock beep is disabled).
+// One short note; pumped to completion from runOnce, then stopped.
+const char kBeepRtttl[] = "adv:d=16,o=6,b=280:g";
+bool g_beeping = false;
+void startBeep()
+{
+    if (!audioThread || g_beeping)
+        return;
+    audioThread->beginRttl(kBeepRtttl, strlen(kBeepRtttl));
+    g_beeping = true;
+}
+#endif
+
+// Unread on a channel = an unread broadcast we received on that channel index.
+bool hasUnreadChannel(int chIdx)
+{
+    for (int i = 0; i < g_msgCount; i++)
+        if (g_msgs[i].to == NODENUM_BROADCAST && g_msgs[i].ch == chIdx && !g_msgs[i].read)
+            return true;
+    return false;
+}
+
+void markReadChannel(int chIdx)
+{
+    for (int i = 0; i < g_msgCount; i++)
+        if (g_msgs[i].to == NODENUM_BROADCAST && g_msgs[i].ch == chIdx && !g_msgs[i].read) {
+            g_msgs[i].read = true;
+            g_msgsDirty = true;
+        }
+}
+
 // Persist the message ring (with delivery status + read flags) to flash, so a
 // reboot keeps the conversation. Written debounced from runOnce.
-constexpr uint32_t kMsgMagic = 0x41565331; // "AVS1" — bump if Msg layout changes
+constexpr uint32_t kMsgMagic = 0x41565332; // "AVS2" — bump when the saved layout changes
 const char *kMsgPath = "/advui_msgs.bin";
 
 void saveMsgs()
@@ -179,7 +226,9 @@ void saveMsgs()
     f.write((const uint8_t *)&magic, sizeof(magic));
     f.write((const uint8_t *)&cnt, sizeof(cnt));
     f.write((const uint8_t *)&nxt, sizeof(nxt));
+    f.write((const uint8_t *)&g_favChannels, sizeof(g_favChannels));
     f.write((const uint8_t *)g_msgs, sizeof(g_msgs));
+    f.write((const uint8_t *)&g_utcOffsetMin, sizeof(g_utcOffsetMin)); // optional tail
     f.close();
 }
 
@@ -193,16 +242,25 @@ void loadMsgs()
     f.read((uint8_t *)&magic, sizeof(magic));
     f.read((uint8_t *)&cnt, sizeof(cnt));
     f.read((uint8_t *)&nxt, sizeof(nxt));
+    f.read((uint8_t *)&g_favChannels, sizeof(g_favChannels));
     size_t n = f.read((uint8_t *)g_msgs, sizeof(g_msgs));
+    int32_t off = 0;
+    f.read((uint8_t *)&off, sizeof(off)); // optional tail; stays 0 for pre-offset files
     f.close();
     if (magic != kMsgMagic || n != sizeof(g_msgs) || cnt < 0 || cnt > kMaxMsgs || nxt < 0 || nxt >= kMaxMsgs)
         return;
+    g_utcOffsetMin = off;
     g_msgCount = cnt;
     g_msgNext = nxt;
-    // an outgoing message still "sending" before the reboot can't get its ACK now
-    for (int i = 0; i < g_msgCount; i++)
+    uint32_t me = nodeDB ? nodeDB->getNodeNum() : 0;
+    for (int i = 0; i < g_msgCount; i++) {
+        // an outgoing DM still "sending" before the reboot can't get its ACK now
         if (g_msgs[i].status == MSG_SENDING)
             g_msgs[i].status = MSG_FAILED;
+        // upgrade our own channel sends saved before MSG_SENT existed
+        else if (g_msgs[i].status == MSG_IN && me && g_msgs[i].from == me && g_msgs[i].to == NODENUM_BROADCAST)
+            g_msgs[i].status = MSG_SENT;
+    }
 }
 
 // Default node ordering: favourites first, then nodes we have a conversation with,
@@ -319,8 +377,22 @@ const EnumOpt kRegionOpts[] = {{"UNSET", 0},   {"US", 1},      {"EU_433", 2}, {"
                                {"UA_868", 15},  {"KZ_433", 23}, {"KZ_863", 24}};
 const EnumOpt kPresetOpts[] = {{"LongFast", 0},  {"LongSlow", 1},  {"LongMod", 7},    {"MedSlow", 3},
                                {"MediumFast", 4}, {"ShortSlow", 5}, {"ShortFast", 6},  {"ShortTurbo", 8}};
+// UTC offset choices (value = minutes) with a representative city, scrolled in the picker.
+const EnumOpt kUtcOpts[] = {
+    {"UTC-12", -720},           {"UTC-11 Midway", -660},      {"UTC-10 Honolulu", -600},
+    {"UTC-9 Anchorage", -540},  {"UTC-8 Los Angeles", -480},  {"UTC-7 Denver", -420},
+    {"UTC-6 Chicago", -360},    {"UTC-5 New York", -300},     {"UTC-4 Halifax", -240},
+    {"UTC-3 Sao Paulo", -180},  {"UTC-2", -120},              {"UTC-1 Azores", -60},
+    {"UTC+0 London", 0},        {"UTC+1 Berlin", 60},         {"UTC+2 Kaliningrad", 120},
+    {"UTC+3 Moscow", 180},      {"UTC+3:30 Tehran", 210},     {"UTC+4 Samara", 240},
+    {"UTC+4:30 Kabul", 270},    {"UTC+5 Yekaterinburg", 300}, {"UTC+5:30 Delhi", 330},
+    {"UTC+5:45 Kathmandu", 345},{"UTC+6 Omsk", 360},          {"UTC+6:30 Yangon", 390},
+    {"UTC+7 Krasnoyarsk", 420}, {"UTC+8 Irkutsk", 480},       {"UTC+9 Yakutsk", 540},
+    {"UTC+9:30 Adelaide", 570}, {"UTC+10 Vladivostok", 600},  {"UTC+11 Magadan", 660},
+    {"UTC+12 Kamchatka", 720},  {"UTC+13 Samoa", 780},        {"UTC+14 Kiritimati", 840}};
 constexpr int kRegionCount = sizeof(kRegionOpts) / sizeof(kRegionOpts[0]);
 constexpr int kPresetCount = sizeof(kPresetOpts) / sizeof(kPresetOpts[0]);
+constexpr int kUtcCount = sizeof(kUtcOpts) / sizeof(kUtcOpts[0]);
 
 int optIndex(const EnumOpt *opts, int cnt, int value)
 {
@@ -448,9 +520,165 @@ void drawMsgStatus(lgfx::LGFXBase *g, int x, int y, uint8_t status)
     } else if (status == MSG_DELIVERED) {
         g->drawLine(x + 2, y + 6, x + 5, y + 9, 0x07E0); // green check: acked
         g->drawLine(x + 5, y + 9, x + 12, y + 2, 0x07E0);
+    } else if (status == MSG_SENT) {
+        g->drawLine(x + 2, y + 6, x + 5, y + 9, 0x07FF); // cyan check: broadcast sent (no ack)
+        g->drawLine(x + 5, y + 9, x + 12, y + 2, 0x07FF);
     } else if (status == MSG_FAILED) {
         g->drawLine(x + 3, y + 2, x + 11, y + 10, 0xF800); // red x: failed
         g->drawLine(x + 11, y + 2, x + 3, y + 10, 0xF800);
+    }
+}
+
+// Compact "HH:MM " prefix for a message's epoch time (local), or "" when the clock
+// wasn't set when the message was stamped (avoids showing bogus 00:xx times).
+void msgTimePrefix(uint32_t rxTime, int32_t tzOff, char *out, int cap)
+{
+    if (rxTime < 1600000000u) { // before 2020-09 => no valid RTC at stamp time
+        out[0] = 0;
+        return;
+    }
+    uint32_t local = rxTime + tzOff;
+    snprintf(out, cap, "%02u:%02u ", (unsigned)((local / 3600u) % 24u), (unsigned)((local / 60u) % 60u));
+}
+
+constexpr int kEmoteAdv = 18; // on-screen advance for a 16px emoji glyph (+2px gap)
+
+// Curated palette shown in the emoji picker (labels match graphics::emotes[] exactly).
+// Incoming messages still render ANY stock emoji; this only limits what we offer to send.
+const char *kEmojiPalette[] = {
+    "\U0001F44D", "\U0001F44E", "\U00002764\U0000FE0F", "\U0001F602", "\U0001F923", "\U0001F642",
+    "\U0001F60A", "\U0001F60D", "\U0001F60E", "\U0001F609", "\U0001F62D", "\U0001F605",
+    "\U0001F440", "\U0001F525", "\U0001F64F", "\U0001F4AA", "\U0001F44B", "\U0001F937",
+    "\U00002753", "\U0000203C\U0000FE0F", "\U00002705", "\U00002600\U0000FE0F", "\U00002744\U0000FE0F", "\U0001F4A9"};
+constexpr int kEmojiCount = sizeof(kEmojiPalette) / sizeof(kEmojiPalette[0]);
+
+// Byte length of the UTF-8 sequence starting at lead byte c.
+int utf8Len(unsigned char c)
+{
+    if (c < 0x80)
+        return 1;
+    if ((c >> 5) == 0x06)
+        return 2;
+    if ((c >> 4) == 0x0E)
+        return 3;
+    if ((c >> 3) == 0x1E)
+        return 4;
+    return 1;
+}
+
+// Longest emote label that is a prefix of s; returns its byte length (0 = none) and,
+// via *em, the matching table entry. Emote labels all start with 0xE2 or 0xF0, so we
+// only scan the table for those lead bytes (ASCII and Cyrillic never match).
+int emoteMatch(const char *s, const graphics::Emote **em)
+{
+    unsigned char c0 = (unsigned char)s[0];
+    if (c0 != 0xE2 && c0 != 0xF0)
+        return 0;
+    int bestLen = 0;
+    const graphics::Emote *best = nullptr;
+    for (int i = 0; i < graphics::numEmotes; i++) {
+        const char *lab = graphics::emotes[i].label;
+        int ll = (int)strlen(lab);
+        if (ll > bestLen && strncmp(s, lab, ll) == 0) {
+            bestLen = ll;
+            best = &graphics::emotes[i];
+        }
+    }
+    if (em)
+        *em = best;
+    return bestLen;
+}
+
+// Copies the leading run of `s` that fits `maxW` px in the current font into `out`
+// (breaking at a space when the line overflows), and returns how many bytes of `s`
+// were consumed. Emoji sequences are atomic tokens of width kEmoteAdv, so they wrap
+// as a unit and are never split across lines.
+int wrapLine(lgfx::LGFXBase *g, const char *s, int maxW, char *out, int outCap)
+{
+    int consumed = 0, w = 0, spaceCut = -1;
+    while (s[consumed]) {
+        const graphics::Emote *em = nullptr;
+        int elen = emoteMatch(s + consumed, &em);
+        int tlen = elen > 0 ? elen : utf8Len((unsigned char)s[consumed]);
+        int tw;
+        if (elen > 0) {
+            tw = em->width + 2;
+        } else {
+            char cb[5];
+            int k = 0;
+            for (; k < tlen && s[consumed + k]; k++)
+                cb[k] = s[consumed + k];
+            cb[k] = 0;
+            tw = g->textWidth(cb);
+        }
+        if (consumed > 0 && w + tw > maxW)
+            break; // doesn't fit -> wrap here
+        if (consumed + tlen > outCap - 1)
+            break; // out buffer full
+        consumed += tlen;
+        w += tw;
+        if (s[consumed - 1] == ' ')
+            spaceCut = consumed;
+    }
+    int cut = !s[consumed] ? consumed : (spaceCut > 0 ? spaceCut : consumed);
+    int dispLen = cut;
+    while (dispLen > 0 && s[dispLen - 1] == ' ')
+        dispLen--; // don't render the trailing break space
+    memcpy(out, s, dispLen);
+    out[dispLen] = 0;
+    return cut > 0 ? cut : 1;
+}
+
+// Pixel width of a string with inline emoji (each emoji counts as its glyph advance).
+int lineWidthEmotes(lgfx::LGFXBase *g, const char *s)
+{
+    int w = 0;
+    while (*s) {
+        const graphics::Emote *em = nullptr;
+        int elen = emoteMatch(s, &em);
+        if (elen > 0 && em) {
+            w += em->width + 2;
+            s += elen;
+        } else {
+            int tlen = utf8Len((unsigned char)s[0]);
+            char cb[5];
+            int k = 0;
+            for (; k < tlen && s[k]; k++)
+                cb[k] = s[k];
+            cb[k] = 0;
+            w += g->textWidth(cb);
+            s += k;
+        }
+    }
+    return w;
+}
+
+// Draws a message-line string at (x,y) in `color`, blitting emoji bitmaps inline.
+void printLineEmotes(lgfx::LGFXBase *g, int x, int y, const char *s, uint16_t color)
+{
+    g->setFont(&cyrFont);
+    g->setTextSize(1);
+    int cx = x;
+    while (*s) {
+        const graphics::Emote *em = nullptr;
+        int elen = emoteMatch(s, &em);
+        if (elen > 0 && em) {
+            g->drawXBitmap(cx, y + (17 - em->height) / 2, em->bitmap, em->width, em->height, color);
+            cx += em->width + 2;
+            s += elen;
+        } else { // one non-emote UTF-8 char
+            int tlen = utf8Len((unsigned char)s[0]);
+            char cb[5];
+            int k = 0;
+            for (; k < tlen && s[k]; k++)
+                cb[k] = s[k];
+            cb[k] = 0;
+            g->setTextColor(color);
+            g->setCursor(cx, y);
+            g->print(cb);
+            cx += g->textWidth(cb);
+            s += k;
+        }
     }
 }
 
@@ -474,6 +702,11 @@ void AdvUI::initHardware()
     haveCanvas = (canvas.createSprite(display.width(), display.height()) != nullptr);
     LOG_INFO("advui: UI up init=%d %dx%d canvas=%d", (int)ok, display.width(), display.height(),
              (int)haveCanvas);
+
+    // Silence the stock ExternalNotificationModule: on this HAS_I2S board its default
+    // config beeps the codec on every received message (channel broadcasts included).
+    // We drive our own favourites-only single beep instead (see startBeep()).
+    moduleConfig.external_notification.enabled = false;
 
     api.begin();
     kb.begin();
@@ -549,8 +782,18 @@ void AdvUI::handleFromRadio(const meshtastic_FromRadio &fr)
     text[n] = 0;
 
     uint32_t me = nodeDB ? nodeDB->getNodeNum() : 0;
-    bool unread = (p.to == me && p.from != me); // a DM addressed to us (not a broadcast, not our echo)
-    addMsg(p.from, p.to, p.rx_time, unread, text, 0, MSG_IN);
+    bool unread = p.from != me && (p.to == me || p.to == NODENUM_BROADCAST); // DM to us, or a channel broadcast
+    addMsg(p.from, p.to, p.channel, p.rx_time, unread, text, 0, MSG_IN);
+
+#ifdef HAS_I2S
+    // Single beep, only from a favourite: a favourited channel broadcast, or a DM
+    // from a favourited node. Everything else stays silent.
+    if (unread) {
+        bool fav = (p.to == NODENUM_BROADCAST) ? chanFav(p.channel) : (nodeDB && nodeDB->isFavorite(p.from));
+        if (fav)
+            startBeep();
+    }
+#endif
 }
 
 // Sends a text DM to a node and adds it to our own thread immediately (status
@@ -582,7 +825,28 @@ void AdvUI::sendMessage(uint32_t to, const char *text)
     service->sendToMesh(p, RX_SRC_LOCAL, false);
 
     uint32_t me = nodeDB ? nodeDB->getNodeNum() : 0;
-    addMsg(me, to, 0, false, text, id, MSG_SENDING);
+    addMsg(me, to, 0, getTime(false), false, text, id, MSG_SENDING);
+}
+
+// Sends a text broadcast to a channel and adds it to that channel's thread.
+void AdvUI::sendChannel(int chIdx, const char *text)
+{
+    if (!router || !service)
+        return;
+    meshtastic_MeshPacket *p = router->allocForSending();
+    p->to = NODENUM_BROADCAST;
+    p->channel = chIdx;
+    p->want_ack = false; // broadcasts aren't acked
+    p->decoded.portnum = meshtastic_PortNum_TEXT_MESSAGE_APP;
+    size_t n = strlen(text);
+    if (n > sizeof(p->decoded.payload.bytes))
+        n = sizeof(p->decoded.payload.bytes);
+    memcpy(p->decoded.payload.bytes, text, n);
+    p->decoded.payload.size = n;
+    service->sendToMesh(p, RX_SRC_LOCAL, false);
+
+    uint32_t me = nodeDB ? nodeDB->getNodeNum() : 0;
+    addMsg(me, NODENUM_BROADCAST, chIdx, getTime(false), false, text, 0, MSG_SENT); // sent to channel (no ack)
 }
 
 // Fills out[] with node-DB indices matching query (all if query is null/empty),
@@ -609,6 +873,82 @@ int AdvUI::buildNodeList(uint16_t *out, int max, const char *query)
     }
     std::sort(out, out + count, nodeLess);
     return count;
+}
+
+// Fills chanList[] with enabled channels (query-matched), favourites first.
+int AdvUI::buildChannels(const char *query)
+{
+    int count = 0;
+    for (int i = 0; i < 8 && count < 8; i++) {
+        meshtastic_Channel &ch = channels.getByIndex(i);
+        if (ch.role == meshtastic_Channel_Role_DISABLED)
+            continue;
+        if (query && query[0]) {
+            const char *name = channels.getName(i);
+            if (!ciContains(name && name[0] ? name : "", query))
+                continue;
+        }
+        chanList[count++] = (uint8_t)i;
+    }
+    std::stable_sort(chanList, chanList + count, [](uint8_t a, uint8_t b) { return chanFav(a) && !chanFav(b); });
+    return count;
+}
+
+void AdvUI::drawChannelRow(int chIdx, int y)
+{
+    lgfx::LGFXBase *g = haveCanvas ? static_cast<lgfx::LGFXBase *>(&canvas) : static_cast<lgfx::LGFXBase *>(&display);
+
+    int nameX = 4;
+    if (hasUnreadChannel(chIdx)) {
+        int ex = 4, ey = y + 5;
+        g->drawRect(ex, ey, 11, 8, 0xF800);
+        g->drawLine(ex, ey, ex + 5, ey + 4, 0xF800);
+        g->drawLine(ex + 10, ey, ex + 5, ey + 4, 0xF800);
+        nameX = 18;
+    }
+    char nm[24];
+    snprintf(nm, sizeof(nm), "#%s", channels.getName(chIdx));
+    g->setFont(&lgfx::fonts::FreeSansBold9pt7b);
+    g->setTextSize(1);
+    fitWidth(g, nm, 232 - nameX);
+    g->setTextColor(chanFav(chIdx) ? 0xFFE0 : 0x07FF); // favourite = yellow, else cyan
+    g->setCursor(nameX, y + 2);
+    g->print(nm);
+}
+
+// Opens the combined-list entry (channels first, then filtered nodes).
+void AdvUI::openEntry(int s)
+{
+    nodeReturn = (mode == MODE_PICKER) ? MODE_PICKER : MODE_NODES;
+    chatScroll = 0; // open threads pinned to the newest message
+    if (s < chanCount) {
+        selectedChannel = chanList[s];
+        markReadChannel(selectedChannel);
+        mode = MODE_NODE;
+    } else if (nodeDB) {
+        meshtastic_NodeInfoLite *node = nodeDB->getMeshNodeByIndex(filtered[s - chanCount]);
+        if (node) {
+            selectedChannel = -1;
+            selectedNum = node->num;
+            mode = MODE_NODE;
+        }
+    }
+}
+
+void AdvUI::favEntry(int s, bool on)
+{
+    if (s < chanCount) {
+        int ci = chanList[s];
+        if (on)
+            g_favChannels |= (1u << ci);
+        else
+            g_favChannels &= ~(1u << ci);
+        g_msgsDirty = true; // persisted alongside the messages
+    } else if (nodeDB) {
+        meshtastic_NodeInfoLite *node = nodeDB->getMeshNodeByIndex(filtered[s - chanCount]);
+        if (node)
+            nodeDB->set_favorite(on, node->num);
+    }
 }
 
 void AdvUI::drawNodeList()
@@ -659,8 +999,9 @@ void AdvUI::drawNodeList()
 
     g->drawFastHLine(0, 13, 240, 0x39C7);
 
-    rebuildFiltered(); // fills filtered[]/filteredCount (empty query here), clamps sel
+    rebuildFiltered(); // channels + filtered nodes, clamps sel
     const int top = 15, rowH = 18, maxRows = (124 - top) / rowH;
+    int listTotal = chanCount + filteredCount;
     if (sel < scrollTop)
         scrollTop = sel;
     if (sel >= scrollTop + maxRows)
@@ -671,14 +1012,17 @@ void AdvUI::drawNodeList()
     int y = top;
     for (int r = 0; r < maxRows; r++) {
         int idx = scrollTop + r;
-        if (idx >= filteredCount)
+        if (idx >= listTotal)
             break;
-        meshtastic_NodeInfoLite *node = nodeDB->getMeshNodeByIndex(filtered[idx]);
-        if (!node)
-            continue;
         if (idx == sel)
             g->fillRect(0, y - 1, 240, rowH, 0x2945); // cursor highlight
-        drawNodeRow(g, node, y, node->num == me);
+        if (idx < chanCount) {
+            drawChannelRow(chanList[idx], y);
+        } else {
+            meshtastic_NodeInfoLite *node = nodeDB->getMeshNodeByIndex(filtered[idx - chanCount]);
+            if (node)
+                drawNodeRow(g, node, y, node->num == me);
+        }
         y += rowH;
     }
 
@@ -690,9 +1034,12 @@ void AdvUI::drawNodeList()
 
 void AdvUI::rebuildFiltered()
 {
-    filteredCount = buildNodeList(filtered, kMaxFiltered, queryLen ? query : nullptr);
-    if (sel >= filteredCount)
-        sel = filteredCount ? filteredCount - 1 : 0;
+    const char *q = queryLen ? query : nullptr;
+    chanCount = buildChannels(q);
+    filteredCount = buildNodeList(filtered, kMaxFiltered, q);
+    int total = chanCount + filteredCount;
+    if (sel >= total)
+        sel = total ? total - 1 : 0;
     if (sel < 0)
         sel = 0;
 }
@@ -714,6 +1061,7 @@ void AdvUI::drawPicker()
 
     uint32_t me = nodeDB ? nodeDB->getNodeNum() : 0;
     const int rowH = 18, top = 16, maxRows = (124 - top) / rowH;
+    int total = chanCount + filteredCount;
 
     // Keep the selection on screen.
     if (sel < scrollTop)
@@ -726,14 +1074,17 @@ void AdvUI::drawPicker()
     int y = top;
     for (int r = 0; r < maxRows; r++) {
         int idx = scrollTop + r;
-        if (idx >= filteredCount)
+        if (idx >= total)
             break;
-        meshtastic_NodeInfoLite *node = nodeDB->getMeshNodeByIndex(filtered[idx]);
-        if (!node)
-            continue;
         if (idx == sel)
             g->fillRect(0, y - 1, 240, rowH, 0x2945); // selection highlight
-        drawNodeRow(g, node, y, node->num == me);
+        if (idx < chanCount) {
+            drawChannelRow(chanList[idx], y);
+        } else {
+            meshtastic_NodeInfoLite *node = nodeDB->getMeshNodeByIndex(filtered[idx - chanCount]);
+            if (node)
+                drawNodeRow(g, node, y, node->num == me);
+        }
         y += rowH;
     }
 
@@ -749,13 +1100,19 @@ void AdvUI::drawNode()
 
     g->fillScreen(0x0000);
 
-    meshtastic_NodeInfoLite *node = nodeDB ? nodeDB->getMeshNode(selectedNum) : nullptr;
+    bool isChan = selectedChannel >= 0;
+    meshtastic_NodeInfoLite *node = (!isChan && nodeDB) ? nodeDB->getMeshNode(selectedNum) : nullptr;
     uint32_t me = nodeDB ? nodeDB->getNodeNum() : 0;
 
-    markReadFrom(selectedNum); // opening the thread clears its unread
+    if (isChan)
+        markReadChannel(selectedChannel); // opening the thread clears its unread
+    else
+        markReadFrom(selectedNum);
 
-    // header: the node's row (name + signal + hops + age + role), like the contact list
-    if (node) {
+    // header: the channel, or the node's row (name + signal + hops + role), like the list
+    if (isChan) {
+        drawChannelRow(selectedChannel, 2);
+    } else if (node) {
         drawNodeRow(g, node, 2, false);
     } else {
         g->setFont(&lgfx::fonts::Font0);
@@ -773,7 +1130,10 @@ void AdvUI::drawNode()
     int matched[kMaxMsgs], mc = 0;
     for (int i = 0; i < g_msgCount; i++) {
         int idx = (g_msgCount == kMaxMsgs) ? (g_msgNext + i) % kMaxMsgs : i;
-        if (g_msgs[idx].from == selectedNum || g_msgs[idx].to == selectedNum)
+        bool match = isChan ? (g_msgs[idx].to == NODENUM_BROADCAST && g_msgs[idx].ch == selectedChannel)
+                            : ((g_msgs[idx].from == selectedNum || g_msgs[idx].to == selectedNum) &&
+                               g_msgs[idx].to != NODENUM_BROADCAST);
+        if (match)
             matched[mc++] = idx;
     }
     if (mc == 0) {
@@ -783,30 +1143,96 @@ void AdvUI::drawNode()
     } else {
         g->setFont(&cyrFont); // Cyrillic-capable, so Russian message text renders
         g->setTextSize(1);
-        int start = mc > maxLines ? mc - maxLines : 0;
-        int y = fy0;
-        for (int i = start; i < mc; i++) {
+        // Word-wrap each message into display lines; the status indicator sits on the
+        // message's LAST line, so long messages keep it visible. We build the wrapped
+        // lines into a ring and render only the last `maxLines` of them.
+        struct DLine {
+            char text[40];
+            uint16_t color;
+            bool last;        // final line of its message (draws the status marker)
+            bool out;
+            uint8_t status;
+            uint8_t err;
+            uint8_t timeLen;  // leading chars that are the dim "HH:MM " prefix (0 on continuation lines)
+        };
+        int32_t tzOff = g_utcOffsetMin * 60; // user-set UTC offset (Settings > UTC)
+        static DLine dl[80]; // single-threaded UI: static keeps it off the stack
+        int dlCount = 0;
+        for (int i = 0; i < mc; i++) {
             Msg &m = g_msgs[matched[i]];
             bool out = (m.from == me);
-            char line[180];
-            snprintf(line, sizeof(line), "%s%s", out ? "> " : "< ", m.text);
             bool failed = out && m.status == MSG_FAILED;
-            fitWidth(g, line, failed ? 150 : (out ? 214 : 232));
-            g->setTextColor(out ? 0x07FF : 0xFFFF); // outgoing cyan, incoming white
-            g->setCursor(4, y);
-            g->print(line);
-            if (failed) {
-                g->setFont(&lgfx::fonts::Font0); // red error name at the right
+            int wrapW = !out ? 232 : (failed ? 162 : 214); // reserve room for the marker
+            char tpre[8];
+            msgTimePrefix(m.rxTime, tzOff, tpre, sizeof(tpre)); // "HH:MM " before the arrow
+            uint8_t tlen = (uint8_t)strlen(tpre);
+            char full[188];
+            snprintf(full, sizeof(full), "%s%s%s", tpre, out ? "> " : "< ", m.text);
+            const char *p = full;
+            bool first = true;
+            do {
+                if (dlCount >= (int)(sizeof(dl) / sizeof(dl[0]))) { // drop the oldest line
+                    memmove(dl, dl + 1, sizeof(dl) - sizeof(dl[0]));
+                    dlCount--;
+                }
+                DLine &d = dl[dlCount++];
+                p += wrapLine(g, p, wrapW, d.text, sizeof(d.text));
+                d.color = out ? 0x07FF : 0xFFFF; // outgoing cyan, incoming white
+                d.out = out;
+                d.status = m.status;
+                d.err = m.err;
+                d.timeLen = first ? tlen : 0; // time sits only on the first line
+                d.last = (*p == 0);
+                first = false;
+            } while (*p);
+        }
+        // chatScroll counts lines scrolled up from the bottom (0 = pinned to newest).
+        int maxScroll = dlCount > maxLines ? dlCount - maxLines : 0;
+        if (chatScroll > maxScroll)
+            chatScroll = maxScroll;
+        if (chatScroll < 0)
+            chatScroll = 0;
+        int startL = maxScroll - chatScroll;
+        int y = fy0;
+        for (int i = startL; i < startL + maxLines && i < dlCount; i++) {
+            DLine &d = dl[i];
+            int cx = 4;
+            if (d.timeLen) { // dim the "HH:MM " prefix (ASCII, no emoji)
+                g->setFont(&cyrFont);
                 g->setTextSize(1);
-                g->setTextColor(0xF800);
-                const char *en = errName(m.err);
-                g->setCursor(238 - g->textWidth(en), y + 4);
-                g->print(en);
-                g->setFont(&cyrFont); // restore for the next line
-            } else if (out) {
-                drawMsgStatus(g, 220, y, m.status);
+                char save = d.text[d.timeLen];
+                d.text[d.timeLen] = 0;
+                g->setTextColor(0x8410); // gray
+                g->setCursor(cx, y);
+                g->print(d.text);
+                cx += g->textWidth(d.text);
+                d.text[d.timeLen] = save;
+            }
+            printLineEmotes(g, cx, y, d.text + d.timeLen, d.color); // message text + inline emoji
+            if (d.last && d.out) {
+                if (d.status == MSG_FAILED) {
+                    g->setFont(&lgfx::fonts::Font0); // red error name at the right
+                    g->setTextSize(1);
+                    g->setTextColor(0xF800);
+                    const char *en = errName(d.err);
+                    g->setCursor(238 - g->textWidth(en), y + 4);
+                    g->print(en);
+                } else {
+                    drawMsgStatus(g, 220, y, d.status);
+                }
             }
             y += lh;
+        }
+        // scrollbar on the right edge when the thread overflows the view
+        if (maxScroll > 0) {
+            int trackY = fy0, trackH = maxLines * lh;
+            g->drawFastVLine(238, trackY, trackH, 0x2104); // dark track
+            int thumbH = trackH * maxLines / dlCount;
+            if (thumbH < 6)
+                thumbH = 6;
+            int thumbY = trackY + (trackH - thumbH) * startL / maxScroll;
+            g->drawFastVLine(238, thumbY, thumbH, 0x07FF); // cyan thumb
+            g->drawFastVLine(239, thumbY, thumbH, 0x07FF);
         }
     }
 
@@ -814,16 +1240,17 @@ void AdvUI::drawNode()
         g->drawFastHLine(0, 114, 240, 0x39C7);
         g->setFont(&cyrFont);
         g->setTextSize(1);
-        g->setTextColor(0xFFE0); // yellow
         char cbuf[210];
         snprintf(cbuf, sizeof(cbuf), "%s_", msgBuf);
-        char *shown = cbuf; // drop leading chars so the cursor stays visible
-        while (*shown && g->textWidth(shown) > 232)
-            shown++;
-        g->setCursor(4, 120);
-        g->print(shown);
+        const char *shown = cbuf; // drop leading tokens so the cursor stays visible
+        while (lineWidthEmotes(g, shown) > 232) {
+            const graphics::Emote *em = nullptr;
+            int el = emoteMatch(shown, &em);
+            shown += el > 0 ? el : utf8Len((unsigned char)*shown);
+        }
+        printLineEmotes(g, 4, 118, shown, 0xFFE0); // yellow, emoji inline
     } else {
-        drawFooter(g, "type to reply   ESC: back");
+        drawFooter(g, "up/dn scroll  Tab emoji  ESC back");
     }
 
     if (haveCanvas)
@@ -917,7 +1344,7 @@ void AdvUI::drawSettings()
     g->print("Settings");
     g->drawFastHLine(0, 13, 240, 0x39C7);
 
-    const char *labels[kNumSettings] = {"Name", "Short", "Region", "Preset", "Frequency", "Channel"};
+    const char *labels[kNumSettings] = {"Name", "Short", "Region", "Preset", "Frequency", "Channel", "UTC"};
     char vals[kNumSettings][24];
     snprintf(vals[0], sizeof(vals[0]), "%s", owner.long_name[0] ? owner.long_name : "(unset)");
     snprintf(vals[1], sizeof(vals[1]), "%s", owner.short_name[0] ? owner.short_name : "(unset)");
@@ -928,8 +1355,15 @@ void AdvUI::drawSettings()
     else
         strcpy(vals[4], "auto");
     snprintf(vals[5], sizeof(vals[5]), "%s", channels.getName(0));
+    {
+        int om = g_utcOffsetMin, ah = om < 0 ? -om : om;
+        if (ah % 60)
+            snprintf(vals[6], sizeof(vals[6]), "UTC%c%d:%02d", om < 0 ? '-' : '+', ah / 60, ah % 60);
+        else
+            snprintf(vals[6], sizeof(vals[6]), "UTC%c%d", om < 0 ? '-' : '+', ah / 60);
+    }
 
-    const int rowH = 18, top = 15;
+    const int rowH = 15, top = 15;
     for (int i = 0; i < kNumSettings; i++) {
         int y = top + i * rowH;
         if (i == setSel)
@@ -960,14 +1394,14 @@ void AdvUI::drawPickList()
 
     g->fillScreen(0x0000);
 
-    const EnumOpt *opts = pickTarget == 0 ? kRegionOpts : kPresetOpts;
-    int cnt = pickTarget == 0 ? kRegionCount : kPresetCount;
+    const EnumOpt *opts = pickTarget == 0 ? kRegionOpts : pickTarget == 1 ? kPresetOpts : kUtcOpts;
+    int cnt = pickTarget == 0 ? kRegionCount : pickTarget == 1 ? kPresetCount : kUtcCount;
 
     g->setFont(&lgfx::fonts::Font0);
     g->setTextSize(1);
     g->setTextColor(0x07FF); // cyan
     g->setCursor(4, 3);
-    g->print(pickTarget == 0 ? "Region" : "Preset");
+    g->print(pickTarget == 0 ? "Region" : pickTarget == 1 ? "Preset" : "UTC offset");
     g->drawFastHLine(0, 13, 240, 0x39C7);
 
     const int rowH = 18, top = 15, maxRows = (124 - top) / rowH;
@@ -1019,6 +1453,35 @@ void AdvUI::drawReboot()
         canvas.pushSprite(0, 0);
 }
 
+// Emoji palette: a grid of bitmaps; Enter inserts the picked emoji into the message.
+void AdvUI::drawEmoji()
+{
+    lgfx::LGFXBase *g = haveCanvas ? static_cast<lgfx::LGFXBase *>(&canvas) : static_cast<lgfx::LGFXBase *>(&display);
+
+    g->fillScreen(0x0000);
+    g->setFont(&lgfx::fonts::Font0);
+    g->setTextSize(1);
+    g->setTextColor(0x07FF); // cyan
+    g->setCursor(4, 3);
+    g->print("Emoji");
+    g->drawFastHLine(0, 13, 240, 0x39C7);
+
+    const int cols = 6, cellW = 40, cellH = 26, top = 16;
+    for (int i = 0; i < kEmojiCount; i++) {
+        int x = (i % cols) * cellW, y = top + (i / cols) * cellH;
+        if (i == emojiSel)
+            g->fillRect(x + 1, y, cellW - 2, cellH, 0x2945); // selection highlight
+        const graphics::Emote *em = nullptr;
+        if (emoteMatch(kEmojiPalette[i], &em) > 0 && em)
+            g->drawXBitmap(x + (cellW - em->width) / 2, y + (cellH - em->height) / 2, em->bitmap, em->width, em->height,
+                           0xFFFF);
+    }
+    drawFooter(g, "arrows  ENTER insert  ESC back");
+
+    if (haveCanvas)
+        canvas.pushSprite(0, 0);
+}
+
 // Applies a LoRa setting (0 = region, 1 = preset), persists it, and schedules the
 // reboot the radio needs to re-init on the new parameters.
 void AdvUI::applyLoRa(int target, int value)
@@ -1045,6 +1508,7 @@ void AdvUI::handleKey(char ch)
     bool down = c == 0xb6;  // DOWN
     bool left = c == 0xb4;  // LEFT  -> favourite
     bool right = c == 0xb7; // RIGHT -> unfavourite
+    bool tab = c == 0x09;   // TAB   -> emoji picker
     bool printable = c >= 0x20 && c < 0x7f;
 
     if (c == AdvKeyboard::kLongEsc) { // long-press ESC opens settings from anywhere
@@ -1115,12 +1579,17 @@ void AdvUI::handleKey(char ch)
             nameLen = strlen(nameBuf);
             nameReturn = MODE_SETTINGS;
             mode = MODE_SETNAME;
+        } else if (enter && setSel == 6) { // UTC offset -> city/offset picker
+            pickTarget = 2;
+            pickSel = optIndex(kUtcOpts, kUtcCount, g_utcOffsetMin);
+            pickScroll = 0;
+            mode = MODE_PICKLIST;
         }
         return;
     }
 
     if (mode == MODE_PICKLIST) {
-        int cnt = pickTarget == 0 ? kRegionCount : kPresetCount;
+        int cnt = pickTarget == 0 ? kRegionCount : pickTarget == 1 ? kPresetCount : kUtcCount;
         if (esc) {
             mode = MODE_SETTINGS;
         } else if (up) {
@@ -1130,8 +1599,14 @@ void AdvUI::handleKey(char ch)
             if (pickSel < cnt - 1)
                 pickSel++;
         } else if (enter) {
-            const EnumOpt *opts = pickTarget == 0 ? kRegionOpts : kPresetOpts;
-            applyLoRa(pickTarget, opts[pickSel].value); // sets config, saves, schedules reboot
+            if (pickTarget == 2) { // UTC offset: applied live, persisted with msgs
+                g_utcOffsetMin = kUtcOpts[pickSel].value;
+                g_msgsDirty = true;
+                mode = MODE_SETTINGS;
+            } else {
+                const EnumOpt *opts = pickTarget == 0 ? kRegionOpts : kPresetOpts;
+                applyLoRa(pickTarget, opts[pickSel].value); // sets config, saves, schedules reboot
+            }
         }
         return;
     }
@@ -1142,7 +1617,20 @@ void AdvUI::handleKey(char ch)
     if (mode == MODE_NODE) {
         if (esc || bksp) {
             mode = nodeReturn;
+        } else if (up) {
+            chatScroll++; // older; drawNode clamps to the top of the thread
+        } else if (down) {
+            if (chatScroll > 0)
+                chatScroll--; // back toward the newest
+        } else if (tab) {
+            msgLen = 0; // start a fresh reply built from the picked emoji
+            msgBuf[0] = 0;
+            chatScroll = 0;
+            emojiReturn = MODE_NODE;
+            emojiSel = 0;
+            mode = MODE_EMOJI;
         } else if (printable) {
+            chatScroll = 0; // jump to the bottom to compose in context
             msgBuf[0] = c; // start composing a reply to this node
             msgBuf[1] = 0;
             msgLen = 1;
@@ -1151,16 +1639,54 @@ void AdvUI::handleKey(char ch)
         return;
     }
 
+    if (mode == MODE_EMOJI) {
+        if (esc) {
+            mode = emojiReturn;
+        } else if (left) {
+            if (emojiSel > 0)
+                emojiSel--;
+        } else if (right) {
+            if (emojiSel < kEmojiCount - 1)
+                emojiSel++;
+        } else if (up) {
+            if (emojiSel >= 6)
+                emojiSel -= 6;
+        } else if (down) {
+            if (emojiSel + 6 < kEmojiCount)
+                emojiSel += 6;
+        } else if (enter) {
+            const char *lab = kEmojiPalette[emojiSel];
+            size_t ll = strlen(lab);
+            if (msgLen + ll < sizeof(msgBuf) - 1) {
+                strcpy(msgBuf + msgLen, lab);
+                msgLen += ll;
+            }
+            mode = MODE_COMPOSE; // continue composing with the emoji inserted
+        }
+        return;
+    }
+
     if (mode == MODE_COMPOSE) {
         if (esc) {
             mode = MODE_NODE;
+        } else if (tab) {
+            emojiReturn = MODE_COMPOSE; // add an emoji into the current message
+            emojiSel = 0;
+            mode = MODE_EMOJI;
         } else if (enter) {
-            if (msgLen)
-                sendMessage(selectedNum, msgBuf);
+            if (msgLen) {
+                if (selectedChannel >= 0)
+                    sendChannel(selectedChannel, msgBuf);
+                else
+                    sendMessage(selectedNum, msgBuf);
+            }
             msgLen = 0;
             msgBuf[0] = 0;
+            chatScroll = 0; // show the just-sent message at the bottom
             mode = MODE_NODE;
         } else if (bksp) {
+            while (msgLen > 0 && ((unsigned char)msgBuf[msgLen - 1] & 0xC0) == 0x80)
+                msgBuf[--msgLen] = 0; // drop UTF-8 continuation bytes, then the lead byte
             if (msgLen)
                 msgBuf[--msgLen] = 0;
         } else if (printable && msgLen < sizeof(msgBuf) - 1) {
@@ -1173,33 +1699,25 @@ void AdvUI::handleKey(char ch)
     // Home node list: navigable directly (cursor + scroll); typing opens the filter.
     if (mode == MODE_NODES) {
         rebuildFiltered();
+        int total = chanCount + filteredCount;
         if (up) {
             if (sel > 0)
                 sel--;
             return;
         }
         if (down) {
-            if (sel < filteredCount - 1)
+            if (sel < total - 1)
                 sel++;
             return;
         }
         if (enter) {
-            if (sel < filteredCount) {
-                meshtastic_NodeInfoLite *node = nodeDB ? nodeDB->getMeshNodeByIndex(filtered[sel]) : nullptr;
-                if (node) {
-                    selectedNum = node->num;
-                    nodeReturn = MODE_NODES;
-                    mode = MODE_NODE;
-                }
-            }
+            if (sel < total)
+                openEntry(sel); // channel or node
             return;
         }
-        if (left || right) { // favourite / unfavourite the selected node (persists in nodeDB)
-            if (sel < filteredCount && nodeDB) {
-                meshtastic_NodeInfoLite *node = nodeDB->getMeshNodeByIndex(filtered[sel]);
-                if (node)
-                    nodeDB->set_favorite(left, node->num);
-            }
+        if (left || right) { // favourite / unfavourite the selected entry (channel or node)
+            if (sel < total)
+                favEntry(sel, left);
             return;
         }
         if (!printable)
@@ -1224,6 +1742,7 @@ void AdvUI::handleKey(char ch)
     }
 
     rebuildFiltered();
+    int total = chanCount + filteredCount;
 
     if (up) {
         if (sel > 0)
@@ -1231,27 +1750,18 @@ void AdvUI::handleKey(char ch)
         return;
     }
     if (down) {
-        if (sel < filteredCount - 1)
+        if (sel < total - 1)
             sel++;
         return;
     }
     if (enter) {
-        if (sel < filteredCount) {
-            meshtastic_NodeInfoLite *node = nodeDB ? nodeDB->getMeshNodeByIndex(filtered[sel]) : nullptr;
-            if (node) {
-                selectedNum = node->num;
-                nodeReturn = MODE_PICKER;
-                mode = MODE_NODE;
-            }
-        }
+        if (sel < total)
+            openEntry(sel); // channel or node
         return;
     }
-    if (left || right) { // favourite / unfavourite the selected node
-        if (sel < filteredCount && nodeDB) {
-            meshtastic_NodeInfoLite *node = nodeDB->getMeshNodeByIndex(filtered[sel]);
-            if (node)
-                nodeDB->set_favorite(left, node->num);
-        }
+    if (left || right) { // favourite / unfavourite the selected entry
+        if (sel < total)
+            favEntry(sel, left);
         return;
     }
     if (bksp) {
@@ -1279,6 +1789,17 @@ int32_t AdvUI::runOnce()
     while (api.available() && api.getFromRadio(fromRadioBuf) > 0) {
         handleFromRadio(api.lastFromRadio()); // pick out incoming text messages
     }
+
+#ifdef HAS_I2S
+    // Advance our alert beep; isPlaying() both plays and reports. Stop when done.
+    if (g_beeping) {
+        if (!audioThread || !audioThread->isPlaying()) {
+            if (audioThread)
+                audioThread->stop();
+            g_beeping = false;
+        }
+    }
+#endif
 
     kb.setNavKeys(mode != MODE_SETNAME && mode != MODE_COMPOSE); // symbols while typing, arrows otherwise
     kb.trigger();
@@ -1323,9 +1844,15 @@ int32_t AdvUI::runOnce()
         drawPickList();
     else if (mode == MODE_REBOOT)
         drawReboot();
+    else if (mode == MODE_EMOJI)
+        drawEmoji();
     else
         drawNodeList();
 
+#ifdef HAS_I2S
+    if (g_beeping)
+        return 20; // pump the tone fast until it finishes
+#endif
     return splashDone ? 200 : 80; // 5 Hz normally; snappier while the splash is up
 }
 

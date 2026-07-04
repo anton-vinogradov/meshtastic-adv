@@ -38,7 +38,8 @@ class AdvUI : public concurrency::OSThread
         MODE_SETNAME,
         MODE_SETTINGS,
         MODE_PICKLIST,
-        MODE_REBOOT
+        MODE_REBOOT,
+        MODE_EMOJI
     };
 
     void initHardware();
@@ -50,12 +51,18 @@ class AdvUI : public concurrency::OSThread
     void drawSetName();
     void drawPickList();
     void drawReboot();
+    void drawEmoji();
     bool applyName(); // returns true if it scheduled a reboot (frequency/channel)
     void applyLoRa(int target, int value);
     void rebuildFiltered();
     int buildNodeList(uint16_t *out, int max, const char *query);
+    int buildChannels(const char *query);
+    void drawChannelRow(int chIdx, int y);
+    void openEntry(int s); // open the combined-list entry at index s (channel or node)
+    void favEntry(int s, bool on);
     void handleFromRadio(const meshtastic_FromRadio &fr);
     void sendMessage(uint32_t to, const char *text);
+    void sendChannel(int chIdx, const char *text);
     void handleKey(char c);
 
     InternalAPI api;
@@ -70,9 +77,15 @@ class AdvUI : public concurrency::OSThread
     static constexpr int kMaxFiltered = 128;
     uint16_t filtered[kMaxFiltered]; // node DB indices, sorted + query-matched (picker)
     int filteredCount = 0;
-    int sel = 0;          // selection cursor into filtered[]
+    uint8_t chanList[8];  // enabled channel indices shown above the nodes
+    int chanCount = 0;
+    int sel = 0;          // cursor into the combined list (channels then filtered nodes)
     int scrollTop = 0;    // first visible row
     uint32_t selectedNum = 0; // node chosen with Enter (MODE_NODE)
+    int selectedChannel = -1; // >= 0 when the open thread is a channel (else a node DM)
+    int chatScroll = 0;       // thread view: lines scrolled up from the bottom (0 = newest)
+    int emojiSel = 0;         // emoji picker cursor (MODE_EMOJI)
+    Mode emojiReturn = MODE_COMPOSE; // where ESC in the emoji picker returns
     Mode nodeReturn = MODE_NODES; // where the node view returns on ESC (home or picker)
 
     char msgBuf[200] = {0};   // compose buffer (MODE_COMPOSE)

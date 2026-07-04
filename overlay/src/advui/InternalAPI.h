@@ -21,6 +21,11 @@ class InternalAPI : public PhoneAPI
     /// Public wrapper: PhoneAPI::handleStartConfig() is protected.
     void begin() { handleStartConfig(); }
 
+    /// The decoded FromRadio from the most recent getFromRadio() call. Lets the UI
+    /// read incoming packets (e.g. text messages) without re-decoding the buffer —
+    /// getFromRadio() builds this scratch struct and then encodes it.
+    const meshtastic_FromRadio &lastFromRadio() const { return fromRadioScratch; }
+
   protected:
     /// The UI shares the engine's process, so the link is always up.
     bool checkIsConnected() override { return true; }

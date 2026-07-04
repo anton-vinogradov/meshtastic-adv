@@ -24,7 +24,7 @@ separate node by swapping the transport.
 
 The `firmware` submodule stays **byte-identical to upstream** `meshtastic/firmware`.
 Our code lives in `overlay/` and is copied into the firmware tree at build time by
-`scripts/sync-overlay.sh`, which also applies two idempotent, marker-guarded (`advui-inject`)
+`scripts/sync-overlay.sh`, which also applies three idempotent, marker-guarded (`advui-inject`)
 injections. Nothing is committed into the submodule, so updating upstream is
 `git -C firmware checkout -- . && git -C firmware pull` then re-sync — no merge conflicts.
 
@@ -34,8 +34,10 @@ injections. Nothing is committed into the submodule, so updating upstream is
   `-D MESHTASTIC_EXCLUDE_SCREEN` and `-D MESHTASTIC_EXCLUDE_INPUTBROKER`, and drops the stock
   keyboard sources — `CardputerKeyboard.cpp`, `kbI2cBase.cpp`, `cardKbI2cImpl.cpp` — via
   `build_src_filter`). A new file, so the `variants/*/*/platformio.ini` glob picks it up.
-- Injections: two, both in `main.cpp` — `#include "advui/AdvUI.h"` and an `advui::advuiSetup();`
-  call after `setupModules()`.
+- Injections: three, all in `main.cpp` — `#include "advui/AdvUI.h"`, an `advui::advuiSetup();`
+  call after `setupModules()`, and `Serial.setTxTimeoutMs(0)` after `consoleInit()` (USB-CDC
+  builds only) so boot logging can't stall when the host has enumerated the port but isn't
+  draining it — that stall is why USB-powered boots were much slower than battery.
 
 `AdvUI` is a `concurrency::OSThread`, so once `advuiSetup()` creates it the scheduler drives
 `runOnce()` — no main-loop edit. Build with `-e m5stack-cardputer-adv-advui`.

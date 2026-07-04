@@ -15,6 +15,7 @@ constexpr uint8_t kRows = 7;
 constexpr uint8_t kCols = 8;
 constexpr uint8_t kNumKeys = 56;
 constexpr uint32_t kMultiTapThreshold = 1500;
+constexpr uint32_t kLongPressMs = 900; // ESC held this long -> settings, not "back"
 
 constexpr uint8_t modifierFnKey = 2;
 constexpr uint8_t modifierFn = 0b0010;
@@ -120,6 +121,13 @@ void AdvKeyboard::begin()
 
 void AdvKeyboard::trigger()
 {
+    // Emit ESC's long-press the moment the hold crosses the threshold (while still
+    // held), independent of the FIFO — so settings open on hold, not on release.
+    if (escDown && !escLongFired && millis() - escPressMs >= kLongPressMs) {
+        queueEvent(kLongEsc);
+        escLongFired = true;
+    }
+
     // Pop exactly one event from the FIFO (reading KEY_EVENT_A advances it). The
     // caller re-triggers in a loop to drain, so keyCount always makes progress.
     if (keyCount() == 0)
@@ -153,6 +161,12 @@ void AdvKeyboard::pressed(uint8_t key)
     uint32_t now = millis();
     tap_interval = now - last_tap;
 
+    if (next_key == 0) { // ESC key down — start the long-press timer
+        escPressMs = now;
+        escDown = true;
+        escLongFired = false;
+    }
+
     updateModifierFlag(next_key);
     if (isModifierKey(next_key))
         last_modifier_time = now;
@@ -184,6 +198,19 @@ void AdvKeyboard::released()
     }
 
     last_tap = millis();
+
+    // ESC: the long-press already fires from trigger() while held. On release just
+    // clean up, and emit the normal "back" code only if it was a short tap.
+    if (last_key == 0) {
+        bool longFired = escLongFired;
+        escDown = false;
+        escLongFired = false;
+        if (longFired)
+            return;
+        modifierFlag = modifierFn;
+        queueEvent(TapMap[0][modifierFlag % TapMod[0]]);
+        return;
+    }
 
     // Esc + the four arrow keys always emit their navigation code (stock does this
     // only in menuMode; we have no stock menu, so it's unconditional).

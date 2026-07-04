@@ -23,7 +23,9 @@ class AdvDisplay : public lgfx::LGFX_Device
     {
         {
             auto cfg = _bus.config();
-            cfg.spi_host = SPI2_HOST;
+            // Dedicated bus on SPI3/HSPI. The LoRa radio owns SPI2/FSPI (Arduino `SPI`),
+            // so keeping the display on its own peripheral avoids corrupting radio SPI.
+            cfg.spi_host = SPI3_HOST;
             cfg.spi_mode = 0;
             cfg.freq_write = 40000000;
             cfg.freq_read = 16000000;
@@ -51,7 +53,7 @@ class AdvDisplay : public lgfx::LGFX_Device
             cfg.invert = true;
             cfg.rgb_order = false;
             cfg.dlen_16bit = false;
-            cfg.bus_shared = true; // ST7789 shares the SPI bus with the SX1262 LoRa radio
+            cfg.bus_shared = false; // dedicated SPI3 bus, not shared with the radio
             _panel.config(cfg);
         }
         setPanel(&_panel);

@@ -810,6 +810,7 @@ void AdvUI::initHardware()
     g_led.setBrightness(70);
     g_led.clear();
     g_led.show();
+    flashLed(0, 70, 90); // brief cyan "hello" blink at boot: confirms the LED works
 #endif
 
     api.begin();

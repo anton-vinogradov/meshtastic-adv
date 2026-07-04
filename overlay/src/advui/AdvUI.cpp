@@ -13,7 +13,7 @@
 #include "main.h" // audioThread (I2S beep)
 #include "modules/NodeInfoModule.h"
 #ifdef HAS_NEOPIXEL
-#include <Adafruit_NeoPixel.h> // RGB notification LED
+#include "esp32-hal-rgb-led.h" // rgbLedWrite(): stateless RMT driver for the onboard RGB LED
 #endif
 #include <algorithm>
 #include <cctype>
@@ -197,16 +197,14 @@ void startBeep()
 #endif
 
 #ifdef HAS_NEOPIXEL
-// Notification LED (single SK6812 on NEOPIXEL_DATA). The stock AmbientLightingThread
-// inits but leaves it idle by default, so our own object can drive it for a brief
-// flash on incoming messages, cleared from runOnce.
-Adafruit_NeoPixel g_led(NEOPIXEL_COUNT, NEOPIXEL_DATA, NEOPIXEL_TYPE);
+// Notification LED (single onboard RGB on NEOPIXEL_DATA). We drive it with the core's
+// stateless rgbLedWrite() (shares the core RMT manager with the stock ambient thread,
+// so no begin()/channel conflict). A brief flash on incoming messages, cleared in runOnce.
 uint32_t g_ledOffMs = 0;
 void flashLed(uint8_t r, uint8_t g, uint8_t b)
 {
-    g_led.setPixelColor(0, g_led.Color(r, g, b));
-    g_led.show();
-    g_ledOffMs = millis() + 350;
+    rgbLedWrite(NEOPIXEL_DATA, r, g, b);
+    g_ledOffMs = millis() + 400;
 }
 #endif
 
@@ -570,7 +568,7 @@ uint16_t translitSingle(char l)
     case 'j': return 0x439; case 'k': return 0x43A; case 'l': return 0x43B; case 'm': return 0x43C;
     case 'n': return 0x43D; case 'o': return 0x43E; case 'p': return 0x43F; case 'r': return 0x440;
     case 's': return 0x441; case 't': return 0x442; case 'u': return 0x443; case 'f': return 0x444;
-    case 'h': return 0x445; case 'c': return 0x446; case 'y': return 0x44B; case 'w': return 0x449;
+    case 'h': return 0x445; case 'c': return 0x446; case 'y': return 0x44B;
     case 'x': return 0x44A; case 'q': return 0x44F;
     default: return 0;
     }
@@ -616,7 +614,21 @@ void translitFeed(char *buf, uint8_t &len, size_t cap, char raw, char &pending)
                 len -= 2;
                 buf[len] = 0;
             }
-            appendCp(buf, len, cap, translitCase(cp, isUp(pending)));
+            uint16_t out = translitCase(cp, isUp(pending));
+            // sch -> щ: fold a preceding с/С and this ч (from c+h) into щ/Щ
+            if (cp == 0x447 && len >= 2) {
+                uint8_t b0 = (uint8_t)buf[len - 2], b1 = (uint8_t)buf[len - 1];
+                if (b0 == 0xD1 && b1 == 0x81) { // с
+                    len -= 2;
+                    buf[len] = 0;
+                    out = 0x449; // щ
+                } else if (b0 == 0xD0 && b1 == 0xA1) { // С
+                    len -= 2;
+                    buf[len] = 0;
+                    out = 0x429; // Щ
+                }
+            }
+            appendCp(buf, len, cap, out);
             pending = 0;
             return;
         }
@@ -806,11 +818,14 @@ void AdvUI::initHardware()
     moduleConfig.external_notification.enabled = false;
 
 #ifdef HAS_NEOPIXEL
-    g_led.begin();
-    g_led.setBrightness(70);
-    g_led.clear();
-    g_led.show();
-    flashLed(0, 70, 90); // brief cyan "hello" blink at boot: confirms the LED works
+    // Boot self-test: cycle red -> green -> blue so it's unmistakable the LED works.
+    rgbLedWrite(NEOPIXEL_DATA, 90, 0, 0);
+    delay(250);
+    rgbLedWrite(NEOPIXEL_DATA, 0, 90, 0);
+    delay(250);
+    rgbLedWrite(NEOPIXEL_DATA, 0, 0, 90);
+    delay(250);
+    rgbLedWrite(NEOPIXEL_DATA, 0, 0, 0);
 #endif
 
     api.begin();
@@ -2082,8 +2097,7 @@ int32_t AdvUI::runOnce()
 #endif
 #ifdef HAS_NEOPIXEL
     if (g_ledOffMs && millis() > g_ledOffMs) { // clear the notification flash
-        g_led.clear();
-        g_led.show();
+        rgbLedWrite(NEOPIXEL_DATA, 0, 0, 0);
         g_ledOffMs = 0;
     }
 #endif

@@ -110,6 +110,7 @@ class AdvUI : public concurrency::OSThread
     bool haveCanvas = false;
     bool splashDone = false;
     bool announced = false; // sent our early boot NodeInfo announce yet
+    bool regionPrompted = false; // opened the first-boot region picker yet
     uint32_t bootMs = 0;
     uint8_t fromRadioBuf[MAX_TO_FROM_RADIO_SIZE]; // sized by PhoneAPI.h
 };

@@ -12,6 +12,9 @@
 #include "graphics/emotes.h" // UTF-8 -> bitmap emoji table (forced in via EmotesData.cpp)
 #include "main.h" // audioThread (I2S beep)
 #include "modules/NodeInfoModule.h"
+#ifdef HAS_NEOPIXEL
+#include <Adafruit_NeoPixel.h> // RGB notification LED
+#endif
 #include <algorithm>
 #include <cctype>
 #include <cstdio>
@@ -190,6 +193,20 @@ void startBeep()
         return;
     audioThread->beginRttl(kBeepRtttl, strlen(kBeepRtttl));
     g_beeping = true;
+}
+#endif
+
+#ifdef HAS_NEOPIXEL
+// Notification LED (single SK6812 on NEOPIXEL_DATA). The stock AmbientLightingThread
+// inits but leaves it idle by default, so our own object can drive it for a brief
+// flash on incoming messages, cleared from runOnce.
+Adafruit_NeoPixel g_led(NEOPIXEL_COUNT, NEOPIXEL_DATA, NEOPIXEL_TYPE);
+uint32_t g_ledOffMs = 0;
+void flashLed(uint8_t r, uint8_t g, uint8_t b)
+{
+    g_led.setPixelColor(0, g_led.Color(r, g, b));
+    g_led.show();
+    g_ledOffMs = millis() + 350;
 }
 #endif
 
@@ -788,6 +805,13 @@ void AdvUI::initHardware()
     // We drive our own favourites-only single beep instead (see startBeep()).
     moduleConfig.external_notification.enabled = false;
 
+#ifdef HAS_NEOPIXEL
+    g_led.begin();
+    g_led.setBrightness(70);
+    g_led.clear();
+    g_led.show();
+#endif
+
     api.begin();
     kb.begin();
     LOG_INFO("advui: keyboard ready");
@@ -865,15 +889,21 @@ void AdvUI::handleFromRadio(const meshtastic_FromRadio &fr)
     bool unread = p.from != me && (p.to == me || p.to == NODENUM_BROADCAST); // DM to us, or a channel broadcast
     addMsg(p.from, p.to, p.channel, p.rx_time, unread, text, 0, MSG_IN);
 
-#ifdef HAS_I2S
-    // Single beep, only from a favourite: a favourited channel broadcast, or a DM
-    // from a favourited node. Everything else stays silent.
     if (unread) {
         bool fav = (p.to == NODENUM_BROADCAST) ? chanFav(p.channel) : (nodeDB && nodeDB->isFavorite(p.from));
+#ifdef HAS_NEOPIXEL
+        // LED flash on any incoming: green from a favourite, blue otherwise.
+        if (fav)
+            flashLed(0, 90, 20);
+        else
+            flashLed(0, 20, 90);
+#endif
+#ifdef HAS_I2S
+        // Beep only from a favourite (channel broadcast or DM); everyone else stays silent.
         if (fav)
             startBeep();
-    }
 #endif
+    }
 }
 
 // Sends a text DM to a node and adds it to our own thread immediately (status
@@ -2019,6 +2049,13 @@ int32_t AdvUI::runOnce()
         }
     }
 #endif
+#ifdef HAS_NEOPIXEL
+    if (g_ledOffMs && millis() > g_ledOffMs) { // clear the notification flash
+        g_led.clear();
+        g_led.show();
+        g_ledOffMs = 0;
+    }
+#endif
 
     kb.setNavKeys(mode != MODE_SETNAME && mode != MODE_COMPOSE); // symbols while typing, arrows otherwise
     kb.trigger();
@@ -2040,6 +2077,18 @@ int32_t AdvUI::runOnce()
     if (splashDone && !announced && nodeInfoModule) {
         nodeInfoModule->sendOurNodeInfo(NODENUM_BROADCAST, false);
         announced = true;
+    }
+
+    // First-boot onboarding: a fresh install has no LoRa region, so the radio can't
+    // transmit. Drop new users straight into the region picker instead of a dead node.
+    if (splashDone && !regionPrompted) {
+        regionPrompted = true;
+        if (config.lora.region == meshtastic_Config_LoRaConfig_RegionCode_UNSET) {
+            pickTarget = 0;
+            pickSel = 0;
+            pickScroll = 0;
+            mode = MODE_PICKLIST;
+        }
     }
 
     // Persist the conversation, debounced, so we don't hammer the flash.

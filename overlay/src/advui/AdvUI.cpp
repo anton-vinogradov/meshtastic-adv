@@ -109,7 +109,7 @@ const char *errName(uint8_t e)
     }
 }
 constexpr int kMaxMsgs = 32;
-constexpr int kNumSettings = 7; // Name, Short, Region, Preset, Frequency, Channel, UTC
+constexpr int kNumSettings = 9; // Name, Short, Region, Preset, Frequency, Channel, UTC, WiFi, MQTT
 Msg g_msgs[kMaxMsgs];
 int g_msgCount = 0;         // populated slots (grows to kMaxMsgs)
 int g_msgNext = 0;          // next write slot (ring head)
@@ -418,12 +418,93 @@ int optIndex(const EnumOpt *opts, int cnt, int value)
 }
 
 // Text-editor (MODE_SETNAME) targets: 0 long name, 1 short name, 2 frequency, 3 channel.
+// --- WiFi / MQTT sub-settings (MODE_NETPAGE) -----------------------------------
+// Two pages of fields backed by the stock config/moduleConfig; no engine changes.
+struct NetField {
+    const char *label;
+    bool isBool;
+};
+const NetField kWifiFields[] = {{"WiFi on (turns BT off)", true}, {"Network name", false}, {"Password", false}};
+const NetField kMqttFields[] = {{"MQTT on", true},   {"Server", false},     {"Username", false},
+                                {"Password", false}, {"Root topic", false}, {"Encryption", true},
+                                {"TLS", true}};
+int netFieldCount(int page) { return page == 0 ? 3 : 7; }
+const NetField *netFields(int page) { return page == 0 ? kWifiFields : kMqttFields; }
+
+bool netGetBool(int page, int i)
+{
+    if (page == 0)
+        return config.network.wifi_enabled;
+    if (i == 0)
+        return moduleConfig.mqtt.enabled;
+    if (i == 5)
+        return moduleConfig.mqtt.encryption_enabled;
+    return moduleConfig.mqtt.tls_enabled;
+}
+void netSetBool(int page, int i, bool v)
+{
+    if (page == 0)
+        config.network.wifi_enabled = v;
+    else if (i == 0)
+        moduleConfig.mqtt.enabled = v;
+    else if (i == 5)
+        moduleConfig.mqtt.encryption_enabled = v;
+    else
+        moduleConfig.mqtt.tls_enabled = v;
+}
+const char *netGetText(int page, int i)
+{
+    if (page == 0)
+        return i == 1 ? config.network.wifi_ssid : config.network.wifi_psk;
+    switch (i) {
+    case 1: return moduleConfig.mqtt.address;
+    case 2: return moduleConfig.mqtt.username;
+    case 3: return moduleConfig.mqtt.password;
+    default: return moduleConfig.mqtt.root;
+    }
+}
+// A net text field is edited via MODE_SETNAME with editTarget = 20 + page*10 + index.
+void netTextDecode(int t, int &page, int &i) { page = (t - 20) / 10; i = (t - 20) % 10; }
+unsigned netTextMax(int page, int i)
+{
+    if (page == 0)
+        return i == 1 ? 32 : 64; // wifi_ssid[33], wifi_psk[65]
+    switch (i) {
+    case 3: return 31;  // password[32]
+    case 4: return 31;  // root[32]
+    default: return 63; // address[64], username[64]
+    }
+}
+void netSetText(int t, const char *s)
+{
+    int page, i;
+    netTextDecode(t, page, i);
+    unsigned n = netTextMax(page, i);
+    char *dst = page == 0 ? (i == 1 ? config.network.wifi_ssid : config.network.wifi_psk)
+                          : (i == 1   ? moduleConfig.mqtt.address
+                             : i == 2 ? moduleConfig.mqtt.username
+                             : i == 3 ? moduleConfig.mqtt.password
+                                      : moduleConfig.mqtt.root);
+    strncpy(dst, s, n);
+    dst[n] = 0;
+}
+
 unsigned editMax(int t)
 {
+    if (t >= 20) {
+        int p, i;
+        netTextDecode(t, p, i);
+        return netTextMax(p, i);
+    }
     return t == 1 ? 4 : t == 2 ? 9 : t == 3 ? 11 : 24;
 }
 const char *editTitle(int t)
 {
+    if (t >= 20) {
+        int p, i;
+        netTextDecode(t, p, i);
+        return netFields(p)[i].label;
+    }
     return t == 1 ? "Set short name" : t == 2 ? "Set frequency (MHz)" : t == 3 ? "Set channel name" : "Set long name";
 }
 
@@ -1670,6 +1751,11 @@ void AdvUI::drawSetName()
 // path AdminModule::handleSetOwner takes, but driven from our UI.
 bool AdvUI::applyName()
 {
+    if (editTarget >= 20) { // WiFi / MQTT text field -> config/moduleConfig; saved on net-page exit
+        netSetText(editTarget, nameBuf);
+        netDirty = true;
+        return false;
+    }
     if (editTarget == 2) { // frequency (MHz) -> override_frequency; radio restart to apply
         config.lora.override_frequency = strtof(nameBuf, nullptr);
         if (nodeDB)
@@ -1720,7 +1806,8 @@ void AdvUI::drawSettings()
     g->print("Settings");
     g->drawFastHLine(0, 13, 240, 0x39C7);
 
-    const char *labels[kNumSettings] = {"Name", "Short", "Region", "Preset", "Frequency", "Channel", "UTC"};
+    const char *labels[kNumSettings] = {"Name",    "Short", "Region", "Preset", "Frequency",
+                                         "Channel", "UTC",   "WiFi",   "MQTT"};
     char vals[kNumSettings][24];
     snprintf(vals[0], sizeof(vals[0]), "%s", owner.long_name[0] ? owner.long_name : "(unset)");
     snprintf(vals[1], sizeof(vals[1]), "%s", owner.short_name[0] ? owner.short_name : "(unset)");
@@ -1738,10 +1825,24 @@ void AdvUI::drawSettings()
         else
             snprintf(vals[6], sizeof(vals[6]), "UTC%c%d", om < 0 ? '-' : '+', ah / 60);
     }
+    if (config.network.wifi_enabled)
+        snprintf(vals[7], sizeof(vals[7]), "%s", config.network.wifi_ssid[0] ? config.network.wifi_ssid : "on");
+    else
+        strcpy(vals[7], "off");
+    strcpy(vals[8], moduleConfig.mqtt.enabled ? "on" : "off");
 
-    const int rowH = 15, top = 15;
-    for (int i = 0; i < kNumSettings; i++) {
-        int y = top + i * rowH;
+    const int rowH = 15, top = 15, maxRows = (124 - top) / rowH;
+    if (setSel < setScroll)
+        setScroll = setSel;
+    if (setSel >= setScroll + maxRows)
+        setScroll = setSel - maxRows + 1;
+    if (setScroll < 0)
+        setScroll = 0;
+    for (int r = 0; r < maxRows; r++) {
+        int i = setScroll + r;
+        if (i >= kNumSettings)
+            break;
+        int y = top + r * rowH;
         if (i == setSel)
             g->fillRect(0, y - 1, 240, rowH, 0x2945); // selection highlight
 
@@ -1759,6 +1860,76 @@ void AdvUI::drawSettings()
     }
 
     drawFooter(g, "up/dn   ENTER edit   ESC back");
+
+    if (haveCanvas)
+        canvas.pushSprite(0, 0);
+}
+
+// WiFi / MQTT sub-settings page (booleans toggle on Enter, text via the name editor).
+void AdvUI::drawNetPage()
+{
+    lgfx::LGFXBase *g = haveCanvas ? static_cast<lgfx::LGFXBase *>(&canvas) : static_cast<lgfx::LGFXBase *>(&display);
+
+    g->fillScreen(0x0000);
+    g->setFont(&lgfx::fonts::Font0);
+    g->setTextSize(1);
+    g->setTextColor(0x07FF);
+    g->setCursor(4, 3);
+    g->print(netPage == 0 ? "WiFi" : "MQTT");
+    g->drawFastHLine(0, 13, 240, 0x39C7);
+
+    const NetField *f = netFields(netPage);
+    int cnt = netFieldCount(netPage);
+    const int rowH = 15, top = 15, maxRows = (124 - top) / rowH;
+    if (netSel < netScroll)
+        netScroll = netSel;
+    if (netSel >= netScroll + maxRows)
+        netScroll = netSel - maxRows + 1;
+    if (netScroll < 0)
+        netScroll = 0;
+
+    for (int r = 0; r < maxRows; r++) {
+        int i = netScroll + r;
+        if (i >= cnt)
+            break;
+        int y = top + r * rowH;
+        if (i == netSel)
+            g->fillRect(0, y - 1, 240, rowH, 0x2945);
+        g->setFont(&lgfx::fonts::FreeSansBold9pt7b);
+        g->setTextSize(1);
+        g->setTextColor(0xFFFF);
+        g->setCursor(6, y + 1);
+        g->print(f[i].label);
+        int lw = g->textWidth(f[i].label);
+
+        char v[26];
+        bool on = false;
+        if (f[i].isBool) {
+            on = netGetBool(netPage, i);
+            strcpy(v, on ? "on" : "off");
+        } else {
+            const char *t = netGetText(netPage, i);
+            bool pass = (netPage == 0 && i == 2) || (netPage == 1 && i == 3);
+            if (!t[0])
+                strcpy(v, (netPage == 1 && i == 1) ? "(default)" : "(unset)");
+            else if (pass) {
+                int n = (int)strlen(t);
+                if (n > 20)
+                    n = 20;
+                memset(v, '*', n);
+                v[n] = 0;
+            } else {
+                strncpy(v, t, sizeof(v));
+                v[sizeof(v) - 1] = 0;
+            }
+        }
+        g->setTextColor(on ? 0x07E0 : 0x9CD3); // green when a toggle is on
+        fitWidth(g, v, 230 - (6 + lw));
+        g->setCursor(236 - g->textWidth(v), y + 1);
+        g->print(v);
+    }
+
+    drawFooter(g, netDirty ? "ENTER edit   ESC save+reboot" : "ENTER edit   ESC back");
 
     if (haveCanvas)
         canvas.pushSprite(0, 0);
@@ -1958,6 +2129,27 @@ void AdvUI::runDemoDump()
     drawPickList();
     screenshot("utc");
 
+    // WiFi / MQTT pages with sample values (restored right after — never saved)
+    meshtastic_Config_NetworkConfig bnet = config.network;
+    meshtastic_ModuleConfig_MQTTConfig bmqtt = moduleConfig.mqtt;
+    config.network.wifi_enabled = true;
+    strcpy(config.network.wifi_ssid, "HomeWiFi");
+    strcpy(config.network.wifi_psk, "s3cret-pass");
+    moduleConfig.mqtt.enabled = true;
+    moduleConfig.mqtt.address[0] = 0;
+    moduleConfig.mqtt.encryption_enabled = true;
+    strcpy(moduleConfig.mqtt.root, "msh");
+    netSel = 0;
+    netScroll = 0;
+    netPage = 0;
+    drawNetPage();
+    screenshot("wifi");
+    netPage = 1;
+    drawNetPage();
+    screenshot("mqtt");
+    config.network = bnet;
+    moduleConfig.mqtt = bmqtt;
+
     Serial.println("@@DONE");
     Serial.flush();
 
@@ -2033,8 +2225,8 @@ void AdvUI::handleKey(char ch)
                 if (nameLen)
                     nameBuf[--nameLen] = 0;
             }
-        } else if (ruMode && !numeric && printable && nameLen + 2 < sizeof(nameBuf)) {
-            translitFeed(nameBuf, nameLen, sizeof(nameBuf), c, pendingLat);
+        } else if (ruMode && !numeric && editTarget < 20 && printable && nameLen + 2 < sizeof(nameBuf)) {
+            translitFeed(nameBuf, nameLen, sizeof(nameBuf), c, pendingLat); // WiFi/MQTT fields stay Latin
         } else if (printable && nameLen < maxLen && (!numeric || (c >= '0' && c <= '9') || c == '.')) {
             nameBuf[nameLen++] = c;
             nameBuf[nameLen] = 0;
@@ -2090,6 +2282,46 @@ void AdvUI::handleKey(char ch)
             pickSel = optIndex(kUtcOpts, kUtcCount, g_utcOffsetMin);
             pickScroll = 0;
             mode = MODE_PICKLIST;
+        } else if (enter && (setSel == 7 || setSel == 8)) { // WiFi / MQTT sub-page
+            netPage = setSel == 7 ? 0 : 1;
+            netSel = 0;
+            netScroll = 0;
+            netDirty = false;
+            mode = MODE_NETPAGE;
+        }
+        return;
+    }
+
+    if (mode == MODE_NETPAGE) {
+        int cnt = netFieldCount(netPage);
+        if (esc) {
+            if (netDirty && nodeDB) { // apply on the way out (WiFi needs a reboot)
+                config.has_network = true; // ensure the optional submessages serialise
+                moduleConfig.has_mqtt = true;
+                nodeDB->saveToDisk(SEGMENT_CONFIG | SEGMENT_MODULECONFIG);
+                rebootAtMsec = millis() + 1500;
+                mode = MODE_REBOOT;
+            } else {
+                mode = MODE_SETTINGS;
+            }
+        } else if (up) {
+            if (netSel > 0)
+                netSel--;
+        } else if (down) {
+            if (netSel < cnt - 1)
+                netSel++;
+        } else if (enter) {
+            if (netFields(netPage)[netSel].isBool) {
+                netSetBool(netPage, netSel, !netGetBool(netPage, netSel));
+                netDirty = true;
+            } else { // text field -> reuse the name editor
+                editTarget = 20 + netPage * 10 + netSel;
+                strncpy(nameBuf, netGetText(netPage, netSel), sizeof(nameBuf));
+                nameBuf[sizeof(nameBuf) - 1] = 0;
+                nameLen = strlen(nameBuf);
+                nameReturn = MODE_NETPAGE;
+                mode = MODE_SETNAME;
+            }
         }
         return;
     }
@@ -2434,6 +2666,8 @@ int32_t AdvUI::runOnce()
         drawSetName();
     else if (mode == MODE_SETTINGS)
         drawSettings();
+    else if (mode == MODE_NETPAGE)
+        drawNetPage();
     else if (mode == MODE_PICKLIST)
         drawPickList();
     else if (mode == MODE_REBOOT)

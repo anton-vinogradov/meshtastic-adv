@@ -40,7 +40,8 @@ class AdvUI : public concurrency::OSThread
         MODE_SETTINGS,
         MODE_PICKLIST,
         MODE_REBOOT,
-        MODE_EMOJI
+        MODE_EMOJI,
+        MODE_NETPAGE // WiFi / MQTT sub-settings page
     };
 
     struct Conv {         // a recent conversation (a channel or a node DM)
@@ -61,6 +62,7 @@ class AdvUI : public concurrency::OSThread
     void drawPickList();
     void drawReboot();
     void drawEmoji();
+    void drawNetPage();        // WiFi / MQTT sub-settings
     void drawChats();          // home: recent conversations
     void buildConversations(); // fill conv[]/convCount, newest first
     void openConv(int i);      // open conversation conv[i]
@@ -119,6 +121,11 @@ class AdvUI : public concurrency::OSThread
     int editTarget = 0;       // MODE_SETNAME target: 0 long name, 1 short, 2 frequency, 3 channel
     Mode nameReturn = MODE_SETTINGS; // where the name editor returns on save/cancel
     int setSel = 0;           // settings-menu cursor (MODE_SETTINGS)
+    int setScroll = 0;        // first visible settings row (scrollable)
+    int netPage = 0;          // MODE_NETPAGE: 0 = WiFi, 1 = MQTT
+    int netSel = 0;           // cursor within the net page
+    int netScroll = 0;        // first visible net-page row
+    bool netDirty = false;    // net config changed -> save + reboot on exit
     int pickTarget = 0;       // MODE_PICKLIST: 0 = region, 1 = preset
     int pickSel = 0;          // list-picker cursor
     int pickScroll = 0;       // first visible list-picker row

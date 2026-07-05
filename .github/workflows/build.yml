@@ -1,0 +1,88 @@
+name: build
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  pull_request:
+
+# Cancel superseded runs on the same ref.
+concurrency:
+  group: build-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: write
+
+jobs:
+  firmware:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout (with the pristine firmware submodule)
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Cache PlatformIO
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.platformio
+            ~/.cache/pip
+          key: pio-${{ hashFiles('firmware/platformio.ini') }}
+          restore-keys: pio-
+
+      - name: Install PlatformIO
+        run: pip install --upgrade platformio
+
+      - name: Sync the overlay into the submodule
+        run: bash scripts/sync-overlay.sh
+
+      - name: Build (m5stack-cardputer-adv-advui)
+        working-directory: firmware
+        run: pio run -e m5stack-cardputer-adv-advui
+
+      - name: Locate the factory image
+        id: img
+        run: echo "path=$(ls firmware/.pio/build/m5stack-cardputer-adv-advui/*.factory.bin | head -1)" >> "$GITHUB_OUTPUT"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: firmware-factory
+          path: ${{ steps.img.outputs.path }}
+
+      # ---------- tag-only: refresh the web installer + cut a release ----------
+      - name: Refresh the installer image on main
+        if: startsWith(github.ref, 'refs/tags/v')
+        run: |
+          cp "${{ steps.img.outputs.path }}" /tmp/fw.bin
+          ver="${GITHUB_REF_NAME#v}"
+          git config user.name  "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git fetch origin main
+          git checkout -B main origin/main
+          cp /tmp/fw.bin docs/firmware.factory.bin
+          tmp=$(mktemp)
+          jq --arg v "$ver (advui · engine 2.8.0)" '.version=$v' docs/manifest.json > "$tmp" && mv "$tmp" docs/manifest.json
+          git add docs/firmware.factory.bin docs/manifest.json
+          git commit -m "ci: web installer image for ${GITHUB_REF_NAME} [skip ci]" || { echo "no change"; exit 0; }
+          git push origin HEAD:main
+
+      - name: Create the GitHub release
+        if: startsWith(github.ref, 'refs/tags/v')
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          cp /tmp/fw.bin "meshtastic-adv-${GITHUB_REF_NAME}.factory.bin"
+          if gh release view "${GITHUB_REF_NAME}" >/dev/null 2>&1; then
+            gh release upload "${GITHUB_REF_NAME}" "meshtastic-adv-${GITHUB_REF_NAME}.factory.bin" --clobber
+          else
+            gh release create "${GITHUB_REF_NAME}" \
+              --title "Meshtastic ADV ${GITHUB_REF_NAME}" \
+              --generate-notes \
+              "meshtastic-adv-${GITHUB_REF_NAME}.factory.bin"
+          fi

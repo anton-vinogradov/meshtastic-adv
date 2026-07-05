@@ -1,5 +1,6 @@
 #pragma once
 
+#include "mesh/generated/meshtastic/config.pb.h"
 #include <cstddef>
 #include <cstdint>
 
@@ -58,7 +59,7 @@ struct CompNode {
     char shortName[5];
     char longName[24];
 };
-constexpr int kMaxCompNodes = 64;
+constexpr int kMaxCompNodes = 128;
 extern CompNode g_compNodes[kMaxCompNodes];
 extern volatile int g_compNodeCount;
 struct CompChan {
@@ -68,6 +69,8 @@ struct CompChan {
 extern CompChan g_compChans[8];
 extern volatile bool g_linkConfigDone; // config download finished
 extern volatile int g_compPreset;      // the node's LoRa modem preset (blank primary shows it)
+extern meshtastic_Config_LoRaConfig g_compLora; // the node's full LoRa config (remote admin edits it)
+extern volatile bool g_compLoraValid;
 extern volatile int g_linkNodeBatt;    // the radio node's battery % (-1 unknown)
 extern volatile int g_linkRssi;        // BLE link RSSI in dBm (0 unknown)
 

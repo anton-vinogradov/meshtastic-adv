@@ -41,7 +41,10 @@ class AdvUI : public concurrency::OSThread
         MODE_PICKLIST,
         MODE_REBOOT,
         MODE_EMOJI,
-        MODE_NETPAGE // WiFi / MQTT sub-settings page
+        MODE_NETPAGE, // WiFi / MQTT sub-settings page
+        MODE_BLESCAN, // companion: find a Meshtastic node over BLE
+        MODE_BLEPIN,  // companion: enter the pairing PIN shown on the node
+        MODE_BLELINK  // companion: link status (connecting/pairing/connected)
     };
 
     struct Conv {         // a recent conversation (a channel or a node DM)
@@ -63,6 +66,9 @@ class AdvUI : public concurrency::OSThread
     void drawReboot();
     void drawEmoji();
     void drawNetPage();        // WiFi / MQTT sub-settings
+    void drawBleScan();        // companion: node scan list
+    void drawBlePin();         // companion: pairing-PIN entry
+    void drawBleLink();        // companion: link status
     void drawChats();          // home: recent conversations
     void buildConversations(); // fill conv[]/convCount, newest first
     void openConv(int i);      // open conversation conv[i]
@@ -136,6 +142,15 @@ class AdvUI : public concurrency::OSThread
     int pickTarget = 0;       // MODE_PICKLIST: 0 = region, 1 = preset
     int pickSel = 0;          // list-picker cursor
     int pickScroll = 0;       // first visible list-picker row
+
+    int bleSel = 0;               // cursor in the BLE scan list
+    uint32_t bleSavedMs = 0;      // when a peer was just saved (transient "saved" note)
+    char pinBuf[8] = {0};         // pairing-PIN entry (MODE_BLEPIN)
+    uint8_t pinLen = 0;
+    bool bleAttemptArmed = false; // crash-guard flag file is on disk for this attempt
+    uint32_t bleRetryMs = 0;      // last auto-reconnect attempt (backoff timer)
+    bool linkJumped = false;      // already auto-jumped to Chats for this link session
+    bool companionEntered = false; // jumped to the scan screen after the splash yet
 
     bool inited = false;
     bool haveCanvas = false;

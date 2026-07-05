@@ -1,4 +1,5 @@
 #include "AdvUI.h"
+#include "AdvBle.h"
 #include "CyrillicFont.h"
 #include "FSCommon.h"
 #include "PowerStatus.h"
@@ -17,6 +18,7 @@
 #endif
 #include <algorithm>
 #include <cctype>
+#include <esp_random.h>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -109,7 +111,7 @@ const char *errName(uint8_t e)
     }
 }
 constexpr int kMaxMsgs = 32;
-constexpr int kNumSettings = 9; // Name, Short, Region, Preset, Frequency, Channel, UTC, WiFi, MQTT
+constexpr int kNumSettings = 10; // Name, Short, Region, Preset, Frequency, Channel, UTC, WiFi, MQTT, Radio
 Msg g_msgs[kMaxMsgs];
 int g_msgCount = 0;         // populated slots (grows to kMaxMsgs)
 int g_msgNext = 0;          // next write slot (ring head)
@@ -235,6 +237,170 @@ int32_t g_utcOffsetMin = 0;
 // chosen layout survives a reboot.
 bool g_ruMode = false;
 
+// --- Radio mode (onboard / BLE companion), its own tiny file -------------------
+constexpr uint32_t kRadioMagic = 0x41565231; // "AVR1"
+const char *kRadioPath = "/advui_radio.bin";
+bool g_radioCompanion = false;
+char g_peerAddr[18] = {0}; // paired companion node (empty = not chosen yet)
+char g_peerName[24] = {0};
+uint8_t g_peerType = 0;    // its BLE address type (public/random) — needed to connect
+
+void saveRadioCfg()
+{
+    auto f = FSCom.open(kRadioPath, FILE_O_WRITE);
+    if (!f)
+        return;
+    uint32_t magic = kRadioMagic;
+    uint8_t mode = g_radioCompanion ? 1 : 0;
+    f.write((const uint8_t *)&magic, sizeof(magic));
+    f.write(&mode, 1);
+    f.write((const uint8_t *)g_peerAddr, sizeof(g_peerAddr));
+    f.write((const uint8_t *)g_peerName, sizeof(g_peerName));
+    f.write(&g_peerType, 1); // optional tail
+    f.close();
+}
+
+// Crash guard for the companion link: the flag file exists while a connect attempt
+// is in flight. If we boot and it's still there, the last attempt took the device
+// down — skip the boot auto-connect so a crash can't loop, and go to the scan.
+const char *kBleAttemptPath = "/advui_bleatt";
+
+void bleAttemptMark()
+{
+    auto f = FSCom.open(kBleAttemptPath, FILE_O_WRITE);
+    if (f) {
+        uint8_t one = 1;
+        f.write(&one, 1);
+        f.close();
+    }
+}
+
+void bleAttemptClear()
+{
+    FSCom.remove(kBleAttemptPath);
+}
+
+bool bleAttemptPending()
+{
+    auto f = FSCom.open(kBleAttemptPath, FILE_O_READ);
+    if (f) {
+        f.close();
+        return true;
+    }
+    return false;
+}
+
+// --- Mesh-state abstraction: local engine vs companion link ---------------------
+// In companion mode the radio lives in another node; the UI reads mesh state from
+// the BLE config stream (g_compNodes/g_compChans) instead of the local nodeDB.
+
+uint32_t myNodeNum()
+{
+    if (g_radioCompanion)
+        return g_linkMyNode;
+    return nodeDB ? nodeDB->getNodeNum() : 0;
+}
+
+// Synthesizes a NodeInfoLite view of a companion node so the existing row/name
+// rendering keeps working unchanged. Sequential use only (one shared temp).
+meshtastic_NodeInfoLite *compSynth(const CompNode &c)
+{
+    static meshtastic_NodeInfoLite tmp;
+    memset(&tmp, 0, sizeof(tmp));
+    tmp.num = c.num;
+    tmp.snr = c.snr;
+    tmp.last_heard = c.lastHeard;
+    tmp.has_hops_away = c.hops != 255;
+    tmp.hops_away = c.hops == 255 ? 0 : c.hops;
+    snprintf(tmp.short_name, sizeof(tmp.short_name), "%s", c.shortName);
+    snprintf(tmp.long_name, sizeof(tmp.long_name), "%s", c.longName);
+    tmp.bitfield = 1 << 5; // NODEINFO_BITFIELD_HAS_USER: names are valid
+    return &tmp;
+}
+
+meshtastic_NodeInfoLite *nodeByNum(uint32_t num)
+{
+    if (g_radioCompanion) {
+        for (int i = 0; i < g_compNodeCount; i++)
+            if (g_compNodes[i].num == num)
+                return compSynth(g_compNodes[i]);
+        return nullptr;
+    }
+    return nodeDB ? nodeDB->getMeshNode(num) : nullptr;
+}
+
+meshtastic_NodeInfoLite *nodeAt(uint16_t idx) // idx from filtered[]
+{
+    if (g_radioCompanion)
+        return idx < (uint16_t)g_compNodeCount ? compSynth(g_compNodes[idx]) : nullptr;
+    return nodeDB ? nodeDB->getMeshNodeByIndex(idx) : nullptr;
+}
+
+const char *presetName(meshtastic_Config_LoRaConfig_ModemPreset p); // defined below
+
+const char *chanName(int i)
+{
+    if (g_radioCompanion) {
+        if (g_compChans[i].name[0])
+            return g_compChans[i].name;
+        // blank primary channel displays the modem preset, like stock does
+        if (g_compChans[i].role == 1)
+            return presetName((meshtastic_Config_LoRaConfig_ModemPreset)g_compPreset);
+        return "?";
+    }
+    return channels.getName(i);
+}
+
+bool chanEnabled(int i)
+{
+    if (g_radioCompanion)
+        return g_compChans[i].role != 0;
+    return channels.getByIndex(i).role != meshtastic_Channel_Role_DISABLED;
+}
+
+// Tiny Bluetooth rune for the companion-link indicator (green/yellow/red by state).
+void drawBtGlyph(lgfx::LGFXBase *g, int x, int y, uint16_t color)
+{
+    g->drawFastVLine(x + 3, y, 9, color);
+    g->drawLine(x + 3, y, x + 6, y + 2, color);
+    g->drawLine(x + 6, y + 2, x, y + 6, color);
+    g->drawLine(x + 3, y + 8, x + 6, y + 6, color);
+    g->drawLine(x + 6, y + 6, x, y + 2, color);
+}
+
+uint16_t linkColor()
+{
+    switch (g_linkState) {
+    case BLE_CONNECTED: return 0x07E0;               // green
+    case BLE_CONNECTING:
+    case BLE_PAIRING:   return 0xFFE0;               // yellow: in progress
+    default:            return 0xF800;               // red: no link
+    }
+}
+
+void loadRadioCfg()
+{
+    auto f = FSCom.open(kRadioPath, FILE_O_READ);
+    if (!f)
+        return;
+    uint32_t magic = 0;
+    uint8_t mode = 0;
+    f.read((uint8_t *)&magic, sizeof(magic));
+    f.read(&mode, 1);
+    f.read((uint8_t *)g_peerAddr, sizeof(g_peerAddr));
+    size_t n = f.read((uint8_t *)g_peerName, sizeof(g_peerName));
+    f.read(&g_peerType, 1); // optional tail (0 for older files)
+    f.close();
+    if (magic != kRadioMagic || n != sizeof(g_peerName)) {
+        g_peerAddr[0] = 0;
+        g_peerName[0] = 0;
+        return;
+    }
+    g_radioCompanion = mode == 1;
+    g_peerAddr[sizeof(g_peerAddr) - 1] = 0;
+    g_peerName[sizeof(g_peerName) - 1] = 0;
+}
+
 #ifdef HAS_I2S
 // Our own single-note alert, played over the I2S codec (the stock beep is disabled).
 // One short note; pumped to completion from runOnce, then stopped.
@@ -344,7 +510,7 @@ void loadMsgs()
         memcpy(g_msgReply, tmpRe, sizeof(g_msgReply));
     g_msgCount = cnt;
     g_msgNext = nxt;
-    uint32_t me = nodeDB ? nodeDB->getNodeNum() : 0;
+    uint32_t me = myNodeNum();
     for (int i = 0; i < g_msgCount; i++) {
         // an outgoing DM still "sending" before the reboot can't get its ACK now
         if (g_msgs[i].status == MSG_SENDING)
@@ -482,9 +648,12 @@ const EnumOpt kUtcOpts[] = {
     {"UTC+7 Krasnoyarsk", 420}, {"UTC+8 Irkutsk", 480},       {"UTC+9 Yakutsk", 540},
     {"UTC+9:30 Adelaide", 570}, {"UTC+10 Vladivostok", 600},  {"UTC+11 Magadan", 660},
     {"UTC+12 Kamchatka", 720},  {"UTC+13 Samoa", 780},        {"UTC+14 Kiritimati", 840}};
+// Radio backend: local Cap LoRa, or another node's radio over BLE (companion).
+const EnumOpt kRadioOpts[] = {{"Onboard (Cap LoRa)", 0}, {"Companion via BLE", 1}};
 constexpr int kRegionCount = sizeof(kRegionOpts) / sizeof(kRegionOpts[0]);
 constexpr int kPresetCount = sizeof(kPresetOpts) / sizeof(kPresetOpts[0]);
 constexpr int kUtcCount = sizeof(kUtcOpts) / sizeof(kUtcOpts[0]);
+constexpr int kRadioCount = sizeof(kRadioOpts) / sizeof(kRadioOpts[0]);
 
 int optIndex(const EnumOpt *opts, int cnt, int value)
 {
@@ -1019,7 +1188,7 @@ void sanitizeDisplay(char *s)
 // falls back to the node-number tail when unknown or nothing drawable remains.
 void shortNameOf(uint32_t num, char *out, size_t cap)
 {
-    meshtastic_NodeInfoLite *n = nodeDB ? nodeDB->getMeshNode(num) : nullptr;
+    meshtastic_NodeInfoLite *n = nodeByNum(num);
     if (n && n->short_name[0]) {
         snprintf(out, cap, "%s", n->short_name);
         sanitizeDisplay(out);
@@ -1066,11 +1235,20 @@ void AdvUI::initHardware()
     rgbLedWrite(NEOPIXEL_DATA, 0, 0, 0);
 #endif
 
-    api.begin();
+    loadRadioCfg();
+    if (!g_radioCompanion)
+        api.begin(); // companion doesn't subscribe to the local engine's phone stream
     kb.begin();
     LOG_INFO("advui: keyboard ready");
 
     loadMsgs(); // restore the saved conversation from flash
+    if (g_radioCompanion) {
+        // The companion is a terminal to another node: free the RAM the stock BT
+        // peripheral would take (no phone connects to us) — SMP pairing on the
+        // central link needs that heap.
+        config.bluetooth.enabled = false;
+        bleCompanionInit(); // BLE central for the companion link (scan/pair/connect)
+    }
     bootMs = millis();
     drawSplash(); // branded splash instead of black while the mesh comes up
 }
@@ -1139,7 +1317,7 @@ void AdvUI::handleFromRadio(const meshtastic_FromRadio &fr)
     memcpy(text, p.decoded.payload.bytes, n);
     text[n] = 0;
 
-    uint32_t me = nodeDB ? nodeDB->getNodeNum() : 0;
+    uint32_t me = myNodeNum();
 
     // A tapback: attach to the target message instead of adding a bubble. Quiet by
     // design (no unread/beep) — just a LED blink so it isn't missed entirely.
@@ -1158,7 +1336,7 @@ void AdvUI::handleFromRadio(const meshtastic_FromRadio &fr)
     addMsg(p.from, p.to, p.channel, p.rx_time, unread, text, p.id, MSG_IN, p.decoded.reply_id);
 
     if (unread) {
-        bool fav = (p.to == NODENUM_BROADCAST) ? chanFav(p.channel) : (nodeDB && nodeDB->isFavorite(p.from));
+        bool fav = (p.to == NODENUM_BROADCAST) ? chanFav(p.channel) : (!g_radioCompanion && nodeDB && nodeDB->isFavorite(p.from));
 #ifdef HAS_NEOPIXEL
         // LED flash on any incoming: green from a favourite, blue otherwise.
         if (fav)
@@ -1178,6 +1356,46 @@ void AdvUI::handleFromRadio(const meshtastic_FromRadio &fr)
 // its packet id. replyId + asEmoji turn it into a reaction (tapback) on that message.
 static uint32_t sendTextPacket(uint32_t to, const char *text, int chIdx = 0, uint32_t replyId = 0, bool asEmoji = false)
 {
+    if (g_radioCompanion) { // ship it over BLE: the node's radio does routing/PKI itself
+        if (g_linkState != BLE_CONNECTED)
+            return 0;
+        meshtastic_ToRadio t = meshtastic_ToRadio_init_default;
+        t.which_payload_variant = meshtastic_ToRadio_packet_tag;
+        meshtastic_MeshPacket &p = t.packet;
+        p.id = (uint32_t)esp_random();
+        if (!p.id)
+            p.id = 1;
+        p.to = to;
+        p.want_ack = to != NODENUM_BROADCAST;
+        if (to == NODENUM_BROADCAST)
+            p.channel = chIdx;
+        p.which_payload_variant = meshtastic_MeshPacket_decoded_tag;
+        p.decoded.portnum = meshtastic_PortNum_TEXT_MESSAGE_APP;
+        size_t n = strlen(text);
+        if (n > sizeof(p.decoded.payload.bytes))
+            n = sizeof(p.decoded.payload.bytes);
+        memcpy(p.decoded.payload.bytes, text, n);
+        p.decoded.payload.size = n;
+        if (replyId) {
+            p.decoded.reply_id = replyId;
+            if (asEmoji)
+                p.decoded.emoji = 1;
+        }
+        if (to != NODENUM_BROADCAST) { // a DM to a key-capable node must be marked PKI
+            for (int i = 0; i < g_compNodeCount; i++)
+                if (g_compNodes[i].num == to && g_compNodes[i].hasKey) {
+                    p.pki_encrypted = true;
+                    p.channel = 0;
+                    break;
+                }
+        }
+        uint8_t buf[320];
+        size_t len = pb_encode_to_bytes(buf, sizeof(buf), &meshtastic_ToRadio_msg, &t);
+        if (!len || !bleQueueToRadio(buf, (uint16_t)len))
+            return 0;
+        return p.id;
+    }
+
     if (!router || !service)
         return 0;
     meshtastic_MeshPacket *p = router->allocForSending();
@@ -1221,7 +1439,7 @@ void AdvUI::sendMessage(uint32_t to, const char *text, uint32_t replyId)
     uint32_t id = sendTextPacket(to, text, 0, replyId);
     if (!id)
         return;
-    uint32_t me = nodeDB ? nodeDB->getNodeNum() : 0;
+    uint32_t me = myNodeNum();
     addMsg(me, to, 0, getTime(false), false, text, id, MSG_SENDING, replyId);
 }
 
@@ -1231,7 +1449,7 @@ void AdvUI::sendChannel(int chIdx, const char *text, uint32_t replyId)
     uint32_t id = sendTextPacket(NODENUM_BROADCAST, text, chIdx, replyId);
     if (!id)
         return;
-    uint32_t me = nodeDB ? nodeDB->getNodeNum() : 0;
+    uint32_t me = myNodeNum();
     addMsg(me, NODENUM_BROADCAST, chIdx, getTime(false), false, text, id, MSG_SENT, replyId); // no ack for broadcast
 }
 
@@ -1249,7 +1467,7 @@ void AdvUI::sendReaction(int msgIdx, const char *label)
                                          : sendTextPacket(selectedNum, label, 0, m.id, true);
     if (!id)
         return;
-    uint32_t me = nodeDB ? nodeDB->getNodeNum() : 0;
+    uint32_t me = myNodeNum();
     addReaction(m.id, me, label);
 }
 
@@ -1258,9 +1476,31 @@ void AdvUI::sendReaction(int msgIdx, const char *label)
 int AdvUI::buildNodeList(uint16_t *out, int max, const char *query)
 {
     int count = 0;
+    uint32_t me = myNodeNum();
+
+    if (g_radioCompanion) { // companion: nodes come from the BLE config stream
+        for (int i = 0; i < g_compNodeCount && count < max; i++) {
+            const CompNode &c = g_compNodes[i];
+            if (c.num == me)
+                continue;
+            if (query && query[0]) {
+                const char *name = c.longName[0] ? c.longName : c.shortName;
+                if (!ciContains(name[0] ? name : "", query))
+                    continue;
+            }
+            out[count++] = (uint16_t)i;
+        }
+        std::sort(out, out + count, [](uint16_t a, uint16_t b) { // unread first, then freshest
+            bool ua = hasUnreadFrom(g_compNodes[a].num), ub = hasUnreadFrom(g_compNodes[b].num);
+            if (ua != ub)
+                return ua;
+            return g_compNodes[a].lastHeard > g_compNodes[b].lastHeard;
+        });
+        return count;
+    }
+
     if (!nodeDB)
         return 0;
-    uint32_t me = nodeDB->getNodeNum();
     size_t total = nodeDB->getNumMeshNodes();
     for (size_t i = 0; i < total && count < max; i++) {
         meshtastic_NodeInfoLite *node = nodeDB->getMeshNodeByIndex(i);
@@ -1284,11 +1524,10 @@ int AdvUI::buildChannels(const char *query)
 {
     int count = 0;
     for (int i = 0; i < 8 && count < 8; i++) {
-        meshtastic_Channel &ch = channels.getByIndex(i);
-        if (ch.role == meshtastic_Channel_Role_DISABLED)
+        if (!chanEnabled(i))
             continue;
         if (query && query[0]) {
-            const char *name = channels.getName(i);
+            const char *name = chanName(i);
             if (!ciContains(name && name[0] ? name : "", query))
                 continue;
         }
@@ -1311,7 +1550,7 @@ void AdvUI::drawChannelRow(int chIdx, int y)
         nameX = 18;
     }
     char nm[24];
-    snprintf(nm, sizeof(nm), "#%s", channels.getName(chIdx));
+    snprintf(nm, sizeof(nm), "#%s", chanName(chIdx));
     g->setFont(&lgfx::fonts::FreeSansBold9pt7b);
     g->setTextSize(1);
     fitWidth(g, nm, 232 - nameX);
@@ -1369,7 +1608,7 @@ void AdvUI::openEntry(int s)
         markReadChannel(selectedChannel);
         mode = MODE_NODE;
     } else if (nodeDB) {
-        meshtastic_NodeInfoLite *node = nodeDB->getMeshNodeByIndex(filtered[s - chanCount]);
+        meshtastic_NodeInfoLite *node = nodeAt(filtered[s - chanCount]);
         if (node) {
             selectedChannel = -1;
             selectedNum = node->num;
@@ -1388,8 +1627,8 @@ void AdvUI::favEntry(int s, bool on)
         else
             g_favChannels &= ~(1u << ci);
         g_msgsDirty = true; // persisted alongside the messages
-    } else if (nodeDB) {
-        meshtastic_NodeInfoLite *node = nodeDB->getMeshNodeByIndex(filtered[s - chanCount]);
+    } else if (nodeDB && !g_radioCompanion) { // node favourites live in the local DB only
+        meshtastic_NodeInfoLite *node = nodeAt(filtered[s - chanCount]);
         if (node)
             nodeDB->set_favorite(on, node->num);
     }
@@ -1400,7 +1639,7 @@ void AdvUI::favEntry(int s, bool on)
 void AdvUI::buildConversations()
 {
     convCount = 0;
-    uint32_t me = nodeDB ? nodeDB->getNodeNum() : 0;
+    uint32_t me = myNodeNum();
     for (int i = 0; i < g_msgCount; i++) {
         int idx = (g_msgCount == kMaxMsgs) ? (g_msgNext + i) % kMaxMsgs : i;
         Msg &m = g_msgs[idx];
@@ -1467,6 +1706,8 @@ void AdvUI::drawChats()
     g->setTextColor(0x07FF);
     g->setCursor(4, 3);
     g->print("Chats");
+    if (g_radioCompanion)
+        drawBtGlyph(g, 40, 2, linkColor()); // companion link state at a glance
     int bw = g->textWidth(bbuf);
     g->setTextColor(bcol);
     g->setCursor(238 - bw, 3);
@@ -1485,7 +1726,7 @@ void AdvUI::drawChats()
     g->drawFastHLine(0, 13, 240, 0x39C7);
 
     buildConversations();
-    uint32_t me = nodeDB ? nodeDB->getNodeNum() : 0;
+    uint32_t me = myNodeNum();
     int32_t tzOff = g_utcOffsetMin * 60;
 
     if (convCount == 0) {
@@ -1522,7 +1763,7 @@ void AdvUI::drawChats()
         if (i == sel)
             g->fillRect(0, y - 1, 240, rowH, 0x2945);
         bool unread = c.isChan ? hasUnreadChannel(c.ch) : hasUnreadFrom(c.node);
-        bool fav = c.isChan ? chanFav(c.ch) : (nodeDB && nodeDB->isFavorite(c.node));
+        bool fav = c.isChan ? chanFav(c.ch) : (!g_radioCompanion && nodeDB && nodeDB->isFavorite(c.node));
 
         int nameX = 6;
         if (unread) { // red envelope before the name
@@ -1549,9 +1790,9 @@ void AdvUI::drawChats()
         // name
         char nm[40];
         if (c.isChan) {
-            snprintf(nm, sizeof(nm), "#%s", channels.getName(c.ch));
+            snprintf(nm, sizeof(nm), "#%s", chanName(c.ch));
         } else {
-            meshtastic_NodeInfoLite *n = nodeDB ? nodeDB->getMeshNode(c.node) : nullptr;
+            meshtastic_NodeInfoLite *n = nodeByNum(c.node);
             const char *nn = n ? nodeName(n) : "";
             if (nn[0])
                 snprintf(nm, sizeof(nm), "%s", nn);
@@ -1602,7 +1843,7 @@ void AdvUI::drawNodeList()
     g->fillScreen(0x0000);
 
     size_t total = nodeDB ? nodeDB->getNumMeshNodes() : 0;
-    uint32_t me = nodeDB ? nodeDB->getNodeNum() : 0;
+    uint32_t me = myNodeNum();
 
     g->setFont(&lgfx::fonts::Font0); // header stays on the compact bitmap font
     g->setTextSize(1);
@@ -1656,7 +1897,7 @@ void AdvUI::drawNodeList()
         if (idx < chanCount) {
             drawChannelRow(chanList[idx], y);
         } else {
-            meshtastic_NodeInfoLite *node = nodeDB->getMeshNodeByIndex(filtered[idx - chanCount]);
+            meshtastic_NodeInfoLite *node = nodeAt(filtered[idx - chanCount]);
             if (node)
                 drawNodeRow(g, node, y, node->num == me);
         }
@@ -1696,7 +1937,7 @@ void AdvUI::drawPicker()
     g->printf("> %s_", query);
     g->drawFastHLine(0, 13, 240, 0x39C7);
 
-    uint32_t me = nodeDB ? nodeDB->getNodeNum() : 0;
+    uint32_t me = myNodeNum();
     const int rowH = 18, top = 16, maxRows = (124 - top) / rowH;
     int total = chanCount + filteredCount;
 
@@ -1718,7 +1959,7 @@ void AdvUI::drawPicker()
         if (idx < chanCount) {
             drawChannelRow(chanList[idx], y);
         } else {
-            meshtastic_NodeInfoLite *node = nodeDB->getMeshNodeByIndex(filtered[idx - chanCount]);
+            meshtastic_NodeInfoLite *node = nodeAt(filtered[idx - chanCount]);
             if (node)
                 drawNodeRow(g, node, y, node->num == me);
         }
@@ -1738,8 +1979,8 @@ void AdvUI::drawNode()
     g->fillScreen(0x0000);
 
     bool isChan = selectedChannel >= 0;
-    meshtastic_NodeInfoLite *node = (!isChan && nodeDB) ? nodeDB->getMeshNode(selectedNum) : nullptr;
-    uint32_t me = nodeDB ? nodeDB->getNodeNum() : 0;
+    meshtastic_NodeInfoLite *node = !isChan ? nodeByNum(selectedNum) : nullptr;
+    uint32_t me = myNodeNum();
 
     if (isChan)
         markReadChannel(selectedChannel); // opening the thread clears its unread
@@ -2134,7 +2375,7 @@ void AdvUI::drawSettings()
     g->drawFastHLine(0, 13, 240, 0x39C7);
 
     const char *labels[kNumSettings] = {"Name",    "Short", "Region", "Preset", "Frequency",
-                                         "Channel", "UTC",   "WiFi",   "MQTT"};
+                                         "Channel", "UTC",   "WiFi",   "MQTT",   "Radio"};
     char vals[kNumSettings][24];
     snprintf(vals[0], sizeof(vals[0]), "%s", owner.long_name[0] ? owner.long_name : "(unset)");
     snprintf(vals[1], sizeof(vals[1]), "%s", owner.short_name[0] ? owner.short_name : "(unset)");
@@ -2157,6 +2398,10 @@ void AdvUI::drawSettings()
     else
         strcpy(vals[7], "off");
     strcpy(vals[8], moduleConfig.mqtt.enabled ? "on" : "off");
+    if (g_radioCompanion)
+        snprintf(vals[9], sizeof(vals[9]), "BLE: %s", g_peerName[0] ? g_peerName : "(no node)");
+    else
+        strcpy(vals[9], "onboard");
 
     const int rowH = 15, top = 15, maxRows = (124 - top) / rowH;
     if (setSel < setScroll)
@@ -2262,20 +2507,184 @@ void AdvUI::drawNetPage()
         canvas.pushSprite(0, 0);
 }
 
+// Companion: scan for Meshtastic nodes over BLE and pick the radio to pair with.
+void AdvUI::drawBleScan()
+{
+    lgfx::LGFXBase *g = haveCanvas ? static_cast<lgfx::LGFXBase *>(&canvas) : static_cast<lgfx::LGFXBase *>(&display);
+
+    g->fillScreen(0x0000);
+    g->setFont(&lgfx::fonts::Font0);
+    g->setTextSize(1);
+    g->setTextColor(0x07FF);
+    g->setCursor(4, 3);
+    g->print("Find node");
+    g->setTextColor(g_scanning ? 0xFFE0 : 0x8410);
+    char st[20];
+    if (g_scanning)
+        strcpy(st, "scanning...");
+    else
+        snprintf(st, sizeof(st), "%d found", g_scanCount);
+    g->setCursor(238 - g->textWidth(st), 3);
+    g->print(st);
+    g->drawFastHLine(0, 13, 240, 0x39C7);
+
+    if (bleSel >= g_scanCount)
+        bleSel = g_scanCount ? g_scanCount - 1 : 0;
+    const int rowH = 18, top = 15;
+    if (g_scanCount == 0) {
+        g->setFont(&lgfx::fonts::FreeSansBold9pt7b);
+        g->setTextColor(0x630C);
+        g->setCursor(6, 50);
+        g->print(g_bleUnsupported ? "Companion image needed" : g_scanning ? "Listening..." : "No nodes found");
+        g->setFont(&lgfx::fonts::Font0);
+        g->setTextColor(0x8410);
+        g->setCursor(6, 70);
+        g->print(g_bleUnsupported ? "flash the companion firmware from the installer"
+                                  : "node powered + BT on, phone app closed");
+    }
+    for (int i = 0; i < g_scanCount && i < 5; i++) {
+        int y = top + i * rowH;
+        if (i == bleSel)
+            g->fillRect(0, y - 1, 240, rowH, 0x2945);
+        g->setFont(&lgfx::fonts::FreeSansBold9pt7b);
+        g->setTextSize(1);
+        char nm[24];
+        snprintf(nm, sizeof(nm), "%s", g_scanHits[i].name[0] ? g_scanHits[i].name : g_scanHits[i].addr);
+        fitWidth(g, nm, 180);
+        bool saved = g_peerAddr[0] && !strcmp(g_peerAddr, g_scanHits[i].addr);
+        g->setTextColor(saved ? 0xFFE0 : 0xFFFF); // the saved peer shows yellow
+        g->setCursor(6, y + 1);
+        g->print(nm);
+        char rb[10];
+        snprintf(rb, sizeof(rb), "%ddB", g_scanHits[i].rssi);
+        g->setFont(&lgfx::fonts::Font0);
+        g->setTextColor(g_scanHits[i].rssi > -70 ? 0x07E0 : 0x8410);
+        g->setCursor(236 - g->textWidth(rb), y + 5);
+        g->print(rb);
+    }
+
+    if (bleSavedMs && millis() - bleSavedMs < 4000) {
+        g->setFont(&lgfx::fonts::Font0);
+        g->setTextColor(0x07E0);
+        g->setCursor(4, 108);
+        g->printf("saved: %s  (link lands in A3)", g_peerName);
+    }
+    drawFooter(g, "up/dn  ENTER connect  R rescan  ESC");
+
+    if (haveCanvas)
+        canvas.pushSprite(0, 0);
+}
+
+// Companion: the node is showing a pairing PIN on its screen — type it here.
+void AdvUI::drawBlePin()
+{
+    lgfx::LGFXBase *g = haveCanvas ? static_cast<lgfx::LGFXBase *>(&canvas) : static_cast<lgfx::LGFXBase *>(&display);
+
+    g->fillScreen(0x0000);
+    g->setFont(&lgfx::fonts::Font0);
+    g->setTextSize(1);
+    g->setTextColor(0x07FF);
+    g->setCursor(4, 3);
+    g->printf("Pairing with %s", g_peerName);
+    g->drawFastHLine(0, 13, 240, 0x39C7);
+
+    g->setTextColor(0x8410);
+    g->setCursor(24, 34);
+    g->print("enter the PIN shown on the node");
+
+    g->setFont(&lgfx::fonts::FreeSansBold9pt7b);
+    g->setTextSize(2);
+    g->setTextColor(0xFFFF);
+    char shown[16];
+    snprintf(shown, sizeof(shown), "%s_", pinBuf);
+    g->setCursor((240 - g->textWidth(shown)) / 2, 58);
+    g->print(shown);
+    g->setTextSize(1);
+
+    drawFooter(g, "digits  ENTER ok  ESC cancel");
+
+    if (haveCanvas)
+        canvas.pushSprite(0, 0);
+}
+
+// Companion: link progress/status against the saved node.
+void AdvUI::drawBleLink()
+{
+    lgfx::LGFXBase *g = haveCanvas ? static_cast<lgfx::LGFXBase *>(&canvas) : static_cast<lgfx::LGFXBase *>(&display);
+
+    g->fillScreen(0x0000);
+    g->setFont(&lgfx::fonts::Font0);
+    g->setTextSize(1);
+    g->setTextColor(0x07FF);
+    g->setCursor(4, 3);
+    g->print("Companion link");
+    g->drawFastHLine(0, 13, 240, 0x39C7);
+
+    g->setFont(&lgfx::fonts::FreeSansBold9pt7b);
+    g->setTextSize(1);
+    g->setTextColor(0xFFFF);
+    g->setCursor(6, 24);
+    char nm[26];
+    snprintf(nm, sizeof(nm), "%s", g_peerName[0] ? g_peerName : g_peerAddr);
+    fitWidth(g, nm, 228);
+    g->print(nm);
+
+    const char *st;
+    uint16_t sc;
+    switch (g_linkState) {
+    case BLE_CONNECTING: st = "connecting..."; sc = 0xFFE0; break;
+    case BLE_PAIRING:    st = "pairing: PIN on the node"; sc = 0xFFE0; break;
+    case BLE_CONNECTED:  st = "connected"; sc = 0x07E0; break;
+    case BLE_FAILED:     st = g_linkErr[0] ? g_linkErr : "failed"; sc = 0xF800; break;
+    default:             st = "idle"; sc = 0x8410; break;
+    }
+    g->setCursor(6, 48);
+    g->setTextColor(sc);
+    g->print(st);
+
+    g->setFont(&lgfx::fonts::Font0);
+    g->setTextColor(0x9CD3);
+    g->setCursor(6, 72);
+    g->printf("packets rx: %u", (unsigned)g_linkRxPkts);
+    if (g_linkMyNode) {
+        g->setCursor(6, 84);
+        g->printf("node id: !%08x", (unsigned)g_linkMyNode);
+    }
+    if (g_linkRssi) {
+        g->setCursor(130, 72);
+        g->printf("link: %ddB", (int)g_linkRssi);
+    }
+    if (g_linkNodeBatt >= 0) {
+        g->setCursor(130, 84);
+        g->printf("node batt: %d%%", (int)g_linkNodeBatt);
+    }
+    if (g_linkState == BLE_CONNECTED && g_linkConfigDone) {
+        g->setTextColor(0x07E0);
+        g->setCursor(6, 102);
+        g->printf("link OK - %d nodes synced", (int)g_compNodeCount);
+    }
+
+    drawFooter(g, g_linkState == BLE_FAILED ? "auto-retry  R now  F forget  ESC"
+                                            : "R reconnect  F forget  ESC scan");
+
+    if (haveCanvas)
+        canvas.pushSprite(0, 0);
+}
+
 void AdvUI::drawPickList()
 {
     lgfx::LGFXBase *g = haveCanvas ? static_cast<lgfx::LGFXBase *>(&canvas) : static_cast<lgfx::LGFXBase *>(&display);
 
     g->fillScreen(0x0000);
 
-    const EnumOpt *opts = pickTarget == 0 ? kRegionOpts : pickTarget == 1 ? kPresetOpts : kUtcOpts;
-    int cnt = pickTarget == 0 ? kRegionCount : pickTarget == 1 ? kPresetCount : kUtcCount;
+    const EnumOpt *opts = pickTarget == 0 ? kRegionOpts : pickTarget == 1 ? kPresetOpts : pickTarget == 2 ? kUtcOpts : kRadioOpts;
+    int cnt = pickTarget == 0 ? kRegionCount : pickTarget == 1 ? kPresetCount : pickTarget == 2 ? kUtcCount : kRadioCount;
 
     g->setFont(&lgfx::fonts::Font0);
     g->setTextSize(1);
     g->setTextColor(0x07FF); // cyan
     g->setCursor(4, 3);
-    g->print(pickTarget == 0 ? "Region" : pickTarget == 1 ? "Preset" : "UTC offset");
+    g->print(pickTarget == 0 ? "Region" : pickTarget == 1 ? "Preset" : pickTarget == 2 ? "UTC offset" : "Radio");
     g->drawFastHLine(0, 13, 240, 0x39C7);
 
     const int rowH = 18, top = 15, maxRows = (124 - top) / rowH;
@@ -2392,7 +2801,7 @@ void AdvUI::screenshot(const char *name)
 // and put back). No reboot, so the USB CDC stays up for the host to read.
 void AdvUI::runDemoDump()
 {
-    uint32_t me = nodeDB ? nodeDB->getNodeNum() : 0;
+    uint32_t me = myNodeNum();
 
     static Msg backup[kMaxMsgs];
     memcpy(backup, g_msgs, sizeof(g_msgs));
@@ -2628,6 +3037,11 @@ void AdvUI::handleKey(char ch)
             pickSel = optIndex(kUtcOpts, kUtcCount, g_utcOffsetMin);
             pickScroll = 0;
             mode = MODE_PICKLIST;
+        } else if (enter && setSel == 9) { // Radio backend -> onboard/companion picker
+            pickTarget = 3;
+            pickSel = g_radioCompanion ? 1 : 0;
+            pickScroll = 0;
+            mode = MODE_PICKLIST;
         } else if (enter && (setSel == 7 || setSel == 8)) { // WiFi / MQTT sub-page
             netPage = setSel == 7 ? 0 : 1;
             netSel = 0;
@@ -2672,8 +3086,80 @@ void AdvUI::handleKey(char ch)
         return;
     }
 
+    if (mode == MODE_BLESCAN) {
+        if (esc) {
+            bleScanStop();
+            setSel = 0;
+            mode = MODE_SETTINGS; // back out (e.g. to flip the radio back to onboard)
+        } else if (up) {
+            if (bleSel > 0)
+                bleSel--;
+        } else if (down) {
+            if (bleSel < g_scanCount - 1)
+                bleSel++;
+        } else if (enter) {
+            if (bleSel < g_scanCount) { // remember the node and connect to it
+                snprintf(g_peerAddr, sizeof(g_peerAddr), "%s", g_scanHits[bleSel].addr);
+                snprintf(g_peerName, sizeof(g_peerName), "%s",
+                         g_scanHits[bleSel].name[0] ? g_scanHits[bleSel].name : g_scanHits[bleSel].addr);
+                g_peerType = g_scanHits[bleSel].type;
+                saveRadioCfg();
+                bleAttemptMark();
+                bleAttemptArmed = true;
+                bleConnectAsync(g_peerAddr, g_peerType);
+                mode = MODE_BLELINK;
+            }
+        } else if (c == 'r' || c == 'R') {
+            bleScanStart();
+        }
+        return;
+    }
+
+    if (mode == MODE_BLEPIN) {
+        if (esc) {
+            bleCancelPin();
+            mode = MODE_BLELINK;
+        } else if (enter) {
+            if (pinLen) {
+                bleSubmitPin((uint32_t)strtoul(pinBuf, nullptr, 10));
+                mode = MODE_BLELINK;
+            }
+        } else if (bksp) {
+            if (pinLen)
+                pinBuf[--pinLen] = 0;
+        } else if (c >= '0' && c <= '9' && pinLen < 6) {
+            pinBuf[pinLen++] = c;
+            pinBuf[pinLen] = 0;
+        }
+        return;
+    }
+
+    if (mode == MODE_BLELINK) {
+        if (esc) { // just a status page now: leave it, the link stays up
+            sel = 0;
+            scrollTop = 0;
+            mode = MODE_CHATS;
+        } else if (c == 'r' || c == 'R') {
+            if (g_linkState != BLE_CONNECTING && g_linkState != BLE_PAIRING) {
+                bleAttemptMark();
+                bleAttemptArmed = true;
+                bleConnectAsync(g_peerAddr, g_peerType);
+            }
+        } else if (c == 'f' || c == 'F') { // forget the node -> back to the scan
+            bleDisconnect();
+            g_peerAddr[0] = 0;
+            g_peerName[0] = 0;
+            g_peerType = 0;
+            saveRadioCfg();
+            bleSel = 0;
+            mode = MODE_BLESCAN;
+            bleScanStart();
+        }
+        return;
+    }
+
     if (mode == MODE_PICKLIST) {
-        int cnt = pickTarget == 0 ? kRegionCount : pickTarget == 1 ? kPresetCount : kUtcCount;
+        int cnt = pickTarget == 0 ? kRegionCount : pickTarget == 1 ? kPresetCount : pickTarget == 2 ? kUtcCount : kRadioCount;
         if (esc) {
             mode = MODE_SETTINGS;
         } else if (up) {
@@ -2687,6 +3173,24 @@ void AdvUI::handleKey(char ch)
                 g_utcOffsetMin = kUtcOpts[pickSel].value;
                 g_msgsDirty = true;
                 mode = MODE_SETTINGS;
+            } else if (pickTarget == 3) { // radio backend: persist + reboot into the new role
+                bool comp = kRadioOpts[pickSel].value == 1;
+                if (comp != g_radioCompanion) {
+                    g_radioCompanion = comp;
+                    saveRadioCfg();
+                    rebootAtMsec = millis() + 1500;
+                    mode = MODE_REBOOT;
+                } else if (comp) { // already companion: open the link status (F there re-scans)
+                    if (g_peerAddr[0]) {
+                        mode = MODE_BLELINK;
+                    } else {
+                        bleSel = 0;
+                        mode = MODE_BLESCAN;
+                        bleScanStart();
+                    }
+                } else {
+                    mode = MODE_SETTINGS;
+                }
             } else {
                 const EnumOpt *opts = pickTarget == 0 ? kRegionOpts : kPresetOpts;
                 applyLoRa(pickTarget, opts[pickSel].value); // sets config, saves, schedules reboot
@@ -2768,7 +3272,7 @@ void AdvUI::handleKey(char ch)
             if (chatScroll > 0)
                 chatScroll--; // back toward the newest
         } else if (enter && selectedChannel < 0) { // resend the newest failed DM in place
-            uint32_t me = nodeDB ? nodeDB->getNodeNum() : 0;
+            uint32_t me = myNodeNum();
             for (int i = g_msgCount - 1; i >= 0; i--) {
                 int idx = (g_msgCount == kMaxMsgs) ? (g_msgNext + i) % kMaxMsgs : i;
                 Msg &m = g_msgs[idx];
@@ -2896,7 +3400,7 @@ void AdvUI::handleKey(char ch)
                     else
                         g_favChannels &= ~(1u << c.ch);
                     g_msgsDirty = true;
-                } else if (nodeDB) {
+                } else if (nodeDB && !g_radioCompanion) {
                     nodeDB->set_favorite(left, c.node);
                 }
             }
@@ -3020,8 +3524,19 @@ int32_t AdvUI::runOnce()
             runDemoDump(); // host sends 'S' -> dump every screen, then reboot
 #endif
 
-    while (api.available() && api.getFromRadio(fromRadioBuf) > 0) {
-        handleFromRadio(api.lastFromRadio()); // pick out incoming text messages
+    while (!g_radioCompanion && api.available() && api.getFromRadio(fromRadioBuf) > 0) {
+        handleFromRadio(api.lastFromRadio()); // pick out incoming text messages (local radio mode)
+    }
+
+    if (g_radioCompanion) { // companion: mesh packets arrive from the BLE pump's ring
+        uint8_t pbuf[512];
+        uint16_t plen;
+        static meshtastic_FromRadio fr; // large struct: keep off the stack
+        while (bleNextPacket(pbuf, &plen)) {
+            fr = meshtastic_FromRadio_init_default;
+            if (pb_decode_from_bytes(pbuf, plen, &meshtastic_FromRadio_msg, &fr))
+                handleFromRadio(fr); // same pipeline: messages, reactions, delivery ACKs
+        }
     }
 
 #ifdef HAS_I2S
@@ -3067,13 +3582,70 @@ int32_t AdvUI::runOnce()
     // transmit. Drop new users straight into the region picker instead of a dead node.
     if (splashDone && !regionPrompted) {
         regionPrompted = true;
-        if (config.lora.region == meshtastic_Config_LoRaConfig_RegionCode_UNSET) {
+        if (!g_radioCompanion && config.lora.region == meshtastic_Config_LoRaConfig_RegionCode_UNSET) {
             pickTarget = 0;
             pickSel = 0;
             pickScroll = 0;
             mode = MODE_PICKLIST;
         }
     }
+
+    // Companion mode: after the splash, reconnect to the saved node, or scan for one.
+    // If the previous connect attempt never finished (crash), don't retry on boot —
+    // otherwise a crashing link would reboot-loop the device.
+    if (splashDone && g_radioCompanion && !companionEntered) {
+        companionEntered = true;
+        bleSel = 0;
+        if (g_peerAddr[0] && !bleAttemptPending()) {
+            bleAttemptMark();
+            bleAttemptArmed = true;
+            bleConnectAsync(g_peerAddr, g_peerType);
+            mode = MODE_BLELINK;
+        } else {
+            bleAttemptClear();
+            mode = MODE_BLESCAN;
+            bleScanStart();
+        }
+    }
+
+    // A finished connect attempt (either way, gracefully) clears the crash guard.
+    if (g_linkState == BLE_CONNECTED || g_linkState == BLE_FAILED) {
+        if (bleAttemptArmed) {
+            bleAttemptClear();
+            bleAttemptArmed = false;
+        }
+    }
+
+    // Once the config download lands, drop the user into the chats — the terminal
+    // is ready. The link screen stays reachable for drops (auto-retry shows there).
+    if (g_radioCompanion) {
+        if (g_linkState != BLE_CONNECTED)
+            linkJumped = false;
+        else if (!linkJumped && g_linkConfigDone && (mode == MODE_BLELINK || mode == MODE_BLEPIN)) {
+            linkJumped = true;
+            sel = 0;
+            scrollTop = 0;
+            mode = MODE_CHATS;
+        }
+    }
+
+    // Auto-reconnect: a dropped (or otherwise idle) companion link retries every ~7s
+    // wherever the user is (except the scan — leaving there means re-picking a node).
+    if (g_radioCompanion && (g_linkState == BLE_FAILED || g_linkState == BLE_IDLE) && g_peerAddr[0] &&
+        companionEntered && mode != MODE_BLESCAN && mode != MODE_BLEPIN && millis() - bleRetryMs > 7000) {
+        bleRetryMs = millis();
+        bleAttemptMark();
+        bleAttemptArmed = true;
+        bleConnectAsync(g_peerAddr, g_peerType);
+    }
+
+    // Pairing wants a passkey: drop whatever we're doing and show the PIN screen.
+    if (g_pinRequested && mode != MODE_BLEPIN) {
+        pinLen = 0;
+        pinBuf[0] = 0;
+        mode = MODE_BLEPIN;
+    }
+    blePump(); // drain the companion link's FromRadio stream (no-op when not connected)
 
     // Persist the conversation, debounced, so we don't hammer the flash.
     if (g_msgsDirty && millis() - g_lastSaveMs > 3000) {
@@ -3094,6 +3666,12 @@ int32_t AdvUI::runOnce()
         drawSettings();
     else if (mode == MODE_NETPAGE)
         drawNetPage();
+    else if (mode == MODE_BLESCAN)
+        drawBleScan();
+    else if (mode == MODE_BLEPIN)
+        drawBlePin();
+    else if (mode == MODE_BLELINK)
+        drawBleLink();
     else if (mode == MODE_PICKLIST)
         drawPickList();
     else if (mode == MODE_REBOOT)

@@ -30,6 +30,8 @@ volatile int g_compNodeCount = 0;
 CompChan g_compChans[8];
 volatile bool g_linkConfigDone = false;
 volatile int g_compPreset = 0;
+meshtastic_Config_LoRaConfig g_compLora = meshtastic_Config_LoRaConfig_init_default;
+volatile bool g_compLoraValid = false;
 volatile int g_linkNodeBatt = -1;
 volatile int g_linkRssi = 0;
 
@@ -258,6 +260,14 @@ void routeFromRadio(const uint8_t *bytes, uint16_t len)
                 slot = i;
         if (slot < 0 && g_compNodeCount < kMaxCompNodes)
             slot = g_compNodeCount++;
+        if (slot < 0) { // table full: evict the longest-silent node
+            uint32_t oldest = 0xFFFFFFFF;
+            for (int i = 0; i < g_compNodeCount; i++)
+                if (g_compNodes[i].lastHeard < oldest && g_compNodes[i].num != g_linkMyNode) {
+                    oldest = g_compNodes[i].lastHeard;
+                    slot = i;
+                }
+        }
         if (slot >= 0) {
             CompNode &c = g_compNodes[slot];
             c.num = ni.num;
@@ -284,8 +294,11 @@ void routeFromRadio(const uint8_t *bytes, uint16_t len)
         break;
     }
     case meshtastic_FromRadio_config_tag:
-        if (fr.config.which_payload_variant == meshtastic_Config_lora_tag)
+        if (fr.config.which_payload_variant == meshtastic_Config_lora_tag) {
             g_compPreset = (int)fr.config.payload_variant.lora.modem_preset;
+            g_compLora = fr.config.payload_variant.lora; // full blob: remote admin round-trips it
+            g_compLoraValid = true;
+        }
         break;
     case meshtastic_FromRadio_config_complete_id_tag:
         g_linkConfigDone = true;

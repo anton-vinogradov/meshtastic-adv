@@ -8,6 +8,7 @@
 #include "mesh/MeshService.h"
 #include "mesh/NodeDB.h"
 #include "mesh/Router.h"
+#include "mesh/generated/meshtastic/admin.pb.h"
 #include "mesh/mesh-pb-constants.h"
 #include "gps/RTC.h" // getTime() for message timestamps
 #include "graphics/emotes.h" // UTF-8 -> bitmap emoji table (forced in via EmotesData.cpp)
@@ -24,6 +25,7 @@
 #include <cstring>
 
 extern uint32_t rebootAtMsec; // main.cpp: set to a future millis() to schedule a reboot
+int advui_max_num_nodes();    // AdvNodeCap.cpp; also injected everywhere as MAX_NUM_NODES
 
 namespace advui
 {
@@ -1432,6 +1434,32 @@ static uint32_t sendTextPacket(uint32_t to, const char *text, int chIdx = 0, uin
     return id;
 }
 
+// Remote admin over the companion link: an AdminMessage addressed to the linked
+// node itself, exactly how the phone app configures it. Arriving via the node's
+// own client API counts as local admin, so no session key or admin channel is
+// needed on the node side.
+static bool sendAdminToNode(const meshtastic_AdminMessage &adm)
+{
+    if (!g_radioCompanion || g_linkState != BLE_CONNECTED || !g_linkMyNode)
+        return false;
+    meshtastic_ToRadio t = meshtastic_ToRadio_init_default;
+    t.which_payload_variant = meshtastic_ToRadio_packet_tag;
+    meshtastic_MeshPacket &p = t.packet;
+    p.id = (uint32_t)esp_random();
+    if (!p.id)
+        p.id = 1;
+    p.to = g_linkMyNode;
+    p.which_payload_variant = meshtastic_MeshPacket_decoded_tag;
+    p.decoded.portnum = meshtastic_PortNum_ADMIN_APP;
+    p.decoded.payload.size =
+        pb_encode_to_bytes(p.decoded.payload.bytes, sizeof(p.decoded.payload.bytes), &meshtastic_AdminMessage_msg, &adm);
+    if (!p.decoded.payload.size)
+        return false;
+    uint8_t buf[320];
+    size_t len = pb_encode_to_bytes(buf, sizeof(buf), &meshtastic_ToRadio_msg, &t);
+    return len && bleQueueToRadio(buf, (uint16_t)len);
+}
+
 // Sends a text DM to a node and adds it to our own thread immediately (status
 // "sending"); the delivery ACK later flips it to "delivered" via ackMsg().
 void AdvUI::sendMessage(uint32_t to, const char *text, uint32_t replyId)
@@ -1842,7 +1870,8 @@ void AdvUI::drawNodeList()
 
     g->fillScreen(0x0000);
 
-    size_t total = nodeDB ? nodeDB->getNumMeshNodes() : 0;
+    size_t total = g_radioCompanion ? (size_t)g_compNodeCount : (nodeDB ? nodeDB->getNumMeshNodes() : 0);
+    size_t cap = g_radioCompanion ? (size_t)kMaxCompNodes : (size_t)::advui_max_num_nodes();
     uint32_t me = myNodeNum();
 
     g->setFont(&lgfx::fonts::Font0); // header stays on the compact bitmap font
@@ -1854,9 +1883,9 @@ void AdvUI::drawNodeList()
 
     g->setTextColor(0x07FF); // cyan
     g->setCursor(4, 3);
-    // At MAX_NUM_NODES the DB is full and pinned there (new nodes evict old ones),
+    // At the cap the table is full and pinned there (new nodes evict old ones),
     // so show "200+" to make the cap visible rather than a suspicious flat count.
-    g->printf("%u%s nodes", (unsigned)total, total >= (size_t)MAX_NUM_NODES ? "+" : "");
+    g->printf("%u%s nodes", (unsigned)total, total >= cap ? "+" : "");
 
     int bw = g->textWidth(bbuf);
     g->setTextColor(bcol);
@@ -2325,6 +2354,19 @@ bool AdvUI::applyName()
         return false;
     }
     if (editTarget == 2) { // frequency (MHz) -> override_frequency; radio restart to apply
+        if (g_radioCompanion) { // remote admin: the node saves and reboots itself
+            if (!g_compLoraValid)
+                return false;
+            meshtastic_AdminMessage adm = meshtastic_AdminMessage_init_default;
+            adm.which_payload_variant = meshtastic_AdminMessage_set_config_tag;
+            adm.set_config.which_payload_variant = meshtastic_Config_lora_tag;
+            adm.set_config.payload_variant.lora = g_compLora;
+            adm.set_config.payload_variant.lora.override_frequency = strtof(nameBuf, nullptr);
+            if (!sendAdminToNode(adm))
+                return false; // link down: just fall back to Settings
+            mode = MODE_BLELINK; // watch the node reboot + the link come back
+            return true;
+        }
         config.lora.override_frequency = strtof(nameBuf, nullptr);
         if (nodeDB)
             nodeDB->saveToDisk(SEGMENT_CONFIG);
@@ -2346,6 +2388,26 @@ bool AdvUI::applyName()
     }
 
     // name (long / short): applied live, no reboot
+    if (g_radioCompanion) { // rename the linked node via set_owner, like the phone
+        meshtastic_AdminMessage adm = meshtastic_AdminMessage_init_default;
+        adm.which_payload_variant = meshtastic_AdminMessage_set_owner_tag;
+        meshtastic_User &u = adm.set_owner;
+        for (int i = 0; i < g_compNodeCount; i++) // start from the node's current names
+            if (g_compNodes[i].num == g_linkMyNode) {
+                snprintf(u.long_name, sizeof(u.long_name), "%s", g_compNodes[i].longName);
+                snprintf(u.short_name, sizeof(u.short_name), "%s", g_compNodes[i].shortName);
+                if (editTarget == 1)
+                    snprintf(u.short_name, sizeof(u.short_name), "%s", nameBuf);
+                else
+                    snprintf(u.long_name, sizeof(u.long_name), "%s", nameBuf);
+                if (sendAdminToNode(adm)) { // mirror locally so Settings shows it at once
+                    snprintf(g_compNodes[i].longName, sizeof(g_compNodes[i].longName), "%s", u.long_name);
+                    snprintf(g_compNodes[i].shortName, sizeof(g_compNodes[i].shortName), "%s", u.short_name);
+                }
+                break;
+            }
+        return false;
+    }
     if (editTarget == 1) {
         strncpy(owner.short_name, nameBuf, sizeof(owner.short_name));
         owner.short_name[sizeof(owner.short_name) - 1] = 0;
@@ -2377,15 +2439,31 @@ void AdvUI::drawSettings()
     const char *labels[kNumSettings] = {"Name",    "Short", "Region", "Preset", "Frequency",
                                          "Channel", "UTC",   "WiFi",   "MQTT",   "Radio"};
     char vals[kNumSettings][24];
-    snprintf(vals[0], sizeof(vals[0]), "%s", owner.long_name[0] ? owner.long_name : "(unset)");
-    snprintf(vals[1], sizeof(vals[1]), "%s", owner.short_name[0] ? owner.short_name : "(unset)");
-    snprintf(vals[2], sizeof(vals[2]), "%s", regionName(config.lora.region));
-    snprintf(vals[3], sizeof(vals[3]), "%s", config.lora.use_preset ? presetName(config.lora.modem_preset) : "custom");
-    if (config.lora.override_frequency > 0)
-        snprintf(vals[4], sizeof(vals[4]), "%.3f", (double)config.lora.override_frequency);
-    else
-        strcpy(vals[4], "auto");
-    snprintf(vals[5], sizeof(vals[5]), "%s", channels.getName(0));
+    if (g_radioCompanion) { // rows 0-5 show (and remote-admin edit) the linked node
+        meshtastic_NodeInfoLite *me = g_linkMyNode ? nodeByNum(g_linkMyNode) : nullptr;
+        snprintf(vals[0], sizeof(vals[0]), "%s", me && me->long_name[0] ? me->long_name : "?");
+        snprintf(vals[1], sizeof(vals[1]), "%s", me && me->short_name[0] ? me->short_name : "?");
+        snprintf(vals[2], sizeof(vals[2]), "%s", g_compLoraValid ? regionName(g_compLora.region) : "?");
+        if (g_compLoraValid)
+            snprintf(vals[3], sizeof(vals[3]), "%s", g_compLora.use_preset ? presetName(g_compLora.modem_preset) : "custom");
+        else
+            strcpy(vals[3], "?");
+        if (g_compLoraValid && g_compLora.override_frequency > 0)
+            snprintf(vals[4], sizeof(vals[4]), "%.3f", (double)g_compLora.override_frequency);
+        else
+            strcpy(vals[4], g_compLoraValid ? "auto" : "?");
+        snprintf(vals[5], sizeof(vals[5]), "%s", chanName(0));
+    } else {
+        snprintf(vals[0], sizeof(vals[0]), "%s", owner.long_name[0] ? owner.long_name : "(unset)");
+        snprintf(vals[1], sizeof(vals[1]), "%s", owner.short_name[0] ? owner.short_name : "(unset)");
+        snprintf(vals[2], sizeof(vals[2]), "%s", regionName(config.lora.region));
+        snprintf(vals[3], sizeof(vals[3]), "%s", config.lora.use_preset ? presetName(config.lora.modem_preset) : "custom");
+        if (config.lora.override_frequency > 0)
+            snprintf(vals[4], sizeof(vals[4]), "%.3f", (double)config.lora.override_frequency);
+        else
+            strcpy(vals[4], "auto");
+        snprintf(vals[5], sizeof(vals[5]), "%s", channels.getName(0));
+    }
     {
         int om = g_utcOffsetMin, ah = om < 0 ? -om : om;
         if (ah % 60)
@@ -2600,6 +2678,11 @@ void AdvUI::drawBlePin()
     g->setCursor((240 - g->textWidth(shown)) / 2, 58);
     g->print(shown);
     g->setTextSize(1);
+
+    g->setFont(&lgfx::fonts::Font0);
+    g->setTextColor(0x630C);
+    g->setCursor(30, 96);
+    g->print("node has no screen? try 123456");
 
     drawFooter(g, "digits  ENTER ok  ESC cancel");
 
@@ -2925,6 +3008,27 @@ void AdvUI::runDemoDump()
 // reboot the radio needs to re-init on the new parameters.
 void AdvUI::applyLoRa(int target, int value)
 {
+    if (g_radioCompanion) { // remote admin: the node saves and reboots itself
+        if (!g_compLoraValid)
+            return;
+        meshtastic_AdminMessage adm = meshtastic_AdminMessage_init_default;
+        adm.which_payload_variant = meshtastic_AdminMessage_set_config_tag;
+        adm.set_config.which_payload_variant = meshtastic_Config_lora_tag;
+        meshtastic_Config_LoRaConfig &lc = adm.set_config.payload_variant.lora;
+        lc = g_compLora;
+        if (target == 0) {
+            lc.region = (meshtastic_Config_LoRaConfig_RegionCode)value;
+        } else {
+            lc.use_preset = true;
+            lc.modem_preset = (meshtastic_Config_LoRaConfig_ModemPreset)value;
+        }
+        if (sendAdminToNode(adm)) {
+            g_compLora = lc; // optimistically ours; the reconnect config stream confirms
+            g_compPreset = (int)lc.modem_preset;
+            mode = MODE_BLELINK; // watch the node reboot + the link come back
+        }
+        return;
+    }
     if (target == 0) {
         config.lora.region = (meshtastic_Config_LoRaConfig_RegionCode)value;
     } else {
@@ -3000,32 +3104,48 @@ void AdvUI::handleKey(char ch)
                 setSel++;
         } else if (enter && setSel <= 1) { // 0 = long name, 1 = short name
             editTarget = setSel;
-            const char *cur = (setSel == 1) ? owner.short_name : owner.long_name;
+            const char *cur;
+            if (g_radioCompanion) { // editing the linked node's names (remote admin)
+                meshtastic_NodeInfoLite *lm = g_linkMyNode ? nodeByNum(g_linkMyNode) : nullptr;
+                cur = lm ? (setSel == 1 ? lm->short_name : lm->long_name) : "";
+            } else {
+                cur = (setSel == 1) ? owner.short_name : owner.long_name;
+            }
             strncpy(nameBuf, cur, sizeof(nameBuf));
             nameBuf[sizeof(nameBuf) - 1] = 0;
             nameLen = strlen(nameBuf);
             nameReturn = MODE_SETTINGS;
             mode = MODE_SETNAME;
         } else if (enter && setSel == 2) { // Region
+            if (g_radioCompanion && !g_compLoraValid)
+                return; // config not synced yet: nothing to edit against
             pickTarget = 0;
-            pickSel = optIndex(kRegionOpts, kRegionCount, (int)config.lora.region);
+            pickSel = optIndex(kRegionOpts, kRegionCount, (int)(g_radioCompanion ? g_compLora.region : config.lora.region));
             pickScroll = 0;
             mode = MODE_PICKLIST;
         } else if (enter && setSel == 3) { // Preset
+            if (g_radioCompanion && !g_compLoraValid)
+                return;
             pickTarget = 1;
-            pickSel = optIndex(kPresetOpts, kPresetCount, (int)config.lora.modem_preset);
+            pickSel =
+                optIndex(kPresetOpts, kPresetCount, (int)(g_radioCompanion ? g_compLora.modem_preset : config.lora.modem_preset));
             pickScroll = 0;
             mode = MODE_PICKLIST;
         } else if (enter && setSel == 4) { // Frequency (MHz)
+            if (g_radioCompanion && !g_compLoraValid)
+                return;
             editTarget = 2;
-            if (config.lora.override_frequency > 0)
-                snprintf(nameBuf, sizeof(nameBuf), "%.3f", (double)config.lora.override_frequency);
+            float ovr = g_radioCompanion ? g_compLora.override_frequency : config.lora.override_frequency;
+            if (ovr > 0)
+                snprintf(nameBuf, sizeof(nameBuf), "%.3f", (double)ovr);
             else
                 nameBuf[0] = 0;
             nameLen = strlen(nameBuf);
             nameReturn = MODE_SETTINGS;
             mode = MODE_SETNAME;
         } else if (enter && setSel == 5) { // Channel name
+            if (g_radioCompanion)
+                return; // the node's PSK isn't synced over the link; a rename would wipe it
             editTarget = 3;
             strncpy(nameBuf, channels.getByIndex(0).settings.name, sizeof(nameBuf));
             nameBuf[sizeof(nameBuf) - 1] = 0;

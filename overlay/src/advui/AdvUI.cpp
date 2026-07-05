@@ -3807,6 +3807,8 @@ int32_t AdvUI::runOnce()
     if (g_beeping)
         return 20; // pump the tone fast until it finishes
 #endif
+    if (splashDone && kb.navHeld())
+        return 40; // a held arrow/backspace is repeating: poll+redraw fast for smooth scroll
     return splashDone ? 200 : 80; // 5 Hz normally; snappier while the splash is up
 }
 

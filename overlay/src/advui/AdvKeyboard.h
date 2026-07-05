@@ -26,6 +26,10 @@ class AdvKeyboard : public TCA8418KeyboardBase
     // typing set this false so they emit their literal symbols (so '.' etc. work).
     void setNavKeys(bool on) { navKeys = on; }
 
+    // True while an auto-repeating key (arrow / backspace) is held — the UI polls
+    // faster during the hold so held-scrolling redraws smoothly.
+    bool navHeld() const { return repeatKey >= 0; }
+
   protected:
     void pressed(uint8_t key) override;
     void released() override;
@@ -45,6 +49,10 @@ class AdvKeyboard : public TCA8418KeyboardBase
     bool escDown = false;      // ESC currently held
     bool escLongFired = false; // long-press already emitted for this hold
     bool navKeys = true;       // , ; . / emit arrows (nav) vs literal symbols (typing)
+    int repeatKey = -1;         // matrix index of the held auto-repeat key (-1 = none)
+    uint8_t repeatChar = 0;     // code re-emitted while it is held
+    uint32_t repeatNextMs = 0;  // when the next auto-repeat fires
+    uint32_t repeatStartMs = 0; // failsafe: stop repeating if the release event got lost
 };
 
 } // namespace advui

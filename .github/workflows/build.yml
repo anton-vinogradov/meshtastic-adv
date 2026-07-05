@@ -68,7 +68,15 @@ jobs:
           cp /tmp/fw.bin docs/firmware.factory.bin
           tmp=$(mktemp)
           jq --arg v "$ver (advui · engine 2.8.0)" '.version=$v' docs/manifest.json > "$tmp" && mv "$tmp" docs/manifest.json
-          git add docs/firmware.factory.bin docs/manifest.json
+          # Archive this version for the installer's version picker. Images must be
+          # same-origin (GitHub Releases lack CORS), so they live under docs/; only
+          # the 6 newest stay archived — older ones remain on the Releases page.
+          mkdir -p "docs/versions/${GITHUB_REF_NAME}"
+          cp /tmp/fw.bin "docs/versions/${GITHUB_REF_NAME}/firmware.factory.bin"
+          cp docs/manifest.json "docs/versions/${GITHUB_REF_NAME}/manifest.json"
+          (cd docs/versions && ls -d v* | sort -rV | tail -n +7 | xargs -r rm -rf)
+          (cd docs/versions && ls -d v* | sort -rV) | jq -R . | jq -s . > docs/versions/index.json
+          git add docs/firmware.factory.bin docs/manifest.json docs/versions
           git commit -m "ci: web installer image for ${GITHUB_REF_NAME} [skip ci]" || { echo "no change"; exit 0; }
           git push origin HEAD:main
 

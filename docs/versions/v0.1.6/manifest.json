@@ -1,0 +1,16 @@
+{
+  "name": "Meshtastic ADV",
+  "version": "0.1.6 (advui · engine 2.8.0)",
+  "new_install_prompt_erase": true,
+  "builds": [
+    {
+      "chipFamily": "ESP32-S3",
+      "parts": [
+        {
+          "path": "firmware.factory.bin",
+          "offset": 0
+        }
+      ]
+    }
+  ]
+}

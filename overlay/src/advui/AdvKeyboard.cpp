@@ -15,7 +15,10 @@ constexpr uint8_t kRows = 7;
 constexpr uint8_t kCols = 8;
 constexpr uint8_t kNumKeys = 56;
 constexpr uint32_t kMultiTapThreshold = 1500;
-constexpr uint32_t kLongPressMs = 900; // ESC held this long -> settings, not "back"
+constexpr uint32_t kLongPressMs = 900;    // ESC held this long -> settings, not "back"
+constexpr uint32_t kRepeatDelayMs = 350;  // hold an arrow/backspace this long to start repeating
+constexpr uint32_t kRepeatEveryMs = 80;   // then repeat at this rate
+constexpr uint32_t kRepeatMaxMs = 15000;  // failsafe if the release event got lost
 
 constexpr uint8_t modifierFnKey = 2;
 constexpr uint8_t modifierFn = 0b0010;
@@ -128,6 +131,17 @@ void AdvKeyboard::trigger()
         escLongFired = true;
     }
 
+    // Auto-repeat for a held arrow / backspace (they emit on the press, see pressed()).
+    if (repeatKey >= 0) {
+        uint32_t now = millis();
+        if (now - repeatStartMs > kRepeatMaxMs) {
+            repeatKey = -1;
+        } else if ((int32_t)(now - repeatNextMs) >= 0) {
+            queueEvent(repeatChar);
+            repeatNextMs = now + kRepeatEveryMs;
+        }
+    }
+
     // Pop exactly one event from the FIFO (reading KEY_EVENT_A advances it). The
     // caller re-triggers in a loop to drain, so keyCount always makes progress.
     if (keyCount() == 0)
@@ -184,6 +198,21 @@ void AdvKeyboard::pressed(uint8_t key)
 
     last_key = next_key;
     last_tap = now;
+
+    // Arrows (nav mode) and backspace emit on the press and auto-repeat while held —
+    // that's what makes held-scrolling work. Their release is suppressed (released()).
+    bool arrow = modifierFlag == 0 && navKeys &&
+                 (next_key == 43 || next_key == 46 || next_key == 47 || next_key == 51);
+    bool bsp = modifierFlag == 0 && next_key == 52;
+    if (arrow || bsp) {
+        repeatKey = next_key;
+        repeatChar = arrow ? TapMap[next_key][2] : TapMap[next_key][0]; // [2] = the arrow code
+        repeatNextMs = now + kRepeatDelayMs;
+        repeatStartMs = now;
+        queueEvent(repeatChar);
+    } else {
+        repeatKey = -1; // any other key ends the hold-repeat
+    }
 }
 
 void AdvKeyboard::released()
@@ -209,6 +238,13 @@ void AdvKeyboard::released()
             return;
         modifierFlag = modifierFn;
         queueEvent(TapMap[0][modifierFlag % TapMod[0]]);
+        return;
+    }
+
+    // Keys of the hold-repeat family already emitted on their press — the release
+    // only stops the repeat.
+    if (repeatKey >= 0 && last_key == repeatKey) {
+        repeatKey = -1;
         return;
     }
 

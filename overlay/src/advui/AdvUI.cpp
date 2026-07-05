@@ -116,9 +116,14 @@ int g_msgNext = 0;          // next write slot (ring head)
 bool g_msgsDirty = false;   // ring changed since the last flash save
 uint32_t g_lastSaveMs = 0;  // when we last wrote the ring to flash
 
+// Parallel to g_msgs: the packet id this slot's message replies to (0 = not a reply).
+// A separate array so the Msg layout (and the saved-file magic) stays unchanged.
+uint32_t g_msgReply[kMaxMsgs];
+
 void addMsg(uint32_t from, uint32_t to, uint8_t ch, uint32_t rxTime, bool unread, const char *text, uint32_t id,
-           uint8_t status)
+           uint8_t status, uint32_t replyId = 0)
 {
+    g_msgReply[g_msgNext] = replyId;
     Msg &m = g_msgs[g_msgNext];
     m.from = from;
     m.to = to;
@@ -298,6 +303,7 @@ void saveMsgs()
     f.write(&rc, 1); // optional tail: reactions ring
     f.write(&rn, 1);
     f.write((const uint8_t *)g_reacts, sizeof(g_reacts));
+    f.write((const uint8_t *)g_msgReply, sizeof(g_msgReply)); // optional tail: reply links
     f.close();
 }
 
@@ -322,6 +328,8 @@ void loadMsgs()
     f.read(&rc, 1); // optional tail: reactions ring
     f.read(&rn, 1);
     size_t rBytes = f.read((uint8_t *)tmpR, sizeof(tmpR));
+    static uint32_t tmpRe[kMaxMsgs];
+    size_t reBytes = f.read((uint8_t *)tmpRe, sizeof(tmpRe)); // optional tail: reply links
     f.close();
     if (magic != kMsgMagic || n != sizeof(g_msgs) || cnt < 0 || cnt > kMaxMsgs || nxt < 0 || nxt >= kMaxMsgs)
         return;
@@ -332,6 +340,8 @@ void loadMsgs()
         g_reactCount = rc;
         g_reactNext = rn;
     }
+    if (reBytes == sizeof(tmpRe))
+        memcpy(g_msgReply, tmpRe, sizeof(g_msgReply));
     g_msgCount = cnt;
     g_msgNext = nxt;
     uint32_t me = nodeDB ? nodeDB->getNodeNum() : 0;
@@ -935,10 +945,11 @@ int lineWidthEmotes(lgfx::LGFXBase *g, const char *s)
     return w;
 }
 
-// Draws a message-line string at (x,y) in `color`, blitting emoji bitmaps inline.
+// Draws a message-line string at (x,y) in `color`, blitting emoji bitmaps inline;
+// returns the x after the last glyph (for multi-colour spans on one line).
 // emojiDy nudges the bitmaps down to sit on the text's visual band (the 9x15 font
 // keeps ~3px of ascender space, so a 16px emoji rides high without it).
-void printLineEmotes(lgfx::LGFXBase *g, int x, int y, const char *s, uint16_t color, int emojiDy = 0)
+int printLineEmotes(lgfx::LGFXBase *g, int x, int y, const char *s, uint16_t color, int emojiDy = 0)
 {
     g->setFont(&cyrFont);
     g->setTextSize(1);
@@ -964,6 +975,7 @@ void printLineEmotes(lgfx::LGFXBase *g, int x, int y, const char *s, uint16_t co
             s += k;
         }
     }
+    return cx;
 }
 
 // Copies at most `maxBytes` of s into out without splitting a UTF-8 sequence.
@@ -1105,7 +1117,8 @@ void AdvUI::handleFromRadio(const meshtastic_FromRadio &fr)
     }
 
     bool unread = p.from != me && (p.to == me || p.to == NODENUM_BROADCAST); // DM to us, or a channel broadcast
-    addMsg(p.from, p.to, p.channel, p.rx_time, unread, text, p.id, MSG_IN); // keep the id: reactions reference it
+    // keep the id (reactions/replies reference it) and the reply link (draws the quote)
+    addMsg(p.from, p.to, p.channel, p.rx_time, unread, text, p.id, MSG_IN, p.decoded.reply_id);
 
     if (unread) {
         bool fav = (p.to == NODENUM_BROADCAST) ? chanFav(p.channel) : (nodeDB && nodeDB->isFavorite(p.from));
@@ -1166,23 +1179,23 @@ static uint32_t sendTextPacket(uint32_t to, const char *text, int chIdx = 0, uin
 
 // Sends a text DM to a node and adds it to our own thread immediately (status
 // "sending"); the delivery ACK later flips it to "delivered" via ackMsg().
-void AdvUI::sendMessage(uint32_t to, const char *text)
+void AdvUI::sendMessage(uint32_t to, const char *text, uint32_t replyId)
 {
-    uint32_t id = sendTextPacket(to, text);
+    uint32_t id = sendTextPacket(to, text, 0, replyId);
     if (!id)
         return;
     uint32_t me = nodeDB ? nodeDB->getNodeNum() : 0;
-    addMsg(me, to, 0, getTime(false), false, text, id, MSG_SENDING);
+    addMsg(me, to, 0, getTime(false), false, text, id, MSG_SENDING, replyId);
 }
 
 // Sends a text broadcast to a channel and adds it to that channel's thread.
-void AdvUI::sendChannel(int chIdx, const char *text)
+void AdvUI::sendChannel(int chIdx, const char *text, uint32_t replyId)
 {
-    uint32_t id = sendTextPacket(NODENUM_BROADCAST, text, chIdx);
+    uint32_t id = sendTextPacket(NODENUM_BROADCAST, text, chIdx, replyId);
     if (!id)
         return;
     uint32_t me = nodeDB ? nodeDB->getNodeNum() : 0;
-    addMsg(me, NODENUM_BROADCAST, chIdx, getTime(false), false, text, id, MSG_SENT); // sent to channel (no ack)
+    addMsg(me, NODENUM_BROADCAST, chIdx, getTime(false), false, text, id, MSG_SENT, replyId); // no ack for broadcast
 }
 
 // Sends a tapback on the message at ring index msgIdx and records it locally.
@@ -1312,6 +1325,7 @@ void AdvUI::openEntry(int s)
     chatAnchorMsgIdx = -1;
     reactSel = -1;
     reactStrip = false;
+    pendingReplyId = 0;
     if (s < chanCount) {
         selectedChannel = chanList[s];
         chatAnchorMsgIdx = firstUnreadIdx(); // capture the first unread before clearing it
@@ -1388,6 +1402,7 @@ void AdvUI::openConv(int i)
     chatAnchorMsgIdx = -1;
     reactSel = -1;
     reactStrip = false;
+    pendingReplyId = 0;
     if (conv[i].isChan) {
         selectedChannel = conv[i].ch;
         chatAnchorMsgIdx = firstUnreadIdx();
@@ -1512,12 +1527,18 @@ void AdvUI::drawChats()
         g->setTextColor(fav ? 0xFFE0 : (c.isChan ? 0x07FF : 0xFFFF));
         g->setCursor(nameX, y);
         g->print(nm);
-        // preview (second line): "> " for our own last message, inline emoji, truncated
+        // preview (second line): "> " for our own last message, sender name for channel
+        // messages (many senders), inline emoji, truncated
         char pv[80];
-        int pfx = (m.from == me) ? 2 : 0;
-        if (pfx) {
+        int pfx = 0;
+        if (m.from == me) {
             pv[0] = '>';
             pv[1] = ' ';
+            pfx = 2;
+        } else if (c.isChan) {
+            char sn[8];
+            shortNameOf(m.from, sn, sizeof(sn));
+            pfx = snprintf(pv, sizeof(pv), "%s: ", sn);
         }
         utf8Copy(pv + pfx, m.text, (int)sizeof(pv) - pfx - 1);
         g->setFont(&cyrFont);
@@ -1704,7 +1725,7 @@ void AdvUI::drawNode()
 
     // message thread (chronological, most recent at the bottom)
     const int fy0 = 24, lh = 17;
-    int bottom = (mode == MODE_COMPOSE) ? 112 : 122; // leave room for the compose bar
+    int bottom = (mode == MODE_COMPOSE) ? (pendingReplyId ? 96 : 112) : 122; // room for compose (+ quote line)
     int maxLines = (bottom - fy0) / lh;
     int matched[kMaxMsgs], mc = 0;
     bool hasFailed = false; // any failed outgoing DM here -> offer ENTER resend
@@ -1737,6 +1758,7 @@ void AdvUI::drawNode()
             uint8_t status;
             uint8_t err;
             uint8_t timeLen;  // leading chars that are the dim "HH:MM " prefix (0 on continuation lines)
+            uint8_t nameLen;  // chars after the time that are the sender-name span (channels)
         };
         int32_t tzOff = g_utcOffsetMin * 60; // user-set UTC offset (Settings > UTC)
         static DLine dl[80]; // single-threaded UI: static keeps it off the stack
@@ -1766,8 +1788,38 @@ void AdvUI::drawNode()
             char tpre[8];
             msgTimePrefix(m.rxTime, tzOff, tpre, sizeof(tpre)); // "HH:MM " before the arrow
             uint8_t tlen = (uint8_t)strlen(tpre);
-            char full[188];
-            snprintf(full, sizeof(full), "%s%s%s", tpre, out ? "> " : "< ", m.text);
+            uint8_t nlen = 0;
+            char full[200];
+            if (isChan && !out) { // channels have many senders — show who wrote it
+                char sn[8];
+                shortNameOf(m.from, sn, sizeof(sn));
+                nlen = (uint8_t)(strlen(sn) + 2);
+                snprintf(full, sizeof(full), "%s%s: %s", tpre, sn, m.text);
+            } else {
+                snprintf(full, sizeof(full), "%s%s%s", tpre, out ? "> " : "< ", m.text);
+            }
+            if (g_msgReply[matched[i]]) { // a reply: quote the original above it, if still in the ring
+                for (int q = 0; q < g_msgCount; q++)
+                    if (g_msgs[q].id == g_msgReply[matched[i]] && g_msgs[q].id != 0) {
+                        DLine &d = pushLine();
+                        char snip[30];
+                        utf8Copy(snip, g_msgs[q].text, (int)sizeof(snip) - 1);
+                        snprintf(d.text, sizeof(d.text), "    | %s", snip);
+                        d.color = 0x630C; // extra dim: context, not content
+                        d.out = false;
+                        d.status = 0;
+                        d.err = 0;
+                        d.timeLen = 0;
+                        d.nameLen = 0;
+                        d.last = false;
+                        if (isSel) {
+                            if (selFirst < 0)
+                                selFirst = dlCount - 1;
+                            selLast = dlCount - 1;
+                        }
+                        break;
+                    }
+            }
             if (matched[i] == chatAnchorMsgIdx)
                 anchorLine = dlCount; // this message's first line
             const char *p = full;
@@ -1779,7 +1831,8 @@ void AdvUI::drawNode()
                 d.out = out;
                 d.status = m.status;
                 d.err = m.err;
-                d.timeLen = first ? tlen : 0; // time sits only on the first line
+                d.timeLen = first ? tlen : 0; // time + name sit only on the first line
+                d.nameLen = first ? nlen : 0;
                 d.last = (*p == 0);
                 if (isSel) {
                     if (selFirst < 0)
@@ -1806,6 +1859,7 @@ void AdvUI::drawNode()
                     d.status = 0;
                     d.err = 0;
                     d.timeLen = 0;
+                    d.nameLen = 0;
                     d.last = false;
                     if (isSel)
                         selLast = dlCount - 1;
@@ -1851,7 +1905,13 @@ void AdvUI::drawNode()
                 cx += g->textWidth(d.text);
                 d.text[d.timeLen] = save;
             }
-            printLineEmotes(g, cx, y, d.text + d.timeLen, d.color, 2); // inline emoji, nudged onto the text band
+            if (d.nameLen) { // sender-name span (channel threads), light blue
+                char save = d.text[d.timeLen + d.nameLen];
+                d.text[d.timeLen + d.nameLen] = 0;
+                cx = printLineEmotes(g, cx, y, d.text + d.timeLen, 0x9CD3, 2); // emote-aware: short names can be emoji
+                d.text[d.timeLen + d.nameLen] = save;
+            }
+            printLineEmotes(g, cx, y, d.text + d.timeLen + d.nameLen, d.color, 2); // inline emoji, nudged onto the text band
             if (d.last && d.out) {
                 if (d.status == MSG_FAILED) {
                     g->setFont(&lgfx::fonts::Font0); // red error name at the right
@@ -1880,6 +1940,14 @@ void AdvUI::drawNode()
     }
 
     if (mode == MODE_COMPOSE) {
+        if (pendingReplyId) { // replying: show what we're quoting above the input
+            g->fillRect(0, 97, 240, 16, 0x0000);
+            g->setFont(&cyrFont);
+            g->setTextSize(1);
+            char qb[44];
+            snprintf(qb, sizeof(qb), "| %s", replyPrev);
+            printLineEmotes(g, 4, 99, qb, 0x630C);
+        }
         g->drawFastHLine(0, 114, 240, 0x39C7);
         g->setFont(&cyrFont);
         g->setTextSize(1);
@@ -1916,10 +1984,12 @@ void AdvUI::drawNode()
         if (reactStrip) {
             hint = "</> pick  ENTER send  ESC";
         } else if (reactSel >= 0) {
-            int smi = matchedFromNewest(reactSel); // old history has no packet id to react to
-            hint = (smi >= 0 && g_msgs[smi].id == 0) ? "old msg: can't react  up/dn  ESC" : "up/dn msg  ENTER react  ESC";
+            int smi = matchedFromNewest(reactSel); // old history has no packet id to reference
+            hint = (smi >= 0 && g_msgs[smi].id == 0) ? "old msg: no id  up/dn  ESC"
+                   : pickReply                       ? "up/dn msg  ENTER reply  ESC"
+                                                     : "up/dn msg  ENTER react  ESC";
         } else {
-            hint = hasFailed ? "ENTER resend  Tab emoji  > react" : "type reply  Tab emoji  > react";
+            hint = hasFailed ? "ENTER resend  <reply  >react" : "type  Tab emoji  <reply  >react";
         }
         drawFooter(g, hint);
         char bb[10];
@@ -2339,6 +2409,7 @@ void AdvUI::runDemoDump()
     screenshot("react");
     reactSel = -1;
     reactStrip = false;
+    pendingReplyId = 0;
 
     sel = 0;
     scrollTop = 0;
@@ -2623,8 +2694,19 @@ void AdvUI::handleKey(char ch)
         } else if (enter) {
             int smi = matchedFromNewest(reactSel);
             if (smi >= 0 && g_msgs[smi].id != 0) { // old history has no id to reference
-                reactStrip = true;
-                reactPick = 0;
+                if (pickReply) { // LEFT flow: compose a quoted reply to this message
+                    pendingReplyId = g_msgs[smi].id;
+                    utf8Copy(replyPrev, g_msgs[smi].text, (int)sizeof(replyPrev) - 1);
+                    reactSel = -1;
+                    msgBuf[0] = 0;
+                    msgLen = 0;
+                    pendingLat = 0;
+                    chatScroll = 0;
+                    mode = MODE_COMPOSE;
+                } else { // RIGHT flow: quick-reaction strip
+                    reactStrip = true;
+                    reactPick = 0;
+                }
             }
         }
         return;
@@ -2638,9 +2720,11 @@ void AdvUI::handleKey(char ch)
                 g_lastSaveMs = millis();
             }
             mode = nodeReturn;
-        } else if (right) { // enter react mode on the newest message
-            if (matchedFromNewest(0) >= 0)
+        } else if (right || left) { // pick a message: RIGHT = react, LEFT = reply
+            if (matchedFromNewest(0) >= 0) {
                 reactSel = 0;
+                pickReply = left;
+            }
         } else if (up) {
             chatScroll++; // older; drawNode clamps to the top of the thread
         } else if (down) {
@@ -2715,6 +2799,7 @@ void AdvUI::handleKey(char ch)
 
     if (mode == MODE_COMPOSE) {
         if (esc) {
+            pendingReplyId = 0; // cancelling compose drops the quote too
             mode = MODE_NODE;
         } else if (tab) {
             emojiReturn = MODE_COMPOSE; // add an emoji into the current message
@@ -2723,10 +2808,11 @@ void AdvUI::handleKey(char ch)
         } else if (enter) {
             if (msgLen) {
                 if (selectedChannel >= 0)
-                    sendChannel(selectedChannel, msgBuf);
+                    sendChannel(selectedChannel, msgBuf, pendingReplyId);
                 else
-                    sendMessage(selectedNum, msgBuf);
+                    sendMessage(selectedNum, msgBuf, pendingReplyId);
             }
+            pendingReplyId = 0;
             msgLen = 0;
             msgBuf[0] = 0;
             pendingLat = 0;

@@ -80,8 +80,8 @@ class AdvUI : public concurrency::OSThread
     int firstUnreadIdx();  // ring index of the first unread message in the open thread, or -1
     void favEntry(int s, bool on);
     void handleFromRadio(const meshtastic_FromRadio &fr);
-    void sendMessage(uint32_t to, const char *text);
-    void sendChannel(int chIdx, const char *text);
+    void sendMessage(uint32_t to, const char *text, uint32_t replyId = 0);
+    void sendChannel(int chIdx, const char *text, uint32_t replyId = 0);
     void sendReaction(int msgIdx, const char *label); // tapback on g_msgs[msgIdx]
     int matchedFromNewest(int back); // ring index of the thread's back-th newest message
     void handleKey(char c);
@@ -109,9 +109,12 @@ class AdvUI : public concurrency::OSThread
     int selectedChannel = -1; // >= 0 when the open thread is a channel (else a node DM)
     int chatScroll = 0;       // thread view: lines scrolled up from the bottom (0 = newest)
     int chatAnchorMsgIdx = -1; // on open: ring index to scroll to (first unread), -1 = bottom
-    int reactSel = -1;        // >= 0: picking a message to react to (0 = newest, counts back)
+    int reactSel = -1;        // >= 0: picking a message (0 = newest, counts back)
+    bool pickReply = false;   // the pick is for a reply (LEFT) rather than a reaction (RIGHT)
     bool reactStrip = false;  // the quick-reaction strip is open
     int reactPick = 0;        // cursor within the strip
+    uint32_t pendingReplyId = 0; // compose sends as a reply to this packet id
+    char replyPrev[36] = {0};    // snippet of the quoted message for the compose bar
     int emojiSel = 0;         // emoji picker cursor (MODE_EMOJI)
     Mode emojiReturn = MODE_COMPOSE; // where ESC in the emoji picker returns
     Mode nodeReturn = MODE_NODES; // where the node view returns on ESC (home or picker)

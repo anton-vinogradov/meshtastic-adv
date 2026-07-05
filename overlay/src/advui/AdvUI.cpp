@@ -1914,13 +1914,20 @@ void AdvUI::runDemoDump()
     drawNodeList();
     screenshot("nodes");
 
-    // sample conversation with the first listed node (Cyrillic + emoji + statuses)
+    // Controlled demo history: clear the real ring (restored from backup on exit) so
+    // screenshots show only our sample data, not real (possibly non-English) chats.
+    g_msgCount = 0;
+    g_msgNext = 0;
     uint32_t peer = (filteredCount > 0 && nodeDB) ? nodeDB->getMeshNodeByIndex(filtered[0])->num : me;
+    uint32_t other = (filteredCount > 1 && nodeDB) ? nodeDB->getMeshNodeByIndex(filtered[1])->num : peer + 1;
     uint32_t t = 1751720400;
-    addMsg(peer, me, 0, t, false, "Привет! Как слышно?", 0, MSG_IN);
-    addMsg(me, peer, 0, t + 60, false, "Чётко, 5/5 \U0001F44D", 1, MSG_DELIVERED);
-    addMsg(peer, me, 0, t + 120, false, "Выезжаем через 10, го \U0001F525", 0, MSG_IN);
-    addMsg(me, peer, 0, t + 180, false, "Ок, буду \U0001F642", 2, MSG_SENDING);
+    // a channel conversation from a different node, left unread -> envelope in the chats list
+    addMsg(other, NODENUM_BROADCAST, 0, t - 200, true, "Anyone up for a mesh test? \U0001F440", 0, MSG_IN);
+    // a DM: mostly English with one Cyrillic line to showcase non-Latin text
+    addMsg(peer, me, 0, t, false, "Hey, you on the mesh?", 0, MSG_IN);
+    addMsg(me, peer, 0, t + 60, false, "Yep, 5/5 \U0001F44D", 1, MSG_DELIVERED);
+    addMsg(peer, me, 0, t + 120, false, "Отлично, погнали \U0001F525", 0, MSG_IN); // Cyrillic showcase
+    addMsg(me, peer, 0, t + 180, false, "On my way \U0001F642", 2, MSG_SENDING);
     selectedChannel = -1;
     selectedNum = peer;
     chatScroll = 0;

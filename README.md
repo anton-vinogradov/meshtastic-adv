@@ -35,6 +35,7 @@ You get a device that boots straight into a usable messenger: pick a contact, ty
 - **📡 WiFi + MQTT, on-device** — join WiFi and bridge the mesh to the internet over MQTT (default public broker or your own), configured right on the device — no phone needed. WiFi also sets the clock via NTP.
 - **💾 History that survives reboots** — the conversation ring is persisted to flash.
 - **⚙️ On-device settings** — name, region, modem preset, frequency, channel, UTC, WiFi and MQTT, all editable on the device (long-press **ESC**).
+- **🔗 Companion mode** — no LoRa cap? Pair the Cardputer with **any stock Meshtastic node** (Heltec, T-Beam, RAK…) over Bluetooth and use its radio: the whole chat UI above, through the other node. [Details below.](#companion-mode-drive-another-node-over-ble)
 
 <p align="center">
   <img src="docs/img/emoji.png" width="32%" alt="Emoji palette"/>
@@ -72,6 +73,18 @@ Everything is keyboard-driven. The footer of each screen shows the live hints.
 
 In Settings, **↑/↓** move, **Enter** edits (toggles for on/off items), **ESC** goes back. Changing Region/Preset/Frequency/Channel, or WiFi/MQTT, reboots to apply. Enabling WiFi turns Bluetooth off (Meshtastic behaviour).
 
+## Companion mode: drive another node over BLE
+
+The Cardputer can act as a **keyboard + screen terminal for a separate Meshtastic node** instead of (or without) its own LoRa cap. It connects as a BLE client to the node's standard Bluetooth API — the same one the phone app uses — so **the other node stays on stock firmware, zero changes**.
+
+1. Long-press **ESC** → **Settings** → **Radio** → **Companion via BLE** → the device reboots into a scan.
+2. Pick your node from the list, type the **PIN** shown on the node's screen.
+3. Done — it downloads the node's contacts and channels and drops you into Chats. Everything works as usual (PKI DMs, delivery checkmarks, reactions, replies), just through the other node's radio.
+
+A Bluetooth rune in the Chats header shows the link state; the link auto-reconnects after drops. **Settings → Radio** doubles as a status page (link signal, the node's battery, traffic; **R** reconnect, **F** forget the node). Switch back with **Radio → Onboard (Cap LoRa)**.
+
+> 📱 The node has a single Bluetooth slot — close the Meshtastic phone app while the Cardputer is linked, or they'll fight over it.
+
 ## Architecture
 
 The UI and the mesh engine talk over the **same protobuf Client API** (`ToRadio` / `FromRadio`) the phone app uses — but in-process, on the same ESP32-S3, via a custom `PhoneAPI` implementation.
@@ -95,7 +108,7 @@ See [docs/interface.md](docs/interface.md) for the on-screen details and [HARDWA
 | Part | Detail |
 |---|---|
 | MCU | M5Stack Cardputer ADV — Stamp-S3A (ESP32-S3FN8, 8 MB flash, **no PSRAM**) |
-| Radio | Cap LoRa-1262 — Semtech **SX1262**, 868–923 MHz, external antenna |
+| Radio | Cap LoRa-1262 — Semtech **SX1262**, 868–923 MHz, external antenna — *or* any stock Meshtastic node over BLE (companion mode) |
 | Display | 1.14" 240×135 IPS |
 | Input | 56-key QWERTY |
 | Audio | ES8311 codec + speaker |
@@ -115,9 +128,9 @@ Requires PlatformIO. The build env is `m5stack-cardputer-adv-advui`. `scripts/sy
 
 ## Status
 
-The read **and** write paths are done and running on real hardware: node list, DMs, channels, delivery status, Cyrillic, emoji, favourites, sound, timestamps, persisted history and on-device settings all work today.
+The read **and** write paths are done and running on real hardware: node list, DMs, channels, delivery status, Cyrillic, emoji, reactions, replies, favourites, sound, timestamps, persisted history, on-device settings and BLE companion mode all work today. Companion mode is verified end-to-end over the air (encrypted DM through the linked node, routing ACK back).
 
-Next up: full-Unicode font from SD (CJK), and quality-of-life polish.
+Next up: full-Unicode font from SD (CJK), remote node settings in companion mode, and quality-of-life polish.
 
 ## License
 

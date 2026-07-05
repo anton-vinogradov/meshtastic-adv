@@ -5,6 +5,9 @@
 A from-scratch on-device UI focused on one thing: making it genuinely comfortable to **message people over the mesh** from a pocket QWERTY device — no phone required — while keeping the proven Meshtastic radio stack underneath.
 
 <p align="center">
+  <img src="docs/img/demo.gif" width="60%" alt="Meshtastic ADV walkthrough: recent chats, Cyrillic + emoji conversation, emoji palette, node list, settings"/>
+</p>
+<p align="center">
   <img src="docs/img/chats.png" width="49%" alt="Recent conversations home with previews and unread badges"/>
   <img src="docs/img/chat.png" width="49%" alt="Conversation with Cyrillic text, inline emoji and delivery status"/>
 </p>

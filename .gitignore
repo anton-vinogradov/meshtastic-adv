@@ -9,8 +9,10 @@
 *.elf
 *.map
 *.hex
-# ...except the installer image, served same-origin by GitHub Pages
+# ...except the installer images, served same-origin by GitHub Pages
+# (the versioned copies feed the installer's version picker)
 !docs/firmware.factory.bin
+!docs/versions/*/firmware.factory.bin
 
 # Editors / OS
 .vscode/

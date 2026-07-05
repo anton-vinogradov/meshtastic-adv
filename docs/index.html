@@ -58,6 +58,16 @@
       box-shadow: 0 0 0 var(--cyanD), 0 0 0 3px #04121a; }
     .unsupported,.blocked{ display:block; color:var(--amber); font-size:20px; }
 
+    /* --- version picker --- */
+    .verrow{ display:flex; align-items:center; gap:12px; margin-top:14px; }
+    .verrow label{ font-family:"Press Start 2P", monospace; font-size:11px; color:var(--dim); }
+    .verrow select{
+      flex:1; min-width:0; appearance:none; cursor:pointer;
+      font-family:"VT323", monospace; font-size:22px; color:var(--ink);
+      background:#000; border:3px solid var(--line); padding:6px 10px;
+    }
+    .verrow select:focus{ outline:none; border-color:var(--cyanD); }
+
     /* --- gallery --- */
     .shots{ display:grid; grid-template-columns:1fr 1fr; gap:14px; }
     .shots figure{ margin:0; border:3px solid var(--line); background:#000; box-shadow:5px 5px 0 rgba(0,0,0,.6); }
@@ -96,6 +106,31 @@
         <span slot="unsupported" class="unsupported">Web Serial isn't supported here — open this page in desktop <b>Chrome</b> or <b>Edge</b>.</span>
         <span slot="not-allowed" class="blocked">Serial access was blocked by the browser.</span>
       </esp-web-install-button>
+      <div class="verrow">
+        <label for="ver">version</label>
+        <select id="ver"><option value="">latest</option></select>
+      </div>
+      <script>
+        (function () {
+          var sel = document.getElementById('ver');
+          var btn = document.querySelector('esp-web-install-button');
+          fetch('versions/index.json').then(function (r) { return r.ok ? r.json() : []; }).then(function (vs) {
+            if (!vs.length) return;
+            sel.innerHTML = '';
+            vs.forEach(function (v, i) {
+              var o = document.createElement('option');
+              o.value = v;
+              o.textContent = i === 0 ? v + ' · latest' : v;
+              sel.appendChild(o);
+            });
+          }).catch(function () {});
+          sel.addEventListener('change', function () {
+            // newest = the root manifest (same image); older = its archived copy
+            var first = sel.selectedIndex === 0;
+            btn.setAttribute('manifest', first || !sel.value ? './manifest.json' : './versions/' + sel.value + '/manifest.json');
+          });
+        })();
+      </script>
     </div>
 
     <div class="panel">

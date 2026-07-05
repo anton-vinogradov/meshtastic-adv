@@ -157,10 +157,13 @@ int unreadCount()
     return c;
 }
 
+// Marks the DM thread with this node read. Only DMs: the node's channel broadcasts
+// belong to the channel thread (same filter as hasUnreadFrom — marking them here
+// silently killed the channel's unread state and its first-unread jump).
 void markReadFrom(uint32_t nodeNum)
 {
     for (int i = 0; i < g_msgCount; i++)
-        if (g_msgs[i].from == nodeNum && !g_msgs[i].read) {
+        if (g_msgs[i].from == nodeNum && g_msgs[i].to != NODENUM_BROADCAST && !g_msgs[i].read) {
             g_msgs[i].read = true;
             g_msgsDirty = true;
         }
@@ -181,6 +184,10 @@ bool chanFav(int i) { return g_favChannels & (1u << i); }
 
 // User-set UTC offset (minutes) for message timestamps; the device has no GPS/tz.
 int32_t g_utcOffsetMin = 0;
+
+// Transliterated Cyrillic input layer (Fn+L); persisted with the messages so the
+// chosen layout survives a reboot.
+bool g_ruMode = false;
 
 #ifdef HAS_I2S
 // Our own single-note alert, played over the I2S codec (the stock beep is disabled).
@@ -244,6 +251,8 @@ void saveMsgs()
     f.write((const uint8_t *)&g_favChannels, sizeof(g_favChannels));
     f.write((const uint8_t *)g_msgs, sizeof(g_msgs));
     f.write((const uint8_t *)&g_utcOffsetMin, sizeof(g_utcOffsetMin)); // optional tail
+    uint8_t ru = g_ruMode ? 1 : 0;
+    f.write(&ru, 1); // optional tail: input layout
     f.close();
 }
 
@@ -261,10 +270,13 @@ void loadMsgs()
     size_t n = f.read((uint8_t *)g_msgs, sizeof(g_msgs));
     int32_t off = 0;
     f.read((uint8_t *)&off, sizeof(off)); // optional tail; stays 0 for pre-offset files
+    uint8_t ru = 0;
+    f.read(&ru, 1); // optional tail: input layout (0 for older files)
     f.close();
     if (magic != kMsgMagic || n != sizeof(g_msgs) || cnt < 0 || cnt > kMaxMsgs || nxt < 0 || nxt >= kMaxMsgs)
         return;
     g_utcOffsetMin = off;
+    g_ruMode = ru != 0;
     g_msgCount = cnt;
     g_msgNext = nxt;
     uint32_t me = nodeDB ? nodeDB->getNodeNum() : 0;
@@ -608,6 +620,21 @@ void drawFooter(lgfx::LGFXBase *g, const char *hint)
     g->print(hint);
 }
 
+// Own battery as short text + colour ("87%", "64%+" charging, "USB" when none).
+void batteryText(char *out, size_t cap, uint16_t &col)
+{
+    if (powerStatus && powerStatus->getHasBattery()) {
+        int pct = powerStatus->getBatteryChargePercent();
+        if (pct > 100)
+            pct = 100;
+        snprintf(out, cap, "%d%%%s", pct, powerStatus->getIsCharging() ? "+" : "");
+        col = pct > 50 ? 0x07E0 : (pct > 20 ? 0xFFE0 : 0xF800);
+    } else {
+        snprintf(out, cap, "USB");
+        col = 0x9CD3;
+    }
+}
+
 // Delivery-status glyph for an outgoing message, drawn at the right of its line.
 void drawMsgStatus(lgfx::LGFXBase *g, int x, int y, uint8_t status)
 {
@@ -844,7 +871,9 @@ int lineWidthEmotes(lgfx::LGFXBase *g, const char *s)
 }
 
 // Draws a message-line string at (x,y) in `color`, blitting emoji bitmaps inline.
-void printLineEmotes(lgfx::LGFXBase *g, int x, int y, const char *s, uint16_t color)
+// emojiDy nudges the bitmaps down to sit on the text's visual band (the 9x15 font
+// keeps ~3px of ascender space, so a 16px emoji rides high without it).
+void printLineEmotes(lgfx::LGFXBase *g, int x, int y, const char *s, uint16_t color, int emojiDy = 0)
 {
     g->setFont(&cyrFont);
     g->setTextSize(1);
@@ -853,7 +882,7 @@ void printLineEmotes(lgfx::LGFXBase *g, int x, int y, const char *s, uint16_t co
         const graphics::Emote *em = nullptr;
         int elen = emoteMatch(s, &em);
         if (elen > 0 && em) {
-            g->drawXBitmap(cx, y + (17 - em->height) / 2, em->bitmap, em->width, em->height, color);
+            g->drawXBitmap(cx, y + (17 - em->height) / 2 + emojiDy, em->bitmap, em->width, em->height, color);
             cx += em->width + 2;
             s += elen;
         } else { // one non-emote UTF-8 char
@@ -1017,12 +1046,12 @@ void AdvUI::handleFromRadio(const meshtastic_FromRadio &fr)
     }
 }
 
-// Sends a text DM to a node and adds it to our own thread immediately (status
-// "sending"); the delivery ACK later flips it to "delivered" via ackMsg().
-void AdvUI::sendMessage(uint32_t to, const char *text)
+// Builds and transmits a text-DM packet (with PKI when the peer has a key) and
+// returns its packet id — shared by first sends and resends of failed messages.
+static uint32_t sendTextPacket(uint32_t to, const char *text)
 {
     if (!router || !service)
-        return;
+        return 0;
     meshtastic_MeshPacket *p = router->allocForSending();
     p->to = to;
     p->want_ack = true;
@@ -1044,7 +1073,16 @@ void AdvUI::sendMessage(uint32_t to, const char *text)
 
     uint32_t id = p->id;
     service->sendToMesh(p, RX_SRC_LOCAL, false);
+    return id;
+}
 
+// Sends a text DM to a node and adds it to our own thread immediately (status
+// "sending"); the delivery ACK later flips it to "delivered" via ackMsg().
+void AdvUI::sendMessage(uint32_t to, const char *text)
+{
+    uint32_t id = sendTextPacket(to, text);
+    if (!id)
+        return;
     uint32_t me = nodeDB ? nodeDB->getNodeNum() : 0;
     addMsg(me, to, 0, getTime(false), false, text, id, MSG_SENDING);
 }
@@ -1258,16 +1296,7 @@ void AdvUI::drawChats()
     g->setTextSize(1);
     char bbuf[10];
     uint16_t bcol;
-    if (powerStatus && powerStatus->getHasBattery()) {
-        int pct = powerStatus->getBatteryChargePercent();
-        if (pct > 100)
-            pct = 100;
-        snprintf(bbuf, sizeof(bbuf), "%d%%%s", pct, powerStatus->getIsCharging() ? "+" : "");
-        bcol = pct > 50 ? 0x07E0 : (pct > 20 ? 0xFFE0 : 0xF800);
-    } else {
-        snprintf(bbuf, sizeof(bbuf), "USB");
-        bcol = 0x9CD3;
-    }
+    batteryText(bbuf, sizeof(bbuf), bcol);
     g->setTextColor(0x07FF);
     g->setCursor(4, 3);
     g->print("Chats");
@@ -1407,20 +1436,13 @@ void AdvUI::drawNodeList()
 
     char bbuf[10];
     uint16_t bcol;
-    if (powerStatus && powerStatus->getHasBattery()) {
-        int pct = powerStatus->getBatteryChargePercent();
-        if (pct > 100)
-            pct = 100;
-        snprintf(bbuf, sizeof(bbuf), "%d%%%s", pct, powerStatus->getIsCharging() ? "+" : "");
-        bcol = pct > 50 ? 0x07E0 : (pct > 20 ? 0xFFE0 : 0xF800);
-    } else {
-        snprintf(bbuf, sizeof(bbuf), "USB");
-        bcol = 0x9CD3;
-    }
+    batteryText(bbuf, sizeof(bbuf), bcol);
 
     g->setTextColor(0x07FF); // cyan
     g->setCursor(4, 3);
-    g->printf("%u nodes", (unsigned)total);
+    // At MAX_NUM_NODES the DB is full and pinned there (new nodes evict old ones),
+    // so show "200+" to make the cap visible rather than a suspicious flat count.
+    g->printf("%u%s nodes", (unsigned)total, total >= (size_t)MAX_NUM_NODES ? "+" : "");
 
     int bw = g->textWidth(bbuf);
     g->setTextColor(bcol);
@@ -1570,13 +1592,17 @@ void AdvUI::drawNode()
     int bottom = (mode == MODE_COMPOSE) ? 112 : 122; // leave room for the compose bar
     int maxLines = (bottom - fy0) / lh;
     int matched[kMaxMsgs], mc = 0;
+    bool hasFailed = false; // any failed outgoing DM here -> offer ENTER resend
     for (int i = 0; i < g_msgCount; i++) {
         int idx = (g_msgCount == kMaxMsgs) ? (g_msgNext + i) % kMaxMsgs : i;
         bool match = isChan ? (g_msgs[idx].to == NODENUM_BROADCAST && g_msgs[idx].ch == selectedChannel)
                             : ((g_msgs[idx].from == selectedNum || g_msgs[idx].to == selectedNum) &&
                                g_msgs[idx].to != NODENUM_BROADCAST);
-        if (match)
+        if (match) {
             matched[mc++] = idx;
+            if (!isChan && g_msgs[idx].from == me && g_msgs[idx].status == MSG_FAILED)
+                hasFailed = true;
+        }
     }
     if (mc == 0) {
         g->setTextColor(0x630C);
@@ -1659,7 +1685,7 @@ void AdvUI::drawNode()
                 cx += g->textWidth(d.text);
                 d.text[d.timeLen] = save;
             }
-            printLineEmotes(g, cx, y, d.text + d.timeLen, d.color); // message text + inline emoji
+            printLineEmotes(g, cx, y, d.text + d.timeLen, d.color, 2); // inline emoji, nudged onto the text band
             if (d.last && d.out) {
                 if (d.status == MSG_FAILED) {
                     g->setFont(&lgfx::fonts::Font0); // red error name at the right
@@ -1703,11 +1729,17 @@ void AdvUI::drawNode()
         g->fillRect(216, 116, 24, 13, 0x0000); // input-mode badge (Fn+L toggles)
         g->setFont(&lgfx::fonts::Font0);
         g->setTextSize(1);
-        g->setTextColor(ruMode ? 0x07FF : 0x630C);
+        g->setTextColor(g_ruMode ? 0x07FF : 0x630C);
         g->setCursor(220, 119);
-        g->print(ruMode ? "RU" : "EN");
+        g->print(g_ruMode ? "RU" : "EN");
     } else {
-        drawFooter(g, "type reply  Tab emoji  Fn+L RU/EN");
+        drawFooter(g, hasFailed ? "ENTER resend  Tab emoji" : "type reply  Tab emoji  Fn+L");
+        char bb[10];
+        uint16_t bc;
+        batteryText(bb, sizeof(bb), bc); // own battery at the right of the footer
+        g->setTextColor(bc);
+        g->setCursor(238 - g->textWidth(bb), 126);
+        g->print(bb);
     }
 
     if (haveCanvas)
@@ -2203,8 +2235,9 @@ void AdvUI::handleKey(char ch)
     }
 
     if (c == AdvKeyboard::kLang) { // Fn+L: toggle transliterated Cyrillic input
-        ruMode = !ruMode;
+        g_ruMode = !g_ruMode;
         pendingLat = 0;
+        g_msgsDirty = true; // the layout choice is persisted with the message file
         return;
     }
 
@@ -2225,7 +2258,7 @@ void AdvUI::handleKey(char ch)
                 if (nameLen)
                     nameBuf[--nameLen] = 0;
             }
-        } else if (ruMode && !numeric && editTarget < 20 && printable && nameLen + 2 < sizeof(nameBuf)) {
+        } else if (g_ruMode && !numeric && editTarget < 20 && printable && nameLen + 2 < sizeof(nameBuf)) {
             translitFeed(nameBuf, nameLen, sizeof(nameBuf), c, pendingLat); // WiFi/MQTT fields stay Latin
         } else if (printable && nameLen < maxLen && (!numeric || (c >= '0' && c <= '9') || c == '.')) {
             nameBuf[nameLen++] = c;
@@ -2354,12 +2387,34 @@ void AdvUI::handleKey(char ch)
 
     if (mode == MODE_NODE) {
         if (esc || bksp) {
+            if (g_msgsDirty) { // flush read-state now — a reset right after would lose it
+                saveMsgs();
+                g_msgsDirty = false;
+                g_lastSaveMs = millis();
+            }
             mode = nodeReturn;
         } else if (up) {
             chatScroll++; // older; drawNode clamps to the top of the thread
         } else if (down) {
             if (chatScroll > 0)
                 chatScroll--; // back toward the newest
+        } else if (enter && selectedChannel < 0) { // resend the newest failed DM in place
+            uint32_t me = nodeDB ? nodeDB->getNodeNum() : 0;
+            for (int i = g_msgCount - 1; i >= 0; i--) {
+                int idx = (g_msgCount == kMaxMsgs) ? (g_msgNext + i) % kMaxMsgs : i;
+                Msg &m = g_msgs[idx];
+                if (m.from == me && m.to == selectedNum && m.status == MSG_FAILED) {
+                    uint32_t id = sendTextPacket(selectedNum, m.text);
+                    if (id) {
+                        m.id = id; // the new ACK will find it by this id
+                        m.status = MSG_SENDING;
+                        m.err = 0;
+                        m.rxTime = getTime(false);
+                        g_msgsDirty = true;
+                    }
+                    break;
+                }
+            }
         } else if (tab) {
             msgLen = 0; // start a fresh reply built from the picked emoji
             msgBuf[0] = 0;
@@ -2372,7 +2427,7 @@ void AdvUI::handleKey(char ch)
             msgBuf[0] = 0;  // start composing a reply to this node
             msgLen = 0;
             pendingLat = 0;
-            if (ruMode)
+            if (g_ruMode)
                 translitFeed(msgBuf, msgLen, sizeof(msgBuf), c, pendingLat);
             else {
                 msgBuf[msgLen++] = c;
@@ -2435,7 +2490,7 @@ void AdvUI::handleKey(char ch)
                 msgBuf[--msgLen] = 0; // drop UTF-8 continuation bytes, then the lead byte
             if (msgLen)
                 msgBuf[--msgLen] = 0;
-        } else if (ruMode && printable && msgLen + 2 < sizeof(msgBuf)) {
+        } else if (g_ruMode && printable && msgLen + 2 < sizeof(msgBuf)) {
             translitFeed(msgBuf, msgLen, sizeof(msgBuf), c, pendingLat);
         } else if (printable && msgLen < sizeof(msgBuf) - 1) {
             msgBuf[msgLen++] = c;

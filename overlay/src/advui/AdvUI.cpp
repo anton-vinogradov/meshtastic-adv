@@ -685,16 +685,6 @@ void drawFooter(lgfx::LGFXBase *g, const char *hint)
     g->print(hint);
 }
 
-// Short name of a node for compact labels (reaction lines), "!xxxx" when unknown.
-void shortNameOf(uint32_t num, char *out, size_t cap)
-{
-    meshtastic_NodeInfoLite *n = nodeDB ? nodeDB->getMeshNode(num) : nullptr;
-    if (n && n->short_name[0])
-        snprintf(out, cap, "%s", n->short_name);
-    else
-        snprintf(out, cap, "%04x", (unsigned)(num & 0xFFFF));
-}
-
 // Own battery as short text + colour ("87%", "64%+" charging, "USB" when none).
 void batteryText(char *out, size_t cap, uint16_t &col)
 {
@@ -990,6 +980,53 @@ void utf8Copy(char *out, const char *s, int maxBytes)
     }
     memcpy(out, s, n);
     out[n] = 0;
+}
+
+// Strips codepoints we can't actually draw (anything beyond ASCII, Cyrillic and the
+// stock emoji bitmaps) — the 9x15 font renders those as boxes. In place.
+void sanitizeDisplay(char *s)
+{
+    char out[32];
+    int o = 0;
+    const char *p = s;
+    while (*p && o < (int)sizeof(out) - 5) {
+        int el = emoteMatch(p, nullptr);
+        if (el > 0) { // a stock emote: rendered as a bitmap
+            memcpy(out + o, p, el);
+            o += el;
+            p += el;
+            continue;
+        }
+        int len = utf8Len((unsigned char)*p);
+        bool ok = false;
+        if (len == 1) {
+            ok = (unsigned char)*p >= 0x20 && (unsigned char)*p < 0x7F;
+        } else if (len == 2) { // the font also covers Cyrillic
+            uint32_t cp = (((unsigned char)p[0] & 0x1F) << 6) | ((unsigned char)p[1] & 0x3F);
+            ok = cp >= 0x400 && cp <= 0x45F;
+        }
+        if (ok) {
+            memcpy(out + o, p, len);
+            o += len;
+        }
+        p += len;
+    }
+    out[o] = 0;
+    strcpy(s, out);
+}
+
+// Short name of a node for compact labels (channel senders, reaction lines);
+// falls back to the node-number tail when unknown or nothing drawable remains.
+void shortNameOf(uint32_t num, char *out, size_t cap)
+{
+    meshtastic_NodeInfoLite *n = nodeDB ? nodeDB->getMeshNode(num) : nullptr;
+    if (n && n->short_name[0]) {
+        snprintf(out, cap, "%s", n->short_name);
+        sanitizeDisplay(out);
+        if (out[0])
+            return;
+    }
+    snprintf(out, cap, "%04x", (unsigned)(num & 0xFFFF));
 }
 
 } // namespace

@@ -137,16 +137,57 @@ void addMsg(uint32_t from, uint32_t to, uint8_t ch, uint32_t rxTime, bool unread
 }
 
 // Mark the sent message whose id matches an incoming ACK/routing response.
+// Skip MSG_IN: incoming messages now carry their sender's packet id (for reactions),
+// and a random id collision must not flip their status.
 void ackMsg(uint32_t reqId, uint8_t status, uint8_t err)
 {
     for (int i = 0; i < g_msgCount; i++)
-        if (g_msgs[i].id == reqId && g_msgs[i].id != 0) {
+        if (g_msgs[i].id == reqId && g_msgs[i].id != 0 && g_msgs[i].status != MSG_IN) {
             g_msgs[i].status = status;
             g_msgs[i].err = err;
             g_msgsDirty = true;
             return;
         }
 }
+
+// --- Reactions (tapback) --------------------------------------------------------
+// A reaction is a TEXT_MESSAGE_APP packet with emoji=1 and reply_id = the target
+// message's packet id (same wire format the phone apps use). We keep them in their
+// own small ring, attached to messages by id at render time.
+struct Reaction {
+    uint32_t msgId; // packet id of the message reacted to
+    uint32_t from;
+    char label[9]; // UTF-8 emoji sequence
+};
+constexpr int kMaxReacts = 32;
+Reaction g_reacts[kMaxReacts];
+int g_reactCount = 0;
+int g_reactNext = 0;
+
+void addReaction(uint32_t msgId, uint32_t from, const char *label)
+{
+    LOG_INFO("advui: reaction msgId=0x%08x from=0x%08x %s", (unsigned)msgId, (unsigned)from, label);
+    for (int i = 0; i < g_reactCount; i++)
+        if (g_reacts[i].msgId == msgId && g_reacts[i].from == from) { // replace their previous one
+            strncpy(g_reacts[i].label, label, sizeof(g_reacts[i].label) - 1);
+            g_reacts[i].label[sizeof(g_reacts[i].label) - 1] = 0;
+            g_msgsDirty = true;
+            return;
+        }
+    Reaction &r = g_reacts[g_reactNext];
+    r.msgId = msgId;
+    r.from = from;
+    strncpy(r.label, label, sizeof(r.label) - 1);
+    r.label[sizeof(r.label) - 1] = 0;
+    g_reactNext = (g_reactNext + 1) % kMaxReacts;
+    if (g_reactCount < kMaxReacts)
+        g_reactCount++;
+    g_msgsDirty = true;
+}
+
+// The quick-reaction strip (labels must exist in graphics::emotes[]).
+const char *kQuickReacts[6] = {"\U0001F44D", "\U0001F44E", "\U00002764\U0000FE0F",
+                               "\U0001F602", "\U00002753", "\U0001F525"};
 
 int unreadCount()
 {
@@ -253,6 +294,10 @@ void saveMsgs()
     f.write((const uint8_t *)&g_utcOffsetMin, sizeof(g_utcOffsetMin)); // optional tail
     uint8_t ru = g_ruMode ? 1 : 0;
     f.write(&ru, 1); // optional tail: input layout
+    uint8_t rc = (uint8_t)g_reactCount, rn = (uint8_t)g_reactNext;
+    f.write(&rc, 1); // optional tail: reactions ring
+    f.write(&rn, 1);
+    f.write((const uint8_t *)g_reacts, sizeof(g_reacts));
     f.close();
 }
 
@@ -272,11 +317,21 @@ void loadMsgs()
     f.read((uint8_t *)&off, sizeof(off)); // optional tail; stays 0 for pre-offset files
     uint8_t ru = 0;
     f.read(&ru, 1); // optional tail: input layout (0 for older files)
+    uint8_t rc = 0, rn = 0;
+    static Reaction tmpR[kMaxReacts];
+    f.read(&rc, 1); // optional tail: reactions ring
+    f.read(&rn, 1);
+    size_t rBytes = f.read((uint8_t *)tmpR, sizeof(tmpR));
     f.close();
     if (magic != kMsgMagic || n != sizeof(g_msgs) || cnt < 0 || cnt > kMaxMsgs || nxt < 0 || nxt >= kMaxMsgs)
         return;
     g_utcOffsetMin = off;
     g_ruMode = ru != 0;
+    if (rBytes == sizeof(tmpR) && rc <= kMaxReacts && rn < kMaxReacts) {
+        memcpy(g_reacts, tmpR, sizeof(g_reacts));
+        g_reactCount = rc;
+        g_reactNext = rn;
+    }
     g_msgCount = cnt;
     g_msgNext = nxt;
     uint32_t me = nodeDB ? nodeDB->getNodeNum() : 0;
@@ -618,6 +673,16 @@ void drawFooter(lgfx::LGFXBase *g, const char *hint)
     g->setTextColor(0x630c); // dim gray
     g->setCursor(4, 126);
     g->print(hint);
+}
+
+// Short name of a node for compact labels (reaction lines), "!xxxx" when unknown.
+void shortNameOf(uint32_t num, char *out, size_t cap)
+{
+    meshtastic_NodeInfoLite *n = nodeDB ? nodeDB->getMeshNode(num) : nullptr;
+    if (n && n->short_name[0])
+        snprintf(out, cap, "%s", n->short_name);
+    else
+        snprintf(out, cap, "%04x", (unsigned)(num & 0xFFFF));
 }
 
 // Own battery as short text + colour ("87%", "64%+" charging, "USB" when none).
@@ -1026,8 +1091,21 @@ void AdvUI::handleFromRadio(const meshtastic_FromRadio &fr)
     text[n] = 0;
 
     uint32_t me = nodeDB ? nodeDB->getNodeNum() : 0;
+
+    // A tapback: attach to the target message instead of adding a bubble. Quiet by
+    // design (no unread/beep) — just a LED blink so it isn't missed entirely.
+    if (p.decoded.emoji && p.decoded.reply_id) {
+        if (p.from != me) {
+            addReaction(p.decoded.reply_id, p.from, text);
+#ifdef HAS_NEOPIXEL
+            flashLed(60, 40, 90); // soft violet: a reaction, not a message
+#endif
+        }
+        return;
+    }
+
     bool unread = p.from != me && (p.to == me || p.to == NODENUM_BROADCAST); // DM to us, or a channel broadcast
-    addMsg(p.from, p.to, p.channel, p.rx_time, unread, text, 0, MSG_IN);
+    addMsg(p.from, p.to, p.channel, p.rx_time, unread, text, p.id, MSG_IN); // keep the id: reactions reference it
 
     if (unread) {
         bool fav = (p.to == NODENUM_BROADCAST) ? chanFav(p.channel) : (nodeDB && nodeDB->isFavorite(p.from));
@@ -1046,15 +1124,14 @@ void AdvUI::handleFromRadio(const meshtastic_FromRadio &fr)
     }
 }
 
-// Builds and transmits a text-DM packet (with PKI when the peer has a key) and
-// returns its packet id — shared by first sends and resends of failed messages.
-static uint32_t sendTextPacket(uint32_t to, const char *text)
+// Builds and transmits a text packet (DM with PKI, or channel broadcast) and returns
+// its packet id. replyId + asEmoji turn it into a reaction (tapback) on that message.
+static uint32_t sendTextPacket(uint32_t to, const char *text, int chIdx = 0, uint32_t replyId = 0, bool asEmoji = false)
 {
     if (!router || !service)
         return 0;
     meshtastic_MeshPacket *p = router->allocForSending();
     p->to = to;
-    p->want_ack = true;
     p->decoded.portnum = meshtastic_PortNum_TEXT_MESSAGE_APP;
     p->decoded.dest = to;
     size_t n = strlen(text);
@@ -1062,13 +1139,24 @@ static uint32_t sendTextPacket(uint32_t to, const char *text)
         n = sizeof(p->decoded.payload.bytes);
     memcpy(p->decoded.payload.bytes, text, n);
     p->decoded.payload.size = n;
+    if (replyId) {
+        p->decoded.reply_id = replyId;
+        if (asEmoji)
+            p->decoded.emoji = 1;
+    }
 
-    // A DM to a key-capable node must be PKI-encrypted (stock forces this); without
-    // it the recipient on a modern mesh won't accept/ack the message.
-    meshtastic_NodeInfoLite *node = nodeDB ? nodeDB->getMeshNode(to) : nullptr;
-    if (node && node->public_key.size == 32) {
-        p->pki_encrypted = true;
-        p->channel = 0;
+    if (to == NODENUM_BROADCAST) {
+        p->channel = chIdx;
+        p->want_ack = false; // broadcasts aren't acked
+    } else {
+        p->want_ack = true;
+        // A DM to a key-capable node must be PKI-encrypted (stock forces this); without
+        // it the recipient on a modern mesh won't accept/ack the message.
+        meshtastic_NodeInfoLite *node = nodeDB ? nodeDB->getMeshNode(to) : nullptr;
+        if (node && node->public_key.size == 32) {
+            p->pki_encrypted = true;
+            p->channel = 0;
+        }
     }
 
     uint32_t id = p->id;
@@ -1090,22 +1178,29 @@ void AdvUI::sendMessage(uint32_t to, const char *text)
 // Sends a text broadcast to a channel and adds it to that channel's thread.
 void AdvUI::sendChannel(int chIdx, const char *text)
 {
-    if (!router || !service)
+    uint32_t id = sendTextPacket(NODENUM_BROADCAST, text, chIdx);
+    if (!id)
         return;
-    meshtastic_MeshPacket *p = router->allocForSending();
-    p->to = NODENUM_BROADCAST;
-    p->channel = chIdx;
-    p->want_ack = false; // broadcasts aren't acked
-    p->decoded.portnum = meshtastic_PortNum_TEXT_MESSAGE_APP;
-    size_t n = strlen(text);
-    if (n > sizeof(p->decoded.payload.bytes))
-        n = sizeof(p->decoded.payload.bytes);
-    memcpy(p->decoded.payload.bytes, text, n);
-    p->decoded.payload.size = n;
-    service->sendToMesh(p, RX_SRC_LOCAL, false);
-
     uint32_t me = nodeDB ? nodeDB->getNodeNum() : 0;
-    addMsg(me, NODENUM_BROADCAST, chIdx, getTime(false), false, text, 0, MSG_SENT); // sent to channel (no ack)
+    addMsg(me, NODENUM_BROADCAST, chIdx, getTime(false), false, text, id, MSG_SENT); // sent to channel (no ack)
+}
+
+// Sends a tapback on the message at ring index msgIdx and records it locally.
+void AdvUI::sendReaction(int msgIdx, const char *label)
+{
+    if (msgIdx < 0 || msgIdx >= kMaxMsgs)
+        return;
+    Msg &m = g_msgs[msgIdx];
+    if (!m.id) {
+        LOG_INFO("advui: can't react - message has no packet id (pre-update history)");
+        return;
+    }
+    uint32_t id = (selectedChannel >= 0) ? sendTextPacket(NODENUM_BROADCAST, label, selectedChannel, m.id, true)
+                                         : sendTextPacket(selectedNum, label, 0, m.id, true);
+    if (!id)
+        return;
+    uint32_t me = nodeDB ? nodeDB->getNodeNum() : 0;
+    addReaction(m.id, me, label);
 }
 
 // Fills out[] with node-DB indices matching query (all if query is null/empty),
@@ -1194,11 +1289,29 @@ int AdvUI::firstUnreadIdx()
     return -1;
 }
 
+// Ring index of the back-th newest message in the open thread (0 = newest), or -1.
+int AdvUI::matchedFromNewest(int back)
+{
+    bool isChan = selectedChannel >= 0;
+    int seen = 0;
+    for (int i = g_msgCount - 1; i >= 0; i--) {
+        int idx = (g_msgCount == kMaxMsgs) ? (g_msgNext + i) % kMaxMsgs : i;
+        Msg &m = g_msgs[idx];
+        bool match = isChan ? (m.to == NODENUM_BROADCAST && m.ch == selectedChannel)
+                            : ((m.from == selectedNum || m.to == selectedNum) && m.to != NODENUM_BROADCAST);
+        if (match && seen++ == back)
+            return idx;
+    }
+    return -1;
+}
+
 void AdvUI::openEntry(int s)
 {
     nodeReturn = (mode == MODE_PICKER) ? MODE_PICKER : MODE_NODES;
     chatScroll = 0;          // default: pinned to the newest message
     chatAnchorMsgIdx = -1;
+    reactSel = -1;
+    reactStrip = false;
     if (s < chanCount) {
         selectedChannel = chanList[s];
         chatAnchorMsgIdx = firstUnreadIdx(); // capture the first unread before clearing it
@@ -1273,6 +1386,8 @@ void AdvUI::openConv(int i)
     nodeReturn = MODE_CHATS;
     chatScroll = 0;
     chatAnchorMsgIdx = -1;
+    reactSel = -1;
+    reactStrip = false;
     if (conv[i].isChan) {
         selectedChannel = conv[i].ch;
         chatAnchorMsgIdx = firstUnreadIdx();
@@ -1627,10 +1742,26 @@ void AdvUI::drawNode()
         static DLine dl[80]; // single-threaded UI: static keeps it off the stack
         int dlCount = 0;
         int anchorLine = -1; // dl index of the first unread message's first line (on open)
+        int selMsgIdx = reactSel >= 0 ? matchedFromNewest(reactSel) : -1;
+        int selFirst = -1, selLast = -1; // dl range of the react-selected message
+        auto pushLine = [&]() -> DLine & {
+            if (dlCount >= (int)(sizeof(dl) / sizeof(dl[0]))) { // drop the oldest line
+                memmove(dl, dl + 1, sizeof(dl) - sizeof(dl[0]));
+                dlCount--;
+                if (anchorLine >= 0)
+                    anchorLine--; // trackers shift up with the dropped line
+                if (selFirst >= 0)
+                    selFirst--;
+                if (selLast >= 0)
+                    selLast--;
+            }
+            return dl[dlCount++];
+        };
         for (int i = 0; i < mc; i++) {
             Msg &m = g_msgs[matched[i]];
             bool out = (m.from == me);
             bool failed = out && m.status == MSG_FAILED;
+            bool isSel = (selMsgIdx >= 0 && matched[i] == selMsgIdx);
             int wrapW = !out ? 232 : (failed ? 162 : 214); // reserve room for the marker
             char tpre[8];
             msgTimePrefix(m.rxTime, tzOff, tpre, sizeof(tpre)); // "HH:MM " before the arrow
@@ -1642,13 +1773,7 @@ void AdvUI::drawNode()
             const char *p = full;
             bool first = true;
             do {
-                if (dlCount >= (int)(sizeof(dl) / sizeof(dl[0]))) { // drop the oldest line
-                    memmove(dl, dl + 1, sizeof(dl) - sizeof(dl[0]));
-                    dlCount--;
-                    if (anchorLine >= 0)
-                        anchorLine--; // the anchor shifted up with the dropped line
-                }
-                DLine &d = dl[dlCount++];
+                DLine &d = pushLine();
                 p += wrapLine(g, p, wrapW, d.text, sizeof(d.text));
                 d.color = out ? 0x07FF : 0xFFFF; // outgoing cyan, incoming white
                 d.out = out;
@@ -1656,8 +1781,36 @@ void AdvUI::drawNode()
                 d.err = m.err;
                 d.timeLen = first ? tlen : 0; // time sits only on the first line
                 d.last = (*p == 0);
+                if (isSel) {
+                    if (selFirst < 0)
+                        selFirst = dlCount - 1;
+                    selLast = dlCount - 1;
+                }
                 first = false;
             } while (*p);
+            if (m.id && g_reactCount) { // tapbacks attached to this message, one dim line
+                char rl[38];
+                int rp = 0;
+                for (int r = 0; r < g_reactCount && rp < (int)sizeof(rl) - 14; r++) {
+                    if (g_reacts[r].msgId != m.id)
+                        continue;
+                    char sn[8];
+                    shortNameOf(g_reacts[r].from, sn, sizeof(sn));
+                    rp += snprintf(rl + rp, sizeof(rl) - rp, "%s%s %s", rp ? "  " : "", g_reacts[r].label, sn);
+                }
+                if (rp > 0) {
+                    DLine &d = pushLine();
+                    snprintf(d.text, sizeof(d.text), "    %s", rl);
+                    d.color = 0x8410; // dim: metadata, not a message
+                    d.out = false;
+                    d.status = 0;
+                    d.err = 0;
+                    d.timeLen = 0;
+                    d.last = false;
+                    if (isSel)
+                        selLast = dlCount - 1;
+                }
+            }
         }
         // chatScroll counts lines scrolled up from the bottom (0 = pinned to newest).
         int maxScroll = dlCount > maxLines ? dlCount - maxLines : 0;
@@ -1669,10 +1822,23 @@ void AdvUI::drawNode()
             chatScroll = maxScroll;
         if (chatScroll < 0)
             chatScroll = 0;
+        if (reactSel >= 0 && selFirst >= 0) { // keep the react-selected message in view
+            int vis0 = maxScroll - chatScroll;
+            if (selFirst < vis0)
+                chatScroll = maxScroll - selFirst;
+            else if (selLast >= vis0 + maxLines)
+                chatScroll = maxScroll - (selLast - maxLines + 1);
+            if (chatScroll > maxScroll)
+                chatScroll = maxScroll;
+            if (chatScroll < 0)
+                chatScroll = 0;
+        }
         int startL = maxScroll - chatScroll;
         int y = fy0;
         for (int i = startL; i < startL + maxLines && i < dlCount; i++) {
             DLine &d = dl[i];
+            if (selFirst >= 0 && i >= selFirst && i <= selLast)
+                g->fillRect(0, y - 1, 236, lh, 0x2945); // react-mode selection band
             int cx = 4;
             if (d.timeLen) { // dim the "HH:MM " prefix (ASCII, no emoji)
                 g->setFont(&cyrFont);
@@ -1733,7 +1899,29 @@ void AdvUI::drawNode()
         g->setCursor(220, 119);
         g->print(g_ruMode ? "RU" : "EN");
     } else {
-        drawFooter(g, hasFailed ? "ENTER resend  Tab emoji" : "type reply  Tab emoji  Fn+L");
+        if (reactStrip) { // quick-reaction strip over the bottom of the feed
+            const int sy = 88;
+            g->fillRect(8, sy, 224, 26, 0x0000);
+            g->drawRect(8, sy, 224, 26, 0x07FF);
+            for (int i = 0; i < 6; i++) {
+                int x = 20 + i * 35;
+                if (i == reactPick)
+                    g->fillRect(x - 5, sy + 3, 26, 20, 0x2945);
+                const graphics::Emote *em = nullptr;
+                if (emoteMatch(kQuickReacts[i], &em) > 0 && em)
+                    g->drawXBitmap(x, sy + 5, em->bitmap, em->width, em->height, 0xFFFF);
+            }
+        }
+        const char *hint;
+        if (reactStrip) {
+            hint = "</> pick  ENTER send  ESC";
+        } else if (reactSel >= 0) {
+            int smi = matchedFromNewest(reactSel); // old history has no packet id to react to
+            hint = (smi >= 0 && g_msgs[smi].id == 0) ? "old msg: can't react  up/dn  ESC" : "up/dn msg  ENTER react  ESC";
+        } else {
+            hint = hasFailed ? "ENTER resend  Tab emoji  > react" : "type reply  Tab emoji  > react";
+        }
+        drawFooter(g, hint);
         char bb[10];
         uint16_t bc;
         batteryText(bb, sizeof(bb), bc); // own battery at the right of the footer
@@ -2101,6 +2289,9 @@ void AdvUI::runDemoDump()
 
     static Msg backup[kMaxMsgs];
     memcpy(backup, g_msgs, sizeof(g_msgs));
+    static Reaction rBackup[kMaxReacts];
+    memcpy(rBackup, g_reacts, sizeof(g_reacts));
+    int brC = g_reactCount, brN = g_reactNext;
     int bCount = g_msgCount, bNext = g_msgNext;
     bool bDirty = g_msgsDirty;
     Mode bMode = mode;
@@ -2129,14 +2320,25 @@ void AdvUI::runDemoDump()
     // a DM: mostly English with one Cyrillic line to showcase non-Latin text
     addMsg(peer, me, 0, t, false, "Hey, you on the mesh?", 0, MSG_IN);
     addMsg(me, peer, 0, t + 60, false, "Yep, 5/5 \U0001F44D", 1, MSG_DELIVERED);
-    addMsg(peer, me, 0, t + 120, false, "Отлично, погнали \U0001F525", 0, MSG_IN); // Cyrillic showcase
+    addMsg(peer, me, 0, t + 120, false, "Отлично, погнали \U0001F525", 3, MSG_IN); // Cyrillic showcase
     addMsg(me, peer, 0, t + 180, false, "On my way \U0001F642", 2, MSG_SENDING);
+    g_reactCount = 0;
+    g_reactNext = 0;
+    addReaction(1, peer, "\U0001F44D"); // their tapback on our "Yep, 5/5"
     selectedChannel = -1;
     selectedNum = peer;
     chatScroll = 0;
     mode = MODE_NODE;
     drawNode();
     screenshot("chat");
+
+    reactSel = 1; // react mode: strip open on the Cyrillic message
+    reactStrip = true;
+    reactPick = 0;
+    drawNode();
+    screenshot("react");
+    reactSel = -1;
+    reactStrip = false;
 
     sel = 0;
     scrollTop = 0;
@@ -2186,6 +2388,9 @@ void AdvUI::runDemoDump()
     Serial.flush();
 
     memcpy(g_msgs, backup, sizeof(g_msgs)); // put the real conversation ring back
+    memcpy(g_reacts, rBackup, sizeof(g_reacts));
+    g_reactCount = brC;
+    g_reactNext = brN;
     g_msgCount = bCount;
     g_msgNext = bNext;
     g_msgsDirty = bDirty;
@@ -2385,6 +2590,46 @@ void AdvUI::handleKey(char ch)
     if (mode == MODE_REBOOT)
         return; // rebooting shortly; ignore input
 
+    if (mode == MODE_NODE && reactStrip) { // quick-reaction strip is open
+        if (esc) {
+            reactStrip = false;
+        } else if (left) {
+            if (reactPick > 0)
+                reactPick--;
+        } else if (right) {
+            if (reactPick < 5)
+                reactPick++;
+        } else if (enter) {
+            int idx = matchedFromNewest(reactSel);
+            if (idx >= 0)
+                sendReaction(idx, kQuickReacts[reactPick]);
+            reactStrip = false;
+            reactSel = -1;
+        }
+        return;
+    }
+
+    if (mode == MODE_NODE && reactSel >= 0) { // picking which message to react to
+        if (esc) {
+            reactSel = -1;
+        } else if (up) {
+            if (matchedFromNewest(reactSel + 1) >= 0)
+                reactSel++; // older
+        } else if (down) {
+            if (reactSel > 0)
+                reactSel--;
+            else
+                reactSel = -1; // stepping past the newest exits react mode
+        } else if (enter) {
+            int smi = matchedFromNewest(reactSel);
+            if (smi >= 0 && g_msgs[smi].id != 0) { // old history has no id to reference
+                reactStrip = true;
+                reactPick = 0;
+            }
+        }
+        return;
+    }
+
     if (mode == MODE_NODE) {
         if (esc || bksp) {
             if (g_msgsDirty) { // flush read-state now — a reset right after would lose it
@@ -2393,6 +2638,9 @@ void AdvUI::handleKey(char ch)
                 g_lastSaveMs = millis();
             }
             mode = nodeReturn;
+        } else if (right) { // enter react mode on the newest message
+            if (matchedFromNewest(0) >= 0)
+                reactSel = 0;
         } else if (up) {
             chatScroll++; // older; drawNode clamps to the top of the thread
         } else if (down) {

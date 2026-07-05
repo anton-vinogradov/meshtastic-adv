@@ -791,6 +791,20 @@ void printLineEmotes(lgfx::LGFXBase *g, int x, int y, const char *s, uint16_t co
     }
 }
 
+// Copies at most `maxBytes` of s into out without splitting a UTF-8 sequence.
+void utf8Copy(char *out, const char *s, int maxBytes)
+{
+    int n = 0;
+    while (s[n]) {
+        int l = utf8Len((unsigned char)s[n]);
+        if (n + l > maxBytes)
+            break;
+        n += l;
+    }
+    memcpy(out, s, n);
+    out[n] = 0;
+}
+
 } // namespace
 
 AdvUI::AdvUI() : concurrency::OSThread("advui") {}
@@ -1098,6 +1112,206 @@ void AdvUI::favEntry(int s, bool on)
     }
 }
 
+// Collects one entry per conversation (channel or node DM) from the message ring,
+// keeping the most recent message of each, newest conversation first.
+void AdvUI::buildConversations()
+{
+    convCount = 0;
+    uint32_t me = nodeDB ? nodeDB->getNodeNum() : 0;
+    for (int i = 0; i < g_msgCount; i++) {
+        int idx = (g_msgCount == kMaxMsgs) ? (g_msgNext + i) % kMaxMsgs : i;
+        Msg &m = g_msgs[idx];
+        bool isChan = (m.to == NODENUM_BROADCAST);
+        uint32_t node = isChan ? 0 : (m.from == me ? m.to : m.from);
+        int found = -1;
+        for (int j = 0; j < convCount; j++)
+            if (conv[j].isChan == isChan && (isChan ? conv[j].ch == m.ch : conv[j].node == node)) {
+                found = j;
+                break;
+            }
+        if (found < 0) {
+            if (convCount >= kMaxConv)
+                continue;
+            found = convCount++;
+            conv[found].isChan = isChan;
+            conv[found].ch = m.ch;
+            conv[found].node = node;
+        }
+        conv[found].lastIdx = idx;
+        conv[found].order = i; // arrival order; higher = more recent
+    }
+    std::sort(conv, conv + convCount, [](const Conv &a, const Conv &b) { return a.order > b.order; });
+    if (sel >= convCount)
+        sel = convCount ? convCount - 1 : 0;
+    if (sel < 0)
+        sel = 0;
+}
+
+void AdvUI::openConv(int i)
+{
+    if (i < 0 || i >= convCount)
+        return;
+    nodeReturn = MODE_CHATS;
+    chatScroll = 0;
+    chatAnchorMsgIdx = -1;
+    if (conv[i].isChan) {
+        selectedChannel = conv[i].ch;
+        chatAnchorMsgIdx = firstUnreadIdx();
+        markReadChannel(selectedChannel);
+    } else {
+        selectedChannel = -1;
+        selectedNum = conv[i].node;
+        chatAnchorMsgIdx = firstUnreadIdx();
+    }
+    mode = MODE_NODE;
+}
+
+// Home screen: recent conversations, newest first, with a last-message preview.
+void AdvUI::drawChats()
+{
+    lgfx::LGFXBase *g = haveCanvas ? static_cast<lgfx::LGFXBase *>(&canvas) : static_cast<lgfx::LGFXBase *>(&display);
+
+    g->fillScreen(0x0000);
+
+    g->setFont(&lgfx::fonts::Font0);
+    g->setTextSize(1);
+    char bbuf[10];
+    uint16_t bcol;
+    if (powerStatus && powerStatus->getHasBattery()) {
+        int pct = powerStatus->getBatteryChargePercent();
+        if (pct > 100)
+            pct = 100;
+        snprintf(bbuf, sizeof(bbuf), "%d%%%s", pct, powerStatus->getIsCharging() ? "+" : "");
+        bcol = pct > 50 ? 0x07E0 : (pct > 20 ? 0xFFE0 : 0xF800);
+    } else {
+        snprintf(bbuf, sizeof(bbuf), "USB");
+        bcol = 0x9CD3;
+    }
+    g->setTextColor(0x07FF);
+    g->setCursor(4, 3);
+    g->print("Chats");
+    int bw = g->textWidth(bbuf);
+    g->setTextColor(bcol);
+    g->setCursor(238 - bw, 3);
+    g->print(bbuf);
+    int uc = unreadCount();
+    if (uc > 0) {
+        char ub[12];
+        snprintf(ub, sizeof(ub), "%d new", uc);
+        int tw = g->textWidth(ub);
+        int px = 238 - bw - 8 - (tw + 6);
+        g->fillRoundRect(px, 2, tw + 6, 10, 2, 0xF800);
+        g->setTextColor(0xFFFF);
+        g->setCursor(px + 3, 3);
+        g->print(ub);
+    }
+    g->drawFastHLine(0, 13, 240, 0x39C7);
+
+    buildConversations();
+    uint32_t me = nodeDB ? nodeDB->getNodeNum() : 0;
+    int32_t tzOff = g_utcOffsetMin * 60;
+
+    if (convCount == 0) {
+        g->setFont(&lgfx::fonts::FreeSansBold9pt7b);
+        g->setTextSize(1);
+        g->setTextColor(0x630C);
+        g->setCursor(6, 50);
+        g->print("No chats yet");
+        g->setFont(&lgfx::fonts::Font0);
+        g->setTextColor(0x8410);
+        g->setCursor(6, 70);
+        g->print("type a name to find a node");
+        drawFooter(g, "type find   Tab: all nodes");
+        if (haveCanvas)
+            canvas.pushSprite(0, 0);
+        return;
+    }
+
+    const int top = 15, rowH = 26, maxRows = (124 - top) / rowH;
+    if (sel < scrollTop)
+        scrollTop = sel;
+    if (sel >= scrollTop + maxRows)
+        scrollTop = sel - maxRows + 1;
+    if (scrollTop < 0)
+        scrollTop = 0;
+
+    int y = top;
+    for (int r = 0; r < maxRows; r++) {
+        int i = scrollTop + r;
+        if (i >= convCount)
+            break;
+        Conv &c = conv[i];
+        Msg &m = g_msgs[c.lastIdx];
+        if (i == sel)
+            g->fillRect(0, y - 1, 240, rowH, 0x2945);
+        bool unread = c.isChan ? hasUnreadChannel(c.ch) : hasUnreadFrom(c.node);
+        bool fav = c.isChan ? chanFav(c.ch) : (nodeDB && nodeDB->isFavorite(c.node));
+
+        int nameX = 6;
+        if (unread) { // red envelope before the name
+            int ex = 5, ey = y + 3;
+            g->drawRect(ex, ey, 11, 8, 0xF800);
+            g->drawLine(ex, ey, ex + 5, ey + 4, 0xF800);
+            g->drawLine(ex + 10, ey, ex + 5, ey + 4, 0xF800);
+            nameX = 20;
+        }
+        // time (right, dim)
+        char tb[8];
+        msgTimePrefix(m.rxTime, tzOff, tb, sizeof(tb));
+        int tl = (int)strlen(tb);
+        if (tl && tb[tl - 1] == ' ')
+            tb[tl - 1] = 0;
+        g->setFont(&lgfx::fonts::Font0);
+        g->setTextSize(1);
+        int tw = tb[0] ? g->textWidth(tb) : 0;
+        if (tb[0]) {
+            g->setTextColor(0x8410);
+            g->setCursor(238 - tw, y + 2);
+            g->print(tb);
+        }
+        // name
+        char nm[40];
+        if (c.isChan) {
+            snprintf(nm, sizeof(nm), "#%s", channels.getName(c.ch));
+        } else {
+            meshtastic_NodeInfoLite *n = nodeDB ? nodeDB->getMeshNode(c.node) : nullptr;
+            const char *nn = n ? nodeName(n) : "";
+            if (nn[0])
+                snprintf(nm, sizeof(nm), "%s", nn);
+            else
+                snprintf(nm, sizeof(nm), "!%08x", (unsigned)c.node);
+        }
+        g->setFont(&lgfx::fonts::FreeSansBold9pt7b);
+        g->setTextSize(1);
+        fitWidth(g, nm, 236 - nameX - (tw ? tw + 6 : 0));
+        g->setTextColor(fav ? 0xFFE0 : (c.isChan ? 0x07FF : 0xFFFF));
+        g->setCursor(nameX, y);
+        g->print(nm);
+        // preview (second line): "> " for our own last message, inline emoji, truncated
+        char pv[80];
+        int pfx = (m.from == me) ? 2 : 0;
+        if (pfx) {
+            pv[0] = '>';
+            pv[1] = ' ';
+        }
+        utf8Copy(pv + pfx, m.text, (int)sizeof(pv) - pfx - 1);
+        g->setFont(&cyrFont);
+        g->setTextSize(1);
+        while (pv[0] && lineWidthEmotes(g, pv) > 230) { // trim to fit, whole codepoints
+            int k = (int)strlen(pv) - 1;
+            while (k > 0 && ((unsigned char)pv[k] & 0xC0) == 0x80)
+                k--;
+            pv[k] = 0;
+        }
+        printLineEmotes(g, 6, y + 14, pv, 0x9CD3);
+        y += rowH;
+    }
+    drawFooter(g, "ENTER open  type find  Tab nodes");
+
+    if (haveCanvas)
+        canvas.pushSprite(0, 0);
+}
+
 void AdvUI::drawNodeList()
 {
     lgfx::LGFXBase *g = haveCanvas ? static_cast<lgfx::LGFXBase *>(&canvas) : static_cast<lgfx::LGFXBase *>(&display);
@@ -1173,7 +1387,7 @@ void AdvUI::drawNodeList()
         y += rowH;
     }
 
-    drawFooter(g, "up/dn  </>fav  ENTER open  type find");
+    drawFooter(g, "</>fav  ENTER open  type find  ESC/Tab chats");
 
     if (haveCanvas)
         canvas.pushSprite(0, 0);
@@ -1714,6 +1928,12 @@ void AdvUI::runDemoDump()
     drawNode();
     screenshot("chat");
 
+    sel = 0;
+    scrollTop = 0;
+    mode = MODE_CHATS;
+    drawChats();
+    screenshot("chats");
+
     emojiSel = 0;
     mode = MODE_EMOJI;
     drawEmoji();
@@ -1985,10 +2205,64 @@ void AdvUI::handleKey(char ch)
         return;
     }
 
+    // Home: recent conversations. Typing opens node search; Tab switches to all nodes.
+    if (mode == MODE_CHATS) {
+        buildConversations();
+        if (up) {
+            if (sel > 0)
+                sel--;
+            return;
+        }
+        if (down) {
+            if (sel < convCount - 1)
+                sel++;
+            return;
+        }
+        if (enter) {
+            openConv(sel);
+            return;
+        }
+        if (left || right) { // favourite the conversation's channel / peer node
+            if (sel < convCount) {
+                Conv &c = conv[sel];
+                if (c.isChan) {
+                    if (left)
+                        g_favChannels |= (1u << c.ch);
+                    else
+                        g_favChannels &= ~(1u << c.ch);
+                    g_msgsDirty = true;
+                } else if (nodeDB) {
+                    nodeDB->set_favorite(left, c.node);
+                }
+            }
+            return;
+        }
+        if (tab) {
+            mode = MODE_NODES;
+            sel = 0;
+            scrollTop = 0;
+            return;
+        }
+        if (!printable)
+            return;
+        mode = MODE_PICKER; // a printable char: search all nodes
+        queryLen = 0;
+        query[0] = 0;
+        sel = 0;
+        scrollTop = 0;
+        // fall through to MODE_PICKER handling
+    }
+
     // Home node list: navigable directly (cursor + scroll); typing opens the filter.
     if (mode == MODE_NODES) {
         rebuildFiltered();
         int total = chanCount + filteredCount;
+        if (esc || tab) { // back to the chats home
+            mode = MODE_CHATS;
+            sel = 0;
+            scrollTop = 0;
+            return;
+        }
         if (up) {
             if (sel > 0)
                 sel--;
@@ -2022,7 +2296,7 @@ void AdvUI::handleKey(char ch)
 
     // MODE_PICKER
     if (esc) {
-        mode = MODE_NODES;
+        mode = MODE_CHATS;
         queryLen = 0;
         query[0] = 0;
         sel = 0;
@@ -2159,8 +2433,10 @@ int32_t AdvUI::runOnce()
         drawReboot();
     else if (mode == MODE_EMOJI)
         drawEmoji();
-    else
+    else if (mode == MODE_NODES)
         drawNodeList();
+    else
+        drawChats();
 
 #ifdef HAS_I2S
     if (g_beeping)

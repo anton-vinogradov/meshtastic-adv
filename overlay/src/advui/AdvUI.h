@@ -31,6 +31,7 @@ class AdvUI : public concurrency::OSThread
 
   private:
     enum Mode : uint8_t {
+        MODE_CHATS, // home: recent conversations with previews
         MODE_NODES,
         MODE_PICKER,
         MODE_NODE,
@@ -40,6 +41,14 @@ class AdvUI : public concurrency::OSThread
         MODE_PICKLIST,
         MODE_REBOOT,
         MODE_EMOJI
+    };
+
+    struct Conv {         // a recent conversation (a channel or a node DM)
+        bool isChan;
+        uint8_t ch;       // channel index (isChan)
+        uint32_t node;    // peer node num (!isChan)
+        int lastIdx;      // ring index of its most recent message
+        int order;        // arrival order of that message (higher = more recent)
     };
 
     void initHardware();
@@ -52,6 +61,9 @@ class AdvUI : public concurrency::OSThread
     void drawPickList();
     void drawReboot();
     void drawEmoji();
+    void drawChats();          // home: recent conversations
+    void buildConversations(); // fill conv[]/convCount, newest first
+    void openConv(int i);      // open conversation conv[i]
 #ifdef ADVUI_SCREENSHOT
     void screenshot(const char *name); // dump the current canvas over serial
     void runDemoDump();                // render each screen with sample data + dump, then reboot
@@ -75,7 +87,7 @@ class AdvUI : public concurrency::OSThread
     AdvKeyboard kb;
     lgfx::LGFX_Sprite canvas{&display}; // off-screen frame buffer
 
-    Mode mode = MODE_NODES;
+    Mode mode = MODE_CHATS;
     char query[24] = {0};
     uint8_t queryLen = 0;
 
@@ -84,7 +96,10 @@ class AdvUI : public concurrency::OSThread
     int filteredCount = 0;
     uint8_t chanList[8];  // enabled channel indices shown above the nodes
     int chanCount = 0;
-    int sel = 0;          // cursor into the combined list (channels then filtered nodes)
+    static constexpr int kMaxConv = 32;
+    Conv conv[kMaxConv];  // recent conversations (MODE_CHATS)
+    int convCount = 0;
+    int sel = 0;          // cursor into the current list (chats / combined nodes+channels)
     int scrollTop = 0;    // first visible row
     uint32_t selectedNum = 0; // node chosen with Enter (MODE_NODE)
     int selectedChannel = -1; // >= 0 when the open thread is a channel (else a node DM)

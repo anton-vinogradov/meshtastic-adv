@@ -5,7 +5,7 @@
 A from-scratch on-device UI focused on one thing: making it genuinely comfortable to **message people over the mesh** from a pocket QWERTY device — no phone required — while keeping the proven Meshtastic radio stack underneath.
 
 <p align="center">
-  <img src="docs/img/nodes.png" width="49%" alt="Node list with signal, hops, last-heard and role"/>
+  <img src="docs/img/chats.png" width="49%" alt="Recent conversations home with previews and unread badges"/>
   <img src="docs/img/chat.png" width="49%" alt="Conversation with Cyrillic text, inline emoji and delivery status"/>
 </p>
 
@@ -19,15 +19,16 @@ You get a device that boots straight into a usable messenger: pick a contact, ty
 
 ## What it does
 
-- **📇 Node list** — everyone on the mesh, sorted *unread → favourites → nearest*. Each row shows a signal-bar meter (from SNR), hop count, last-heard age and node role, in fixed columns.
+- **🗨️ Recent chats home** — boots into your conversations (DMs + channels), newest first, each with a last-message preview, time and unread badge. Opening one jumps straight to the first unread message.
 - **💬 Direct messages** — open a node, type, send. PKI-encrypted DMs like the phone app.
-- **📢 Channels** — channels appear alongside nodes; open one to read/broadcast to the whole channel.
+- **📢 Channels** — read and broadcast to any channel, right alongside your DMs.
 - **✅ Delivery status** — every sent message shows *sending* (dot) → *delivered* (green check, from the routing ACK) → *failed* (red ✗ with the reason). Channel broadcasts get a "sent" check.
-- **🔤 Cyrillic + 😀 emoji** — receives and renders non-Latin text and inline emoji bitmaps; a **Tab** palette lets you insert emoji into a message.
-- **🔎 Contact search** — start typing on the node list to filter by name.
-- **⭐ Favourites** — flag contacts and channels (they sort to the top and can beep).
-- **🔔 Smart sound** — a single beep, only for messages from a favourite (no more buzzing on every packet).
-- **🕘 Timestamps** — compact local `HH:MM` on every message, with a UTC-offset picker (cities).
+- **⌨️ Cyrillic input + 😀 emoji** — type Russian on the Latin keyboard via a live transliteration layer (**Fn+L**); receive/render non-Latin text and inline emoji bitmaps; a **Tab** palette inserts emoji.
+- **📇 Node list** — press **Tab** for everyone on the mesh, with a signal-bar meter (from SNR), hop count, last-heard age and role, in fixed columns.
+- **🔎 Contact search** — start typing to find any node and start a new chat.
+- **⭐ Favourites** — flag contacts and channels; they get priority alerts.
+- **🔔 Sound + light** — a single beep **and** a green LED flash from a favourite; a blue flash for everyone else (no buzzing on every packet).
+- **🕘 Timestamps** — compact local `HH:MM` on every message, with a UTC-offset (city) picker.
 - **💾 History that survives reboots** — the conversation ring is persisted to flash.
 - **⚙️ On-device settings** — name, region, modem preset, frequency, channel and UTC, all editable on the device (long-press **ESC**).
 
@@ -54,15 +55,15 @@ Everything is keyboard-driven. The footer of each screen shows the live hints.
 
 | Where | Key | Action |
 |---|---|---|
-| Node list | **↑ / ↓** | move the cursor |
-| Node list | **← / →** | favourite / un-favourite the selected contact |
-| Node list | *type* | filter contacts by name |
-| Node list | **Enter** | open the conversation |
-| Conversation | *type* | start a reply |
-| Conversation | **Tab** | open the emoji palette |
+| Chats (home) | **↑ / ↓** · **Enter** | move · open the conversation |
+| Chats (home) | **← / →** | favourite / un-favourite |
+| Chats (home) | *type* | search all nodes to start a new chat |
+| Chats (home) | **Tab** | switch to the full node list (and back) |
+| Conversation | *type* · **Enter** | write a reply · send |
+| Conversation | **Fn+L** | toggle Cyrillic (translit) input |
+| Conversation | **Tab** | emoji palette |
 | Conversation | **↑ / ↓** | scroll through history |
-| Conversation | **Enter** | send |
-| Conversation | **ESC** | back to the list |
+| Conversation | **ESC** | back |
 | Anywhere | **long-press ESC** | open Settings |
 
 In Settings, **↑/↓** move, **Enter** edits, **ESC** goes back. Changing Region/Preset/Frequency/Channel reboots the radio to apply.

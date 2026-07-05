@@ -1,8 +1,8 @@
 # Meshtastic ADV
 
-**A keyboard-first [Meshtastic](https://meshtastic.org) client for the [M5Stack Cardputer ADV](https://shop.m5stack.com/products/m5stack-cardputer-adv) + Cap LoRa-1262 (SX1262).**
+**A keyboard-first [Meshtastic](https://meshtastic.org) client for the [M5Stack Cardputer ADV](https://shop.m5stack.com/products/m5stack-cardputer-adv) — with its own Cap LoRa-1262 (SX1262), or driving any stock Meshtastic node over Bluetooth.**
 
-A from-scratch on-device UI focused on one thing: making it genuinely comfortable to **message people over the mesh** from a pocket QWERTY device — no phone required — while keeping the proven Meshtastic radio stack underneath.
+A from-scratch on-device UI focused on one thing: making it genuinely comfortable to **message people over the mesh** from a pocket QWERTY device — no phone required — while keeping the proven Meshtastic radio stack underneath. No LoRa cap? [Companion mode](#companion-mode-drive-another-node-over-ble) turns the Cardputer into a terminal for a Heltec / T-Beam / RAK you already own.
 
 <p align="center">
   <img src="docs/img/demo.gif" width="60%" alt="Meshtastic ADV walkthrough: recent chats, Cyrillic + emoji conversation, emoji palette, node list, settings"/>

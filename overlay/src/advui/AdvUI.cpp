@@ -114,7 +114,14 @@ const char *errName(uint8_t e)
     }
 }
 constexpr int kMaxMsgs = 32;
-constexpr int kNumSettings = 15; // Name..Channel, Role, Hops, Power, Rebroadcast, UTC, WiFi, MQTT, Screen, Radio
+constexpr int kNumSettings = 15; // the flat item table: Name..Channel, Role..Rebroadcast, UTC, WiFi, MQTT, Screen, Radio
+
+// The Settings menu is two-level: the top lists sections (plus WiFi/MQTT/Radio
+// as direct entries); a section lists indices into the flat item table.
+const uint8_t kSecNode[] = {0, 1};                    // Name, Short
+const uint8_t kSecLora[] = {2, 3, 4, 5, 6, 7, 8, 9};  // Region..Rebroadcast
+const uint8_t kSecDevice[] = {10, 13};                // UTC, Screen
+constexpr int kTopCount = 6;                          // Node, LoRa, WiFi, MQTT, Device, Radio
 Msg g_msgs[kMaxMsgs];
 int g_msgCount = 0;         // populated slots (grows to kMaxMsgs)
 int g_msgNext = 0;          // next write slot (ring head)
@@ -2525,7 +2532,10 @@ void AdvUI::drawSettings()
     g->setTextSize(1);
     g->setTextColor(0x07FF); // cyan
     g->setCursor(4, 3);
-    g->print("Settings");
+    g->printf("Settings%s", setSection == 0   ? " / Node"
+                            : setSection == 1 ? " / LoRa"
+                            : setSection == 2 ? " / Device"
+                                              : "");
     g->drawFastHLine(0, 13, 240, 0x39C7);
 
     const char *labels[kNumSettings] = {"Name", "Short",       "Region", "Preset", "Frequency",
@@ -2597,6 +2607,28 @@ void AdvUI::drawSettings()
     else
         strcpy(vals[14], "onboard");
 
+    // What the current level shows: top = sections + direct entries (with a
+    // representative value as the preview), sub = the section's flat items.
+    const char *rowLabel[kNumSettings];
+    const char *rowVal[kNumSettings];
+    int listCount;
+    if (setSection < 0) {
+        static const char *topNames[kTopCount] = {"Node", "LoRa", "WiFi", "MQTT", "Device", "Radio"};
+        static const uint8_t topPreview[kTopCount] = {0, 3, 11, 12, 10, 14};
+        listCount = kTopCount;
+        for (int i = 0; i < kTopCount; i++) {
+            rowLabel[i] = topNames[i];
+            rowVal[i] = vals[topPreview[i]];
+        }
+    } else {
+        const uint8_t *items = setSection == 0 ? kSecNode : setSection == 1 ? kSecLora : kSecDevice;
+        listCount = setSection == 0 ? (int)sizeof(kSecNode) : setSection == 1 ? (int)sizeof(kSecLora) : (int)sizeof(kSecDevice);
+        for (int i = 0; i < listCount; i++) {
+            rowLabel[i] = labels[items[i]];
+            rowVal[i] = vals[items[i]];
+        }
+    }
+
     const int rowH = 15, top = 15, maxRows = (124 - top) / rowH;
     if (setSel < setScroll)
         setScroll = setSel;
@@ -2606,7 +2638,7 @@ void AdvUI::drawSettings()
         setScroll = 0;
     for (int r = 0; r < maxRows; r++) {
         int i = setScroll + r;
-        if (i >= kNumSettings)
+        if (i >= listCount)
             break;
         int y = top + r * rowH;
         if (i == setSel)
@@ -2616,16 +2648,18 @@ void AdvUI::drawSettings()
         g->setTextSize(1);
         g->setTextColor(0xFFFF);
         g->setCursor(6, y + 1);
-        g->print(labels[i]);
-        int lw = g->textWidth(labels[i]);
+        g->print(rowLabel[i]);
+        int lw = g->textWidth(rowLabel[i]);
 
-        fitWidth(g, vals[i], 230 - (6 + lw));
+        char vbuf[24];
+        snprintf(vbuf, sizeof(vbuf), "%s", rowVal[i]);
+        fitWidth(g, vbuf, 230 - (6 + lw));
         g->setTextColor(0x9CD3);
-        g->setCursor(236 - g->textWidth(vals[i]), y + 1);
-        g->print(vals[i]);
+        g->setCursor(236 - g->textWidth(vbuf), y + 1);
+        g->print(vbuf);
     }
 
-    drawFooter(g, "up/dn   ENTER edit   ESC back");
+    drawFooter(g, setSection < 0 ? "up/dn   ENTER open   ESC back" : "up/dn   ENTER edit   ESC sections");
 
     if (haveCanvas)
         canvas.pushSprite(0, 0);
@@ -3217,6 +3251,113 @@ void AdvUI::applyLoRa(int target, int value)
     mode = MODE_REBOOT;
 }
 
+// Opens the editor/picker for one flat settings item (see the labels table).
+void AdvUI::openSetting(int item)
+{
+    if (item <= 1) { // 0 = long name, 1 = short name
+        editTarget = item;
+        const char *cur;
+        if (g_radioCompanion) { // editing the linked node's names (remote admin)
+            meshtastic_NodeInfoLite *lm = g_linkMyNode ? nodeByNum(g_linkMyNode) : nullptr;
+            cur = lm ? (item == 1 ? lm->short_name : lm->long_name) : "";
+        } else {
+            cur = (item == 1) ? owner.short_name : owner.long_name;
+        }
+        strncpy(nameBuf, cur, sizeof(nameBuf));
+        nameBuf[sizeof(nameBuf) - 1] = 0;
+        nameLen = strlen(nameBuf);
+        nameReturn = MODE_SETTINGS;
+        mode = MODE_SETNAME;
+    } else if (item == 2) { // Region
+        if (g_radioCompanion && !g_compLoraValid)
+            return; // config not synced yet: nothing to edit against
+        pickTarget = 0;
+        pickSel = optIndex(kRegionOpts, kRegionCount, (int)(g_radioCompanion ? g_compLora.region : config.lora.region));
+        pickScroll = 0;
+        mode = MODE_PICKLIST;
+    } else if (item == 3) { // Preset
+        if (g_radioCompanion && !g_compLoraValid)
+            return;
+        pickTarget = 1;
+        pickSel =
+            optIndex(kPresetOpts, kPresetCount, (int)(g_radioCompanion ? g_compLora.modem_preset : config.lora.modem_preset));
+        pickScroll = 0;
+        mode = MODE_PICKLIST;
+    } else if (item == 4) { // Frequency (MHz)
+        if (g_radioCompanion && !g_compLoraValid)
+            return;
+        editTarget = 2;
+        float ovr = g_radioCompanion ? g_compLora.override_frequency : config.lora.override_frequency;
+        if (ovr > 0)
+            snprintf(nameBuf, sizeof(nameBuf), "%.3f", (double)ovr);
+        else
+            nameBuf[0] = 0;
+        nameLen = strlen(nameBuf);
+        nameReturn = MODE_SETTINGS;
+        mode = MODE_SETNAME;
+    } else if (item == 5) { // Channel name
+        if (g_radioCompanion && !g_compChans[0].has_settings)
+            return; // channel not synced yet: nothing to round-trip
+        editTarget = 3;
+        strncpy(nameBuf, g_radioCompanion ? g_compChans[0].settings.name : channels.getByIndex(0).settings.name,
+                sizeof(nameBuf));
+        nameBuf[sizeof(nameBuf) - 1] = 0;
+        nameLen = strlen(nameBuf);
+        nameReturn = MODE_SETTINGS;
+        mode = MODE_SETNAME;
+    } else if (item == 6) { // Role
+        if (g_radioCompanion && !g_compDeviceValid)
+            return;
+        pickTarget = 5;
+        pickSel = optIndex(kRoleOpts2, kRoleCount, (int)(g_radioCompanion ? g_compDevice.role : config.device.role));
+        pickScroll = 0;
+        mode = MODE_PICKLIST;
+    } else if (item == 7) { // Hop limit
+        if (g_radioCompanion && !g_compLoraValid)
+            return;
+        pickTarget = 6;
+        pickSel = optIndex(kHopOpts, kHopCount, (int)(g_radioCompanion ? g_compLora.hop_limit : config.lora.hop_limit));
+        pickScroll = 0;
+        mode = MODE_PICKLIST;
+    } else if (item == 8) { // TX power
+        if (g_radioCompanion && !g_compLoraValid)
+            return;
+        pickTarget = 7;
+        pickSel = optIndex(kPowerOpts, kPowerCount, (int)(g_radioCompanion ? g_compLora.tx_power : config.lora.tx_power));
+        pickScroll = 0;
+        mode = MODE_PICKLIST;
+    } else if (item == 9) { // Rebroadcast mode
+        if (g_radioCompanion && !g_compDeviceValid)
+            return;
+        pickTarget = 8;
+        pickSel = optIndex(kRebroadOpts, kRebroadCount,
+                           (int)(g_radioCompanion ? g_compDevice.rebroadcast_mode : config.device.rebroadcast_mode));
+        pickScroll = 0;
+        mode = MODE_PICKLIST;
+    } else if (item == 10) { // UTC offset -> city/offset picker
+        pickTarget = 2;
+        pickSel = optIndex(kUtcOpts, kUtcCount, g_utcOffsetMin);
+        pickScroll = 0;
+        mode = MODE_PICKLIST;
+    } else if (item == 13) { // Screen auto-off -> timeout picker
+        pickTarget = 4;
+        pickSel = optIndex(kScreenOpts, kScreenCount, (int)g_screenOffSec);
+        pickScroll = 0;
+        mode = MODE_PICKLIST;
+    } else if (item == 14) { // Radio backend -> onboard/companion picker
+        pickTarget = 3;
+        pickSel = g_radioCompanion ? 1 : 0;
+        pickScroll = 0;
+        mode = MODE_PICKLIST;
+    } else if (item == 11 || item == 12) { // WiFi / MQTT sub-page
+        netPage = item == 11 ? 0 : 1;
+        netSel = 0;
+        netScroll = 0;
+        netDirty = false;
+        mode = MODE_NETPAGE;
+    }
+}
+
 void AdvUI::handleKey(char ch)
 {
     unsigned char c = (unsigned char)ch;
@@ -3232,6 +3373,8 @@ void AdvUI::handleKey(char ch)
 
     if (c == AdvKeyboard::kLongEsc) { // long-press ESC opens settings from anywhere
         setSel = 0;
+        setScroll = 0;
+        setSection = -1;
         mode = MODE_SETTINGS;
         return;
     }
@@ -3278,115 +3421,46 @@ void AdvUI::handleKey(char ch)
     }
 
     if (mode == MODE_SETTINGS) {
+        const uint8_t *items = setSection == 0 ? kSecNode : setSection == 1 ? kSecLora : kSecDevice;
+        int listCount = setSection < 0    ? kTopCount
+                        : setSection == 0 ? (int)sizeof(kSecNode)
+                        : setSection == 1 ? (int)sizeof(kSecLora)
+                                          : (int)sizeof(kSecDevice);
         if (esc) {
-            mode = MODE_NODES;
+            if (setSection >= 0) { // back to the top level, cursor on the section's row
+                setSel = setSection == 0 ? 0 : setSection == 1 ? 1 : 4;
+                setSection = -1;
+                setScroll = 0;
+            } else {
+                mode = MODE_NODES;
+            }
         } else if (up) {
             if (setSel > 0)
                 setSel--;
         } else if (down) {
-            if (setSel < kNumSettings - 1)
+            if (setSel < listCount - 1)
                 setSel++;
-        } else if (enter && setSel <= 1) { // 0 = long name, 1 = short name
-            editTarget = setSel;
-            const char *cur;
-            if (g_radioCompanion) { // editing the linked node's names (remote admin)
-                meshtastic_NodeInfoLite *lm = g_linkMyNode ? nodeByNum(g_linkMyNode) : nullptr;
-                cur = lm ? (setSel == 1 ? lm->short_name : lm->long_name) : "";
+        } else if (enter) {
+            if (setSection < 0) {
+                switch (setSel) {
+                case 0: // Node
+                case 1: // LoRa
+                    setSection = setSel;
+                    setSel = 0;
+                    setScroll = 0;
+                    break;
+                case 4: // Device
+                    setSection = 2;
+                    setSel = 0;
+                    setScroll = 0;
+                    break;
+                case 2: openSetting(11); break; // WiFi
+                case 3: openSetting(12); break; // MQTT
+                case 5: openSetting(14); break; // Radio
+                }
             } else {
-                cur = (setSel == 1) ? owner.short_name : owner.long_name;
+                openSetting(items[setSel]);
             }
-            strncpy(nameBuf, cur, sizeof(nameBuf));
-            nameBuf[sizeof(nameBuf) - 1] = 0;
-            nameLen = strlen(nameBuf);
-            nameReturn = MODE_SETTINGS;
-            mode = MODE_SETNAME;
-        } else if (enter && setSel == 2) { // Region
-            if (g_radioCompanion && !g_compLoraValid)
-                return; // config not synced yet: nothing to edit against
-            pickTarget = 0;
-            pickSel = optIndex(kRegionOpts, kRegionCount, (int)(g_radioCompanion ? g_compLora.region : config.lora.region));
-            pickScroll = 0;
-            mode = MODE_PICKLIST;
-        } else if (enter && setSel == 3) { // Preset
-            if (g_radioCompanion && !g_compLoraValid)
-                return;
-            pickTarget = 1;
-            pickSel =
-                optIndex(kPresetOpts, kPresetCount, (int)(g_radioCompanion ? g_compLora.modem_preset : config.lora.modem_preset));
-            pickScroll = 0;
-            mode = MODE_PICKLIST;
-        } else if (enter && setSel == 4) { // Frequency (MHz)
-            if (g_radioCompanion && !g_compLoraValid)
-                return;
-            editTarget = 2;
-            float ovr = g_radioCompanion ? g_compLora.override_frequency : config.lora.override_frequency;
-            if (ovr > 0)
-                snprintf(nameBuf, sizeof(nameBuf), "%.3f", (double)ovr);
-            else
-                nameBuf[0] = 0;
-            nameLen = strlen(nameBuf);
-            nameReturn = MODE_SETTINGS;
-            mode = MODE_SETNAME;
-        } else if (enter && setSel == 5) { // Channel name
-            if (g_radioCompanion && !g_compChans[0].has_settings)
-                return; // channel not synced yet: nothing to round-trip
-            editTarget = 3;
-            strncpy(nameBuf, g_radioCompanion ? g_compChans[0].settings.name : channels.getByIndex(0).settings.name,
-                    sizeof(nameBuf));
-            nameBuf[sizeof(nameBuf) - 1] = 0;
-            nameLen = strlen(nameBuf);
-            nameReturn = MODE_SETTINGS;
-            mode = MODE_SETNAME;
-        } else if (enter && setSel == 6) { // Role
-            if (g_radioCompanion && !g_compDeviceValid)
-                return;
-            pickTarget = 5;
-            pickSel = optIndex(kRoleOpts2, kRoleCount, (int)(g_radioCompanion ? g_compDevice.role : config.device.role));
-            pickScroll = 0;
-            mode = MODE_PICKLIST;
-        } else if (enter && setSel == 7) { // Hop limit
-            if (g_radioCompanion && !g_compLoraValid)
-                return;
-            pickTarget = 6;
-            pickSel = optIndex(kHopOpts, kHopCount, (int)(g_radioCompanion ? g_compLora.hop_limit : config.lora.hop_limit));
-            pickScroll = 0;
-            mode = MODE_PICKLIST;
-        } else if (enter && setSel == 8) { // TX power
-            if (g_radioCompanion && !g_compLoraValid)
-                return;
-            pickTarget = 7;
-            pickSel = optIndex(kPowerOpts, kPowerCount, (int)(g_radioCompanion ? g_compLora.tx_power : config.lora.tx_power));
-            pickScroll = 0;
-            mode = MODE_PICKLIST;
-        } else if (enter && setSel == 9) { // Rebroadcast mode
-            if (g_radioCompanion && !g_compDeviceValid)
-                return;
-            pickTarget = 8;
-            pickSel = optIndex(kRebroadOpts, kRebroadCount,
-                               (int)(g_radioCompanion ? g_compDevice.rebroadcast_mode : config.device.rebroadcast_mode));
-            pickScroll = 0;
-            mode = MODE_PICKLIST;
-        } else if (enter && setSel == 10) { // UTC offset -> city/offset picker
-            pickTarget = 2;
-            pickSel = optIndex(kUtcOpts, kUtcCount, g_utcOffsetMin);
-            pickScroll = 0;
-            mode = MODE_PICKLIST;
-        } else if (enter && setSel == 13) { // Screen auto-off -> timeout picker
-            pickTarget = 4;
-            pickSel = optIndex(kScreenOpts, kScreenCount, (int)g_screenOffSec);
-            pickScroll = 0;
-            mode = MODE_PICKLIST;
-        } else if (enter && setSel == 14) { // Radio backend -> onboard/companion picker
-            pickTarget = 3;
-            pickSel = g_radioCompanion ? 1 : 0;
-            pickScroll = 0;
-            mode = MODE_PICKLIST;
-        } else if (enter && (setSel == 11 || setSel == 12)) { // WiFi / MQTT sub-page
-            netPage = setSel == 11 ? 0 : 1;
-            netSel = 0;
-            netScroll = 0;
-            netDirty = false;
-            mode = MODE_NETPAGE;
         }
         return;
     }

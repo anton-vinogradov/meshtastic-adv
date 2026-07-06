@@ -106,29 +106,23 @@ the middle, the compose bar sits at the bottom.
 
 ### Settings (long-press ESC anywhere)
 
-| Row           | What it does                                                                |
-| ------------- | --------------------------------------------------------------------------- |
-| **Name / Short** | the node's long and short names (text editor: type, Enter saves)         |
-| **Region**    | LoRa region picker — required on first boot                                  |
-| **Preset**    | modem preset (LongFast, MediumFast, …)                                       |
-| **Frequency** | frequency-slot override in MHz                                               |
-| **Channel**   | primary channel name + PSK                                                   |
-| **Role**      | device role: Client, Client Mute/Hidden, Router (Late), Repeater, Tracker, Sensor, TAK |
-| **Hops**      | hop limit (1–7)                                                              |
-| **Power**     | TX power: region max, or 2–22 dBm                                            |
-| **Rebroadcast** | which packets the node relays: All, Local only, Known only, Core ports, None |
-| **UTC**       | UTC-offset picker with city labels — drives all timestamps                   |
-| **WiFi**      | join a network (NTP time comes with it); enabling WiFi turns Bluetooth off   |
-| **MQTT**      | bridge the mesh to the internet: default public broker or your own           |
-| **Screen**    | auto-off timeout (15 s … 5 min, or never; default 5 min) — saves the battery |
-| **Radio**     | **Onboard (Cap LoRa)** or **Companion via BLE** — see below                  |
+Two levels: the top menu shows sections with a live preview of the key value; Enter opens
+a section (or WiFi / MQTT / Radio directly), ESC steps back up.
+
+| Section | Rows |
+| ------- | ---- |
+| **Node**   | **Name** and **Short** — the node's long/short names (text editor)         |
+| **LoRa**   | **Region** (required on first boot) · **Preset** (LongFast, MediumFast, …) · **Frequency** (slot override, MHz) · **Channel** (primary name; key kept) · **Role** (Client, Client Mute/Hidden, Router (Late), Repeater, Tracker, Sensor, TAK) · **Hops** (1–7) · **Power** (region max or 2–22 dBm) · **Rebroadcast** (All / Local only / Known only / Core ports only / None) |
+| **WiFi**   | join a network (NTP time comes with it); enabling WiFi turns Bluetooth off |
+| **MQTT**   | bridge the mesh to the internet: default public broker or your own         |
+| **Device** | **UTC** — offset picker with city labels, drives all timestamps · **Screen** — auto-off timeout (15 s … 5 min or never; default 5 min) |
+| **Radio**  | **Onboard (Cap LoRa)** or **Companion via BLE** — see below                |
 
 **↑/↓** move, **Enter** edits (or toggles), **ESC** backs out. Changes that affect the radio
-(Region / Preset / Frequency / Channel / Role / Hops / Power / Rebroadcast, WiFi / MQTT,
-Radio mode) reboot the device to apply.
+(everything under LoRa, WiFi / MQTT, Radio mode) reboot the device to apply.
 
-In **companion mode** the Name → Channel rows show — and edit — **the linked node** instead
-(see below); UTC / WiFi / MQTT / Radio stay local to the Cardputer.
+In **companion mode** the Node and LoRa sections show — and edit — **the linked node**
+instead (see below); WiFi / MQTT / Device / Radio stay local to the Cardputer.
 
 ### Companion mode (Settings → Radio → Companion via BLE)
 

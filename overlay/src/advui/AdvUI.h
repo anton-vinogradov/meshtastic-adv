@@ -62,6 +62,7 @@ class AdvUI : public concurrency::OSThread
     void drawPicker();
     void drawNode();
     void drawSettings();
+    void openSetting(int item); // dispatch a settings item (flat index) to its editor/picker
     void drawSetName();
     void drawPickList();
     void drawReboot();
@@ -139,6 +140,7 @@ class AdvUI : public concurrency::OSThread
     Mode nameReturn = MODE_SETTINGS; // where the name editor returns on save/cancel
     int setSel = 0;           // settings-menu cursor (MODE_SETTINGS)
     int setScroll = 0;        // first visible settings row (scrollable)
+    int setSection = -1;      // open settings section (-1 = the top-level menu)
     int netPage = 0;          // MODE_NETPAGE: 0 = WiFi, 1 = MQTT
     int netSel = 0;           // cursor within the net page
     int netScroll = 0;        // first visible net-page row

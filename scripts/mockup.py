@@ -98,6 +98,7 @@ def main():
     ap.add_argument("--out", help="output PNG (with --frame)")
     ap.add_argument("--gif", help="output GIF (with --frames)")
     ap.add_argument("--delay", type=int, default=1400, help="GIF frame delay, ms")
+    ap.add_argument("--delays", help="per-frame delays, comma-separated ms (matches sorted frames)")
     ap.add_argument("--width", type=int, default=900, help="output width (photo downscale)")
     ap.add_argument("--debug", action="store_true", help="draw the quad outline instead")
     args = ap.parse_args()
@@ -131,7 +132,10 @@ def main():
         # Quantize on the first frame's palette so the static photo doesn't shimmer.
         base = imgs[0].quantize(colors=255, dither=Image.FLOYDSTEINBERG)
         rest = [im.quantize(palette=base, dither=Image.FLOYDSTEINBERG) for im in imgs[1:]]
-        base.save(args.gif, save_all=True, append_images=rest, duration=args.delay, loop=0, optimize=True)
+        durations = [int(d) for d in args.delays.split(",")] if args.delays else args.delay
+        if isinstance(durations, list) and len(durations) != len(imgs):
+            sys.exit(f"{len(durations)} delays for {len(imgs)} frames")
+        base.save(args.gif, save_all=True, append_images=rest, duration=durations, loop=0, optimize=True)
         print("->", args.gif, f"({len(imgs)} frames)")
     else:
         sys.exit("need --frame or --frames")

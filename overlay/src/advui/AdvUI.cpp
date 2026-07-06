@@ -3169,6 +3169,70 @@ void AdvUI::runDemoDump()
     config.network = bnet;
     moduleConfig.mqtt = bmqtt;
 
+    // --- Usage-scenario frames (a01..) for the animated hero: pick the chat,
+    // type, send, get the delivery check, receive the reply, scroll the history.
+    bool bRu = g_ruMode;
+    g_ruMode = false;
+    g_msgCount = 0;
+    g_msgNext = 0;
+    g_reactCount = 0;
+    g_reactNext = 0;
+    addMsg(peer, me, 0, t - 900, false, "Radio check?", 11, MSG_IN);
+    addMsg(me, peer, 0, t - 840, false, "Loud and clear \U0001F44D", 12, MSG_DELIVERED);
+    addMsg(peer, me, 0, t - 300, false, "Bridge at seven?", 13, MSG_IN);
+    addMsg(me, peer, 0, t - 240, false, "Deal", 14, MSG_DELIVERED);
+    addMsg(peer, me, 0, t, true, "Ты где? \U0001F440", 15, MSG_IN); // unread -> the envelope on home
+
+    sel = 0;
+    scrollTop = 0;
+    mode = MODE_CHATS;
+    drawChats();
+    screenshot("a01"); // home: the DM on top with an unread envelope
+
+    selectedChannel = -1;
+    selectedNum = peer;
+    chatAnchorMsgIdx = firstUnreadIdx();
+    chatScroll = 0;
+    mode = MODE_NODE;
+    drawNode();
+    screenshot("a02"); // opened at the first unread
+
+    mode = MODE_COMPOSE;
+    const char *typing[] = {"O", "On m", "On my w", "On my way", "On my way \U0001F642"};
+    for (unsigned i = 0; i < sizeof(typing) / sizeof(typing[0]); i++) {
+        snprintf(msgBuf, sizeof(msgBuf), "%s", typing[i]);
+        msgLen = (uint8_t)strlen(msgBuf);
+        drawNode();
+        char nm[8];
+        snprintf(nm, sizeof(nm), "a%02u", 3 + i);
+        screenshot(nm); // a03..a07: the reply being typed
+    }
+    msgBuf[0] = 0;
+    msgLen = 0;
+    addMsg(me, peer, 0, t + 60, false, "On my way \U0001F642", 16, MSG_SENDING);
+    mode = MODE_NODE;
+    chatScroll = 0;
+    drawNode();
+    screenshot("a08"); // sent: the pending dot
+    for (int i = 0; i < g_msgCount; i++)
+        if (g_msgs[i].id == 16)
+            g_msgs[i].status = MSG_DELIVERED; // the routing ACK lands
+    drawNode();
+    screenshot("a09"); // the green check
+    addMsg(peer, me, 0, t + 120, false, "Same, see you there \U0001F44D", 17, MSG_IN);
+    drawNode();
+    screenshot("a10"); // their reply arrives
+    chatScroll = 4;
+    drawNode();
+    screenshot("a11"); // scrolling back through the history
+    chatScroll = 8;
+    drawNode();
+    screenshot("a12");
+    chatScroll = 0;
+    drawNode();
+    screenshot("a13"); // back at the newest message
+    g_ruMode = bRu;
+
     Serial.println("@@DONE");
     Serial.flush();
 

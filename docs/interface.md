@@ -1,5 +1,7 @@
 # Interface — the on-device app
 
+**English** | [Русский](interface.ru.md)
+
 The advui firmware replaces the stock Meshtastic screen with a keyboard-first UI built
 for the Cardputer ADV. This is the guide to what's on screen and how to drive it.
 

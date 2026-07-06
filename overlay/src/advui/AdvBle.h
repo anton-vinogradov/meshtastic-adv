@@ -1,5 +1,6 @@
 #pragma once
 
+#include "mesh/generated/meshtastic/channel.pb.h"
 #include "mesh/generated/meshtastic/config.pb.h"
 #include <cstddef>
 #include <cstdint>
@@ -62,11 +63,10 @@ struct CompNode {
 constexpr int kMaxCompNodes = 128;
 extern CompNode g_compNodes[kMaxCompNodes];
 extern volatile int g_compNodeCount;
-struct CompChan {
-    char name[12];
-    uint8_t role; // 0 disabled
-};
-extern CompChan g_compChans[8];
+// Full channel objects from the config stream. Kept whole — the PSK included —
+// so a rename can round-trip the channel back via set_channel without wiping
+// the key (the same reason the phone can edit channels).
+extern meshtastic_Channel g_compChans[8];
 extern volatile bool g_linkConfigDone; // config download finished
 extern volatile int g_compPreset;      // the node's LoRa modem preset (blank primary shows it)
 extern meshtastic_Config_LoRaConfig g_compLora; // the node's full LoRa config (remote admin edits it)

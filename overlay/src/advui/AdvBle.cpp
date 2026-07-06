@@ -27,7 +27,7 @@ char g_linkErr[28] = {0};
 
 CompNode g_compNodes[kMaxCompNodes];
 volatile int g_compNodeCount = 0;
-CompChan g_compChans[8];
+meshtastic_Channel g_compChans[8];
 volatile bool g_linkConfigDone = false;
 volatile int g_compPreset = 0;
 meshtastic_Config_LoRaConfig g_compLora = meshtastic_Config_LoRaConfig_init_default;
@@ -284,15 +284,10 @@ void routeFromRadio(const uint8_t *bytes, uint16_t len)
             g_linkNodeBatt = ni.device_metrics.battery_level; // the radio node's own battery
         break;
     }
-    case meshtastic_FromRadio_channel_tag: {
-        const meshtastic_Channel &ch = fr.channel;
-        if (ch.index >= 0 && ch.index < 8) {
-            g_compChans[ch.index].role = (uint8_t)ch.role;
-            snprintf(g_compChans[ch.index].name, sizeof(g_compChans[ch.index].name), "%s",
-                     ch.has_settings ? ch.settings.name : "");
-        }
+    case meshtastic_FromRadio_channel_tag:
+        if (fr.channel.index >= 0 && fr.channel.index < 8)
+            g_compChans[fr.channel.index] = fr.channel;
         break;
-    }
     case meshtastic_FromRadio_config_tag:
         if (fr.config.which_payload_variant == meshtastic_Config_lora_tag) {
             g_compPreset = (int)fr.config.payload_variant.lora.modem_preset;

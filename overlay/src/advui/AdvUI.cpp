@@ -343,10 +343,10 @@ const char *presetName(meshtastic_Config_LoRaConfig_ModemPreset p); // defined b
 const char *chanName(int i)
 {
     if (g_radioCompanion) {
-        if (g_compChans[i].name[0])
-            return g_compChans[i].name;
+        if (g_compChans[i].has_settings && g_compChans[i].settings.name[0])
+            return g_compChans[i].settings.name;
         // blank primary channel displays the modem preset, like stock does
-        if (g_compChans[i].role == 1)
+        if (g_compChans[i].role == meshtastic_Channel_Role_PRIMARY)
             return presetName((meshtastic_Config_LoRaConfig_ModemPreset)g_compPreset);
         return "?";
     }
@@ -356,7 +356,7 @@ const char *chanName(int i)
 bool chanEnabled(int i)
 {
     if (g_radioCompanion)
-        return g_compChans[i].role != 0;
+        return g_compChans[i].role != meshtastic_Channel_Role_DISABLED;
     return channels.getByIndex(i).role != meshtastic_Channel_Role_DISABLED;
 }
 
@@ -2375,6 +2375,17 @@ bool AdvUI::applyName()
         return true;
     }
     if (editTarget == 3) { // primary channel name; radio restart to apply
+        if (g_radioCompanion) { // remote rename: round-trip the synced channel object,
+                                // PSK included, so set_channel can't wipe the key
+            meshtastic_AdminMessage adm = meshtastic_AdminMessage_init_default;
+            adm.which_payload_variant = meshtastic_AdminMessage_set_channel_tag;
+            adm.set_channel = g_compChans[0];
+            strncpy(adm.set_channel.settings.name, nameBuf, sizeof(adm.set_channel.settings.name));
+            adm.set_channel.settings.name[sizeof(adm.set_channel.settings.name) - 1] = 0;
+            if (sendAdminToNode(adm)) // applied live on the node (no reboot); mirror it
+                g_compChans[0] = adm.set_channel;
+            return false;
+        }
         meshtastic_Channel ch = channels.getByIndex(0);
         strncpy(ch.settings.name, nameBuf, sizeof(ch.settings.name));
         ch.settings.name[sizeof(ch.settings.name) - 1] = 0;
@@ -3073,7 +3084,9 @@ void AdvUI::handleKey(char ch)
         if (esc) {
             mode = nameReturn;
         } else if (enter) {
-            bool rebooting = nameLen && applyName();
+            // A blank channel name is legitimate (it means "the preset default"), so the
+            // channel editor applies even when emptied; the other editors need text.
+            bool rebooting = (nameLen || editTarget == 3) && applyName();
             if (!rebooting)
                 mode = nameReturn;
         } else if (bksp) {
@@ -3144,10 +3157,11 @@ void AdvUI::handleKey(char ch)
             nameReturn = MODE_SETTINGS;
             mode = MODE_SETNAME;
         } else if (enter && setSel == 5) { // Channel name
-            if (g_radioCompanion)
-                return; // the node's PSK isn't synced over the link; a rename would wipe it
+            if (g_radioCompanion && !g_compChans[0].has_settings)
+                return; // channel not synced yet: nothing to round-trip
             editTarget = 3;
-            strncpy(nameBuf, channels.getByIndex(0).settings.name, sizeof(nameBuf));
+            strncpy(nameBuf, g_radioCompanion ? g_compChans[0].settings.name : channels.getByIndex(0).settings.name,
+                    sizeof(nameBuf));
             nameBuf[sizeof(nameBuf) - 1] = 0;
             nameLen = strlen(nameBuf);
             nameReturn = MODE_SETTINGS;

@@ -88,7 +88,8 @@ the middle, the compose bar sits at the bottom.
 - **Delivery status** on your messages: a grey dot while sending → a **green ✓** on the
   routing ACK (channel broadcasts get their ✓ on transmit) → a **red ✗ with the reason** on
   failure. When the newest message has failed, **Enter resends it**.
-- **↑ / ↓** scroll the history; opening a thread auto-jumps to the first unread.
+- **↑ / ↓** scroll the history — **hold to keep scrolling** (arrows auto-repeat everywhere,
+  and so does backspace while erasing text); opening a thread auto-jumps to the first unread.
 - **Type** and hit **Enter** to send. **Fn+L** toggles the Cyrillic transliteration layer
   (the `RU`/`EN` badge on the compose bar; the choice persists). **Tab** opens the emoji
   palette (~24 icons, arrows + Enter to insert; emoji render inline in text).
@@ -118,6 +119,9 @@ the middle, the compose bar sits at the bottom.
 **↑/↓** move, **Enter** edits (or toggles), **ESC** backs out. Changes that affect the radio
 (Region / Preset / Frequency / Channel, WiFi / MQTT, Radio mode) reboot the device to apply.
 
+In **companion mode** the Name → Channel rows show — and edit — **the linked node** instead
+(see below); UTC / WiFi / MQTT / Radio stay local to the Cardputer.
+
 ### Companion mode (Settings → Radio → Companion via BLE)
 
 The Cardputer becomes a keyboard + screen terminal for **another, stock Meshtastic node**
@@ -138,6 +142,13 @@ link signal (dB), **the node's battery**, and how many nodes have synced. **R** 
 reconnect, **F** forgets the node (back to scan), **ESC** just leaves — the link stays up.
 Drops auto-reconnect in the background.
 
+**Settings drive the node remotely**, the way the phone app does: **Name / Short** and the
+**Channel** name apply instantly over the link (the channel object round-trips with its key,
+so the rename can't break encryption), while **Region / Preset / Frequency** make the node
+save and reboot itself — the screen drops to the Radio status page and the link comes back
+on its own. Screenless nodes usually pair with the stock PIN `123456` (the PIN screen
+reminds you).
+
 > 📱 The node has a single Bluetooth slot — close the Meshtastic phone app while the
 > Cardputer is linked, or they'll steal the connection from each other.
 
@@ -148,6 +159,6 @@ Drops auto-reconnect in the background.
 - **Sound + light:** one beep + green LED flash for favourites, a blue flash for everyone
   else — never a buzz per packet.
 - The node DB caps at 200 nodes on this hardware; the header shows `200+` when it's full.
-  In companion mode the synced node table holds the 64 most relevant nodes.
+  In companion mode the synced node table holds the 128 most recently heard nodes.
 - Other nodes' battery levels aren't stored by this build's compact node DB — only our own
   battery (header/footer) and, in companion mode, the linked node's.

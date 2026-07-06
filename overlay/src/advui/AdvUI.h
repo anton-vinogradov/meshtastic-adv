@@ -44,7 +44,8 @@ class AdvUI : public concurrency::OSThread
         MODE_NETPAGE, // WiFi / MQTT sub-settings page
         MODE_BLESCAN, // companion: find a Meshtastic node over BLE
         MODE_BLEPIN,  // companion: enter the pairing PIN shown on the node
-        MODE_BLELINK  // companion: link status (connecting/pairing/connected)
+        MODE_BLELINK, // companion: link status (connecting/pairing/connected)
+        MODE_BTPIN    // local: show the PIN a pairing phone must enter (we ARE the node)
     };
 
     struct Conv {         // a recent conversation (a channel or a node DM)
@@ -69,6 +70,7 @@ class AdvUI : public concurrency::OSThread
     void drawBleScan();        // companion: node scan list
     void drawBlePin();         // companion: pairing-PIN entry
     void drawBleLink();        // companion: link status
+    void drawBtPin();          // local: passkey for a phone pairing with us
     void drawChats();          // home: recent conversations
     void buildConversations(); // fill conv[]/convCount, newest first
     void openConv(int i);      // open conversation conv[i]
@@ -153,6 +155,7 @@ class AdvUI : public concurrency::OSThread
     uint32_t bleRetryMs = 0;      // last auto-reconnect attempt (backoff timer)
     bool linkJumped = false;      // already auto-jumped to Chats for this link session
     bool companionEntered = false; // jumped to the scan screen after the splash yet
+    Mode btPinReturn = MODE_CHATS; // where the phone-pairing PIN screen returns
 
     bool inited = false;
     bool screenOn = true;        // display rail up; false = auto-off engaged

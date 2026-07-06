@@ -32,6 +32,8 @@ volatile bool g_linkConfigDone = false;
 volatile int g_compPreset = 0;
 meshtastic_Config_LoRaConfig g_compLora = meshtastic_Config_LoRaConfig_init_default;
 volatile bool g_compLoraValid = false;
+meshtastic_Config_DeviceConfig g_compDevice = meshtastic_Config_DeviceConfig_init_default;
+volatile bool g_compDeviceValid = false;
 volatile int g_linkNodeBatt = -1;
 volatile int g_linkRssi = 0;
 
@@ -293,6 +295,9 @@ void routeFromRadio(const uint8_t *bytes, uint16_t len)
             g_compPreset = (int)fr.config.payload_variant.lora.modem_preset;
             g_compLora = fr.config.payload_variant.lora; // full blob: remote admin round-trips it
             g_compLoraValid = true;
+        } else if (fr.config.which_payload_variant == meshtastic_Config_device_tag) {
+            g_compDevice = fr.config.payload_variant.device; // role / rebroadcast, same round-trip
+            g_compDeviceValid = true;
         }
         break;
     case meshtastic_FromRadio_config_complete_id_tag:

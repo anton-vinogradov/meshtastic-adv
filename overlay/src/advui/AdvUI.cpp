@@ -1,5 +1,6 @@
 #include "AdvUI.h"
 #include "AdvBle.h"
+#include "BluetoothStatus.h"
 #include "CyrillicFont.h"
 #include "FSCommon.h"
 #include "PowerStatus.h"
@@ -113,7 +114,7 @@ const char *errName(uint8_t e)
     }
 }
 constexpr int kMaxMsgs = 32;
-constexpr int kNumSettings = 11; // Name, Short, Region, Preset, Frequency, Channel, UTC, WiFi, MQTT, Screen, Radio
+constexpr int kNumSettings = 15; // Name..Channel, Role, Hops, Power, Rebroadcast, UTC, WiFi, MQTT, Screen, Radio
 Msg g_msgs[kMaxMsgs];
 int g_msgCount = 0;         // populated slots (grows to kMaxMsgs)
 int g_msgNext = 0;          // next write slot (ring head)
@@ -659,11 +660,54 @@ const EnumOpt kUtcOpts[] = {
 // Radio backend: local Cap LoRa, or another node's radio over BLE (companion).
 const EnumOpt kRadioOpts[] = {{"Onboard (Cap LoRa)", 0}, {"Companion via BLE", 1}};
 const EnumOpt kScreenOpts[] = {{"15 s", 15}, {"30 s", 30}, {"1 min", 60}, {"5 min", 300}, {"never", 0}};
+const EnumOpt kRoleOpts2[] = {{"Client", 0},      {"Client Mute", 1}, {"Client Hidden", 8},
+                              {"Router", 2},      {"Router Late", 11}, {"Repeater", 4},
+                              {"Tracker", 5},     {"Sensor", 6},       {"TAK", 7}};
+const EnumOpt kHopOpts[] = {{"1", 1}, {"2", 2}, {"3", 3}, {"4", 4}, {"5", 5}, {"6", 6}, {"7", 7}};
+const EnumOpt kPowerOpts[] = {{"max (region)", 0}, {"2 dBm", 2},   {"5 dBm", 5},   {"8 dBm", 8},  {"11 dBm", 11},
+                              {"14 dBm", 14},      {"17 dBm", 17}, {"20 dBm", 20}, {"22 dBm", 22}};
+const EnumOpt kRebroadOpts[] = {{"All", 0},        {"All skip decode", 1}, {"Local only", 2},
+                                {"Known only", 3}, {"Core ports only", 5}, {"None", 4}};
 constexpr int kRegionCount = sizeof(kRegionOpts) / sizeof(kRegionOpts[0]);
 constexpr int kPresetCount = sizeof(kPresetOpts) / sizeof(kPresetOpts[0]);
 constexpr int kUtcCount = sizeof(kUtcOpts) / sizeof(kUtcOpts[0]);
 constexpr int kRadioCount = sizeof(kRadioOpts) / sizeof(kRadioOpts[0]);
 constexpr int kScreenCount = sizeof(kScreenOpts) / sizeof(kScreenOpts[0]);
+constexpr int kRoleCount = sizeof(kRoleOpts2) / sizeof(kRoleOpts2[0]);
+constexpr int kHopCount = sizeof(kHopOpts) / sizeof(kHopOpts[0]);
+constexpr int kPowerCount = sizeof(kPowerOpts) / sizeof(kPowerOpts[0]);
+constexpr int kRebroadCount = sizeof(kRebroadOpts) / sizeof(kRebroadOpts[0]);
+
+// The settings list-pickers, keyed by pickTarget.
+struct PickList {
+    const EnumOpt *opts;
+    int cnt;
+    const char *title;
+};
+PickList pickListFor(int target); // defined after the option tables it references
+
+const char *optName(const EnumOpt *opts, int cnt, int value)
+{
+    for (int i = 0; i < cnt; i++)
+        if (opts[i].value == value)
+            return opts[i].name;
+    return "?";
+}
+
+PickList pickListFor(int target)
+{
+    switch (target) {
+    case 0: return {kRegionOpts, kRegionCount, "Region"};
+    case 1: return {kPresetOpts, kPresetCount, "Preset"};
+    case 2: return {kUtcOpts, kUtcCount, "UTC offset"};
+    case 4: return {kScreenOpts, kScreenCount, "Screen off"};
+    case 5: return {kRoleOpts2, kRoleCount, "Role"};
+    case 6: return {kHopOpts, kHopCount, "Hop limit"};
+    case 7: return {kPowerOpts, kPowerCount, "TX power"};
+    case 8: return {kRebroadOpts, kRebroadCount, "Rebroadcast"};
+    default: return {kRadioOpts, kRadioCount, "Radio"};
+    }
+}
 
 int optIndex(const EnumOpt *opts, int cnt, int value)
 {
@@ -909,8 +953,8 @@ void msgTimePrefix(uint32_t rxTime, int32_t tzOff, char *out, int cap)
 }
 
 // --- Transliterated Cyrillic input (Fn+L) --------------------------------------
-// Phonetic Latin->Cyrillic with the usual digraphs (sh ш, zh ж, ch ч, ya/yu/yo/ye)
-// and singles w->щ, j->й, x->ъ, '->ь. A letter is emitted immediately and morphed
+// Phonetic Latin->Cyrillic with the usual digraphs (sh ш, zh ж, ch ч, sch щ,
+// ya/yu/yo/ye) and singles j->й, x->ъ, '->ь. A letter is emitted immediately and morphed
 // in place when it turns out to be the head of a digraph.
 uint16_t translitSingle(char l)
 {
@@ -2484,8 +2528,9 @@ void AdvUI::drawSettings()
     g->print("Settings");
     g->drawFastHLine(0, 13, 240, 0x39C7);
 
-    const char *labels[kNumSettings] = {"Name", "Short", "Region", "Preset", "Frequency", "Channel",
-                                        "UTC",  "WiFi",  "MQTT",   "Screen", "Radio"};
+    const char *labels[kNumSettings] = {"Name", "Short",       "Region", "Preset", "Frequency",
+                                        "Channel", "Role",     "Hops",   "Power",  "Rebroadcast",
+                                        "UTC",     "WiFi",     "MQTT",   "Screen", "Radio"};
     char vals[kNumSettings][24];
     if (g_radioCompanion) { // rows 0-5 show (and remote-admin edit) the linked node
         meshtastic_NodeInfoLite *me = g_linkMyNode ? nodeByNum(g_linkMyNode) : nullptr;
@@ -2512,26 +2557,45 @@ void AdvUI::drawSettings()
             strcpy(vals[4], "auto");
         snprintf(vals[5], sizeof(vals[5]), "%s", channels.getName(0));
     }
+    if (g_radioCompanion) { // LoRa/device rows mirror the linked node too
+        snprintf(vals[6], sizeof(vals[6]), "%s",
+                 g_compDeviceValid ? optName(kRoleOpts2, kRoleCount, (int)g_compDevice.role) : "?");
+        if (g_compLoraValid)
+            snprintf(vals[7], sizeof(vals[7]), "%u", (unsigned)g_compLora.hop_limit);
+        else
+            strcpy(vals[7], "?");
+        if (g_compLoraValid)
+            snprintf(vals[8], sizeof(vals[8]), "%s", g_compLora.tx_power ? optName(kPowerOpts, kPowerCount, g_compLora.tx_power) : "max");
+        else
+            strcpy(vals[8], "?");
+        snprintf(vals[9], sizeof(vals[9]), "%s",
+                 g_compDeviceValid ? optName(kRebroadOpts, kRebroadCount, (int)g_compDevice.rebroadcast_mode) : "?");
+    } else {
+        snprintf(vals[6], sizeof(vals[6]), "%s", optName(kRoleOpts2, kRoleCount, (int)config.device.role));
+        snprintf(vals[7], sizeof(vals[7]), "%u", (unsigned)config.lora.hop_limit);
+        snprintf(vals[8], sizeof(vals[8]), "%s", config.lora.tx_power ? optName(kPowerOpts, kPowerCount, config.lora.tx_power) : "max");
+        snprintf(vals[9], sizeof(vals[9]), "%s", optName(kRebroadOpts, kRebroadCount, (int)config.device.rebroadcast_mode));
+    }
     {
         int om = g_utcOffsetMin, ah = om < 0 ? -om : om;
         if (ah % 60)
-            snprintf(vals[6], sizeof(vals[6]), "UTC%c%d:%02d", om < 0 ? '-' : '+', ah / 60, ah % 60);
+            snprintf(vals[10], sizeof(vals[10]), "UTC%c%d:%02d", om < 0 ? '-' : '+', ah / 60, ah % 60);
         else
-            snprintf(vals[6], sizeof(vals[6]), "UTC%c%d", om < 0 ? '-' : '+', ah / 60);
+            snprintf(vals[10], sizeof(vals[10]), "UTC%c%d", om < 0 ? '-' : '+', ah / 60);
     }
     if (config.network.wifi_enabled)
-        snprintf(vals[7], sizeof(vals[7]), "%s", config.network.wifi_ssid[0] ? config.network.wifi_ssid : "on");
+        snprintf(vals[11], sizeof(vals[11]), "%s", config.network.wifi_ssid[0] ? config.network.wifi_ssid : "on");
     else
-        strcpy(vals[7], "off");
-    strcpy(vals[8], moduleConfig.mqtt.enabled ? "on" : "off");
-    strcpy(vals[9], "never");
+        strcpy(vals[11], "off");
+    strcpy(vals[12], moduleConfig.mqtt.enabled ? "on" : "off");
+    strcpy(vals[13], "never");
     for (int i = 0; i < kScreenCount; i++)
         if (kScreenOpts[i].value == (int)g_screenOffSec)
-            strcpy(vals[9], kScreenOpts[i].name);
+            strcpy(vals[13], kScreenOpts[i].name);
     if (g_radioCompanion)
-        snprintf(vals[10], sizeof(vals[10]), "BLE: %s", g_peerName[0] ? g_peerName : "(no node)");
+        snprintf(vals[14], sizeof(vals[14]), "BLE: %s", g_peerName[0] ? g_peerName : "(no node)");
     else
-        strcpy(vals[10], "onboard");
+        strcpy(vals[14], "onboard");
 
     const int rowH = 15, top = 15, maxRows = (124 - top) / rowH;
     if (setSel < setScroll)
@@ -2742,6 +2806,40 @@ void AdvUI::drawBlePin()
         canvas.pushSprite(0, 0);
 }
 
+// Local mode: a phone is pairing with US — show the passkey it must enter (the
+// stock screen that would display it is compiled out).
+void AdvUI::drawBtPin()
+{
+    lgfx::LGFXBase *g = haveCanvas ? static_cast<lgfx::LGFXBase *>(&canvas) : static_cast<lgfx::LGFXBase *>(&display);
+
+    g->fillScreen(0x0000);
+    g->setFont(&lgfx::fonts::Font0);
+    g->setTextSize(1);
+    g->setTextColor(0x07FF);
+    g->setCursor(4, 3);
+    g->print("Bluetooth pairing");
+    g->drawFastHLine(0, 13, 240, 0x39C7);
+
+    g->setTextColor(0x8410);
+    g->setCursor(30, 30);
+    g->print("enter this code on the phone");
+
+    char pin[16] = "";
+    if (bluetoothStatus->getConnectionState() == meshtastic::BluetoothStatus::ConnectionState::PAIRING)
+        snprintf(pin, sizeof(pin), "%s", bluetoothStatus->getPasskey().c_str());
+    g->setFont(&lgfx::fonts::FreeSansBold9pt7b);
+    g->setTextSize(2);
+    g->setTextColor(0xFFFF);
+    g->setCursor((240 - g->textWidth(pin)) / 2, 56);
+    g->print(pin);
+    g->setTextSize(1);
+
+    drawFooter(g, "ESC hide");
+
+    if (haveCanvas)
+        canvas.pushSprite(0, 0);
+}
+
 // Companion: link progress/status against the saved node.
 void AdvUI::drawBleLink()
 {
@@ -2812,26 +2910,15 @@ void AdvUI::drawPickList()
 
     g->fillScreen(0x0000);
 
-    const EnumOpt *opts = pickTarget == 0   ? kRegionOpts
-                          : pickTarget == 1 ? kPresetOpts
-                          : pickTarget == 2 ? kUtcOpts
-                          : pickTarget == 4 ? kScreenOpts
-                                            : kRadioOpts;
-    int cnt = pickTarget == 0   ? kRegionCount
-              : pickTarget == 1 ? kPresetCount
-              : pickTarget == 2 ? kUtcCount
-              : pickTarget == 4 ? kScreenCount
-                                : kRadioCount;
+    PickList pl = pickListFor(pickTarget);
+    const EnumOpt *opts = pl.opts;
+    int cnt = pl.cnt;
 
     g->setFont(&lgfx::fonts::Font0);
     g->setTextSize(1);
     g->setTextColor(0x07FF); // cyan
     g->setCursor(4, 3);
-    g->print(pickTarget == 0   ? "Region"
-             : pickTarget == 1 ? "Preset"
-             : pickTarget == 2 ? "UTC offset"
-             : pickTarget == 4 ? "Screen off"
-                               : "Radio");
+    g->print(pl.title);
     g->drawFastHLine(0, 13, 240, 0x39C7);
 
     const int rowH = 18, top = 15, maxRows = (124 - top) / rowH;
@@ -3068,34 +3155,59 @@ void AdvUI::runDemoDump()
 }
 #endif
 
-// Applies a LoRa setting (0 = region, 1 = preset), persists it, and schedules the
-// reboot the radio needs to re-init on the new parameters.
+// Applies a radio-config pick (by pickTarget: 0 region, 1 preset, 5 role,
+// 6 hop limit, 7 TX power, 8 rebroadcast mode), persists it, and schedules the
+// reboot the radio needs. In companion mode it goes to the linked node as a
+// set_config admin message instead — the node saves and reboots itself.
 void AdvUI::applyLoRa(int target, int value)
 {
-    if (g_radioCompanion) { // remote admin: the node saves and reboots itself
-        if (!g_compLoraValid)
+    bool devCfg = target == 5 || target == 8; // role / rebroadcast live in DeviceConfig
+
+    if (g_radioCompanion) {
+        if (devCfg ? !g_compDeviceValid : !g_compLoraValid)
             return;
         meshtastic_AdminMessage adm = meshtastic_AdminMessage_init_default;
         adm.which_payload_variant = meshtastic_AdminMessage_set_config_tag;
+        if (devCfg) {
+            adm.set_config.which_payload_variant = meshtastic_Config_device_tag;
+            meshtastic_Config_DeviceConfig &dc = adm.set_config.payload_variant.device;
+            dc = g_compDevice;
+            if (target == 5)
+                dc.role = (meshtastic_Config_DeviceConfig_Role)value;
+            else
+                dc.rebroadcast_mode = (meshtastic_Config_DeviceConfig_RebroadcastMode)value;
+            if (sendAdminToNode(adm)) {
+                g_compDevice = dc; // optimistically ours; the reconnect config stream confirms
+                mode = MODE_BLELINK;
+            }
+            return;
+        }
         adm.set_config.which_payload_variant = meshtastic_Config_lora_tag;
         meshtastic_Config_LoRaConfig &lc = adm.set_config.payload_variant.lora;
         lc = g_compLora;
-        if (target == 0) {
-            lc.region = (meshtastic_Config_LoRaConfig_RegionCode)value;
-        } else {
+        switch (target) {
+        case 0: lc.region = (meshtastic_Config_LoRaConfig_RegionCode)value; break;
+        case 6: lc.hop_limit = (uint32_t)value; break;
+        case 7: lc.tx_power = value; break;
+        default:
             lc.use_preset = true;
             lc.modem_preset = (meshtastic_Config_LoRaConfig_ModemPreset)value;
         }
         if (sendAdminToNode(adm)) {
-            g_compLora = lc; // optimistically ours; the reconnect config stream confirms
+            g_compLora = lc;
             g_compPreset = (int)lc.modem_preset;
             mode = MODE_BLELINK; // watch the node reboot + the link come back
         }
         return;
     }
-    if (target == 0) {
-        config.lora.region = (meshtastic_Config_LoRaConfig_RegionCode)value;
-    } else {
+
+    switch (target) {
+    case 0: config.lora.region = (meshtastic_Config_LoRaConfig_RegionCode)value; break;
+    case 5: config.device.role = (meshtastic_Config_DeviceConfig_Role)value; break;
+    case 6: config.lora.hop_limit = (uint32_t)value; break;
+    case 7: config.lora.tx_power = value; break;
+    case 8: config.device.rebroadcast_mode = (meshtastic_Config_DeviceConfig_RebroadcastMode)value; break;
+    default:
         config.lora.use_preset = true;
         config.lora.modem_preset = (meshtastic_Config_LoRaConfig_ModemPreset)value;
     }
@@ -3159,6 +3271,12 @@ void AdvUI::handleKey(char ch)
         return;
     }
 
+    if (mode == MODE_BTPIN) {
+        if (esc)
+            mode = btPinReturn; // pairing keeps going in the background
+        return;
+    }
+
     if (mode == MODE_SETTINGS) {
         if (esc) {
             mode = MODE_NODES;
@@ -3219,23 +3337,52 @@ void AdvUI::handleKey(char ch)
             nameLen = strlen(nameBuf);
             nameReturn = MODE_SETTINGS;
             mode = MODE_SETNAME;
-        } else if (enter && setSel == 6) { // UTC offset -> city/offset picker
+        } else if (enter && setSel == 6) { // Role
+            if (g_radioCompanion && !g_compDeviceValid)
+                return;
+            pickTarget = 5;
+            pickSel = optIndex(kRoleOpts2, kRoleCount, (int)(g_radioCompanion ? g_compDevice.role : config.device.role));
+            pickScroll = 0;
+            mode = MODE_PICKLIST;
+        } else if (enter && setSel == 7) { // Hop limit
+            if (g_radioCompanion && !g_compLoraValid)
+                return;
+            pickTarget = 6;
+            pickSel = optIndex(kHopOpts, kHopCount, (int)(g_radioCompanion ? g_compLora.hop_limit : config.lora.hop_limit));
+            pickScroll = 0;
+            mode = MODE_PICKLIST;
+        } else if (enter && setSel == 8) { // TX power
+            if (g_radioCompanion && !g_compLoraValid)
+                return;
+            pickTarget = 7;
+            pickSel = optIndex(kPowerOpts, kPowerCount, (int)(g_radioCompanion ? g_compLora.tx_power : config.lora.tx_power));
+            pickScroll = 0;
+            mode = MODE_PICKLIST;
+        } else if (enter && setSel == 9) { // Rebroadcast mode
+            if (g_radioCompanion && !g_compDeviceValid)
+                return;
+            pickTarget = 8;
+            pickSel = optIndex(kRebroadOpts, kRebroadCount,
+                               (int)(g_radioCompanion ? g_compDevice.rebroadcast_mode : config.device.rebroadcast_mode));
+            pickScroll = 0;
+            mode = MODE_PICKLIST;
+        } else if (enter && setSel == 10) { // UTC offset -> city/offset picker
             pickTarget = 2;
             pickSel = optIndex(kUtcOpts, kUtcCount, g_utcOffsetMin);
             pickScroll = 0;
             mode = MODE_PICKLIST;
-        } else if (enter && setSel == 9) { // Screen auto-off -> timeout picker
+        } else if (enter && setSel == 13) { // Screen auto-off -> timeout picker
             pickTarget = 4;
             pickSel = optIndex(kScreenOpts, kScreenCount, (int)g_screenOffSec);
             pickScroll = 0;
             mode = MODE_PICKLIST;
-        } else if (enter && setSel == 10) { // Radio backend -> onboard/companion picker
+        } else if (enter && setSel == 14) { // Radio backend -> onboard/companion picker
             pickTarget = 3;
             pickSel = g_radioCompanion ? 1 : 0;
             pickScroll = 0;
             mode = MODE_PICKLIST;
-        } else if (enter && (setSel == 7 || setSel == 8)) { // WiFi / MQTT sub-page
-            netPage = setSel == 7 ? 0 : 1;
+        } else if (enter && (setSel == 11 || setSel == 12)) { // WiFi / MQTT sub-page
+            netPage = setSel == 11 ? 0 : 1;
             netSel = 0;
             netScroll = 0;
             netDirty = false;
@@ -3351,11 +3498,7 @@ void AdvUI::handleKey(char ch)
     }
 
     if (mode == MODE_PICKLIST) {
-        int cnt = pickTarget == 0   ? kRegionCount
-                  : pickTarget == 1 ? kPresetCount
-                  : pickTarget == 2 ? kUtcCount
-                  : pickTarget == 4 ? kScreenCount
-                                    : kRadioCount;
+        int cnt = pickListFor(pickTarget).cnt;
         if (esc) {
             mode = MODE_SETTINGS;
         } else if (up) {
@@ -3392,8 +3535,9 @@ void AdvUI::handleKey(char ch)
                     mode = MODE_SETTINGS;
                 }
             } else {
-                const EnumOpt *opts = pickTarget == 0 ? kRegionOpts : kPresetOpts;
-                applyLoRa(pickTarget, opts[pickSel].value); // sets config, saves, schedules reboot
+                // Region/Preset/Role/Hops/Power/Rebroadcast: radio config, needs a
+                // reboot (ours, or the linked node's via remote admin).
+                applyLoRa(pickTarget, pickListFor(pickTarget).opts[pickSel].value);
             }
         }
         return;
@@ -3848,6 +3992,20 @@ int32_t AdvUI::runOnce()
         bleConnectAsync(g_peerAddr, g_peerType);
     }
 
+    // A phone is pairing with us (local mode): pop the passkey screen, waking the
+    // display if needed — same as stock behaviour, just on our UI.
+    if (!g_radioCompanion && splashDone) {
+        bool phonePairing = bluetoothStatus->getConnectionState() == meshtastic::BluetoothStatus::ConnectionState::PAIRING;
+        if (phonePairing && mode != MODE_BTPIN) {
+            btPinReturn = (mode == MODE_COMPOSE || mode == MODE_NODE) ? MODE_NODE : MODE_CHATS;
+            mode = MODE_BTPIN;
+            if (!screenOn)
+                screenWake();
+        } else if (!phonePairing && mode == MODE_BTPIN) {
+            mode = btPinReturn; // pairing finished (either way)
+        }
+    }
+
     // Pairing wants a passkey: drop whatever we're doing and show the PIN screen.
     if (g_pinRequested && mode != MODE_BLEPIN) {
         pinLen = 0;
@@ -3866,7 +4024,8 @@ int32_t AdvUI::runOnce()
     // Screen auto-off: no input for the configured time cuts the display rail.
     // Setup/transient screens keep it awake, and a PIN request relights it (pairing
     // needs the user). While dark, skip all rendering — the panel is unpowered.
-    bool sleepable = splashDone && g_screenOffSec > 0 && mode != MODE_BLEPIN && mode != MODE_BLESCAN && mode != MODE_REBOOT;
+    bool sleepable = splashDone && g_screenOffSec > 0 && mode != MODE_BLEPIN && mode != MODE_BLESCAN &&
+                     mode != MODE_REBOOT && mode != MODE_BTPIN;
     if (screenOn && sleepable && millis() - lastActivityMs >= (uint32_t)g_screenOffSec * 1000)
         screenSleep();
     if (!screenOn) {
@@ -3894,6 +4053,8 @@ int32_t AdvUI::runOnce()
         drawBlePin();
     else if (mode == MODE_BLELINK)
         drawBleLink();
+    else if (mode == MODE_BTPIN)
+        drawBtPin();
     else if (mode == MODE_PICKLIST)
         drawPickList();
     else if (mode == MODE_REBOOT)

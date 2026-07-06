@@ -113,7 +113,7 @@ const char *errName(uint8_t e)
     }
 }
 constexpr int kMaxMsgs = 32;
-constexpr int kNumSettings = 10; // Name, Short, Region, Preset, Frequency, Channel, UTC, WiFi, MQTT, Radio
+constexpr int kNumSettings = 11; // Name, Short, Region, Preset, Frequency, Channel, UTC, WiFi, MQTT, Screen, Radio
 Msg g_msgs[kMaxMsgs];
 int g_msgCount = 0;         // populated slots (grows to kMaxMsgs)
 int g_msgNext = 0;          // next write slot (ring head)
@@ -234,6 +234,7 @@ bool chanFav(int i) { return g_favChannels & (1u << i); }
 
 // User-set UTC offset (minutes) for message timestamps; the device has no GPS/tz.
 int32_t g_utcOffsetMin = 0;
+int32_t g_screenOffSec = 300; // screen auto-off timeout; 0 = never
 
 // Transliterated Cyrillic input layer (Fn+L); persisted with the messages so the
 // chosen layout survives a reboot.
@@ -472,6 +473,7 @@ void saveMsgs()
     f.write(&rn, 1);
     f.write((const uint8_t *)g_reacts, sizeof(g_reacts));
     f.write((const uint8_t *)g_msgReply, sizeof(g_msgReply)); // optional tail: reply links
+    f.write((const uint8_t *)&g_screenOffSec, sizeof(g_screenOffSec)); // optional tail: screen auto-off
     f.close();
 }
 
@@ -498,11 +500,15 @@ void loadMsgs()
     size_t rBytes = f.read((uint8_t *)tmpR, sizeof(tmpR));
     static uint32_t tmpRe[kMaxMsgs];
     size_t reBytes = f.read((uint8_t *)tmpRe, sizeof(tmpRe)); // optional tail: reply links
+    int32_t so = 0;
+    size_t soBytes = f.read((uint8_t *)&so, sizeof(so)); // optional tail: screen auto-off
     f.close();
     if (magic != kMsgMagic || n != sizeof(g_msgs) || cnt < 0 || cnt > kMaxMsgs || nxt < 0 || nxt >= kMaxMsgs)
         return;
     g_utcOffsetMin = off;
     g_ruMode = ru != 0;
+    if (soBytes == sizeof(so) && (so == 0 || (so >= 15 && so <= 3600)))
+        g_screenOffSec = so;
     if (rBytes == sizeof(tmpR) && rc <= kMaxReacts && rn < kMaxReacts) {
         memcpy(g_reacts, tmpR, sizeof(g_reacts));
         g_reactCount = rc;
@@ -652,10 +658,12 @@ const EnumOpt kUtcOpts[] = {
     {"UTC+12 Kamchatka", 720},  {"UTC+13 Samoa", 780},        {"UTC+14 Kiritimati", 840}};
 // Radio backend: local Cap LoRa, or another node's radio over BLE (companion).
 const EnumOpt kRadioOpts[] = {{"Onboard (Cap LoRa)", 0}, {"Companion via BLE", 1}};
+const EnumOpt kScreenOpts[] = {{"15 s", 15}, {"30 s", 30}, {"1 min", 60}, {"5 min", 300}, {"never", 0}};
 constexpr int kRegionCount = sizeof(kRegionOpts) / sizeof(kRegionOpts[0]);
 constexpr int kPresetCount = sizeof(kPresetOpts) / sizeof(kPresetOpts[0]);
 constexpr int kUtcCount = sizeof(kUtcOpts) / sizeof(kUtcOpts[0]);
 constexpr int kRadioCount = sizeof(kRadioOpts) / sizeof(kRadioOpts[0]);
+constexpr int kScreenCount = sizeof(kScreenOpts) / sizeof(kScreenOpts[0]);
 
 int optIndex(const EnumOpt *opts, int cnt, int value)
 {
@@ -1204,6 +1212,27 @@ void shortNameOf(uint32_t num, char *out, size_t cap)
 
 AdvUI::AdvUI() : concurrency::OSThread("advui") {}
 
+// Screen auto-off cuts the display power rail (GPIO38 feeds panel + backlight —
+// there is no separately dimmable backlight on this board), so waking needs a
+// full panel re-init: the ST7789 loses its config with the rail.
+void AdvUI::screenSleep()
+{
+    screenOn = false;
+    digitalWrite(38, LOW);
+    LOG_INFO("advui: screen sleep");
+}
+
+void AdvUI::screenWake()
+{
+    digitalWrite(38, HIGH);
+    delay(20); // let the rail settle before talking to the panel
+    display.init();
+    display.setRotation(1);
+    screenOn = true;
+    lastActivityMs = millis();
+    LOG_INFO("advui: screen wake");
+}
+
 void AdvUI::initHardware()
 {
     pinMode(38, OUTPUT); // display power/backlight rail — steady HIGH, not PWM
@@ -1212,12 +1241,20 @@ void AdvUI::initHardware()
     bool ok = display.init();
     display.setRotation(1); // landscape 240x135
     display.fillScreen(0x0000);
+    lastActivityMs = millis();
 
     // 8-bit (rgb332) frame buffer: 32KB instead of 64KB. The full 16-bit buffer
     // starved the internal DMA pool so PKI crypto (esp-aes) couldn't allocate and
     // DMs failed to send. Colours coarsen slightly but stay recognisable.
+    //
+    // The buffer is static RAM, not createSprite(): a 32KB contiguous malloc can
+    // fail on a fragmented heap (WiFi+MQTT setups), and the direct-draw fallback
+    // repaints the panel at 5 Hz — the "blinking screen" users reported. A static
+    // buffer costs the same RAM but can never fail or fragment.
+    static uint8_t fb[240 * 135];
     canvas.setColorDepth(8);
-    haveCanvas = (canvas.createSprite(display.width(), display.height()) != nullptr);
+    canvas.setBuffer(fb, display.width(), display.height(), 8);
+    haveCanvas = true;
     LOG_INFO("advui: UI up init=%d %dx%d canvas=%d", (int)ok, display.width(), display.height(),
              (int)haveCanvas);
 
@@ -2447,8 +2484,8 @@ void AdvUI::drawSettings()
     g->print("Settings");
     g->drawFastHLine(0, 13, 240, 0x39C7);
 
-    const char *labels[kNumSettings] = {"Name",    "Short", "Region", "Preset", "Frequency",
-                                         "Channel", "UTC",   "WiFi",   "MQTT",   "Radio"};
+    const char *labels[kNumSettings] = {"Name", "Short", "Region", "Preset", "Frequency", "Channel",
+                                        "UTC",  "WiFi",  "MQTT",   "Screen", "Radio"};
     char vals[kNumSettings][24];
     if (g_radioCompanion) { // rows 0-5 show (and remote-admin edit) the linked node
         meshtastic_NodeInfoLite *me = g_linkMyNode ? nodeByNum(g_linkMyNode) : nullptr;
@@ -2487,10 +2524,14 @@ void AdvUI::drawSettings()
     else
         strcpy(vals[7], "off");
     strcpy(vals[8], moduleConfig.mqtt.enabled ? "on" : "off");
+    strcpy(vals[9], "never");
+    for (int i = 0; i < kScreenCount; i++)
+        if (kScreenOpts[i].value == (int)g_screenOffSec)
+            strcpy(vals[9], kScreenOpts[i].name);
     if (g_radioCompanion)
-        snprintf(vals[9], sizeof(vals[9]), "BLE: %s", g_peerName[0] ? g_peerName : "(no node)");
+        snprintf(vals[10], sizeof(vals[10]), "BLE: %s", g_peerName[0] ? g_peerName : "(no node)");
     else
-        strcpy(vals[9], "onboard");
+        strcpy(vals[10], "onboard");
 
     const int rowH = 15, top = 15, maxRows = (124 - top) / rowH;
     if (setSel < setScroll)
@@ -2771,14 +2812,26 @@ void AdvUI::drawPickList()
 
     g->fillScreen(0x0000);
 
-    const EnumOpt *opts = pickTarget == 0 ? kRegionOpts : pickTarget == 1 ? kPresetOpts : pickTarget == 2 ? kUtcOpts : kRadioOpts;
-    int cnt = pickTarget == 0 ? kRegionCount : pickTarget == 1 ? kPresetCount : pickTarget == 2 ? kUtcCount : kRadioCount;
+    const EnumOpt *opts = pickTarget == 0   ? kRegionOpts
+                          : pickTarget == 1 ? kPresetOpts
+                          : pickTarget == 2 ? kUtcOpts
+                          : pickTarget == 4 ? kScreenOpts
+                                            : kRadioOpts;
+    int cnt = pickTarget == 0   ? kRegionCount
+              : pickTarget == 1 ? kPresetCount
+              : pickTarget == 2 ? kUtcCount
+              : pickTarget == 4 ? kScreenCount
+                                : kRadioCount;
 
     g->setFont(&lgfx::fonts::Font0);
     g->setTextSize(1);
     g->setTextColor(0x07FF); // cyan
     g->setCursor(4, 3);
-    g->print(pickTarget == 0 ? "Region" : pickTarget == 1 ? "Preset" : pickTarget == 2 ? "UTC offset" : "Radio");
+    g->print(pickTarget == 0   ? "Region"
+             : pickTarget == 1 ? "Preset"
+             : pickTarget == 2 ? "UTC offset"
+             : pickTarget == 4 ? "Screen off"
+                               : "Radio");
     g->drawFastHLine(0, 13, 240, 0x39C7);
 
     const int rowH = 18, top = 15, maxRows = (124 - top) / rowH;
@@ -3171,7 +3224,12 @@ void AdvUI::handleKey(char ch)
             pickSel = optIndex(kUtcOpts, kUtcCount, g_utcOffsetMin);
             pickScroll = 0;
             mode = MODE_PICKLIST;
-        } else if (enter && setSel == 9) { // Radio backend -> onboard/companion picker
+        } else if (enter && setSel == 9) { // Screen auto-off -> timeout picker
+            pickTarget = 4;
+            pickSel = optIndex(kScreenOpts, kScreenCount, (int)g_screenOffSec);
+            pickScroll = 0;
+            mode = MODE_PICKLIST;
+        } else if (enter && setSel == 10) { // Radio backend -> onboard/companion picker
             pickTarget = 3;
             pickSel = g_radioCompanion ? 1 : 0;
             pickScroll = 0;
@@ -3293,7 +3351,11 @@ void AdvUI::handleKey(char ch)
     }
 
     if (mode == MODE_PICKLIST) {
-        int cnt = pickTarget == 0 ? kRegionCount : pickTarget == 1 ? kPresetCount : pickTarget == 2 ? kUtcCount : kRadioCount;
+        int cnt = pickTarget == 0   ? kRegionCount
+                  : pickTarget == 1 ? kPresetCount
+                  : pickTarget == 2 ? kUtcCount
+                  : pickTarget == 4 ? kScreenCount
+                                    : kRadioCount;
         if (esc) {
             mode = MODE_SETTINGS;
         } else if (up) {
@@ -3303,7 +3365,11 @@ void AdvUI::handleKey(char ch)
             if (pickSel < cnt - 1)
                 pickSel++;
         } else if (enter) {
-            if (pickTarget == 2) { // UTC offset: applied live, persisted with msgs
+            if (pickTarget == 4) { // screen auto-off: applied live, persisted with msgs
+                g_screenOffSec = kScreenOpts[pickSel].value;
+                g_msgsDirty = true;
+                mode = MODE_SETTINGS;
+            } else if (pickTarget == 2) { // UTC offset: applied live, persisted with msgs
                 g_utcOffsetMin = kUtcOpts[pickSel].value;
                 g_msgsDirty = true;
                 mode = MODE_SETTINGS;
@@ -3693,14 +3759,23 @@ int32_t AdvUI::runOnce()
     kb.setNavKeys(mode != MODE_SETNAME && mode != MODE_COMPOSE); // symbols while typing, arrows otherwise
     kb.trigger();
     bool keyDuringSplash = false;
+    bool wakeOnly = !screenOn; // keys pressed on a dark screen only wake it
+    bool sawKey = false;
     while (kb.hasEvent()) {
         char ch = kb.dequeueEvent();
-        if (splashDone)
+        sawKey = true;
+        if (wakeOnly) {
+            // swallowed: the wake key must not also act
+        } else if (splashDone)
             handleKey(ch);
         else
             keyDuringSplash = true; // any key dismisses the splash early
         kb.trigger(); // re-read the FIFO as we drain (matches the stock poll loop)
     }
+    if (sawKey)
+        lastActivityMs = millis();
+    if (wakeOnly && sawKey)
+        screenWake();
     kb.clearInt(); // re-arm the TCA8418 interrupt, else it stops reporting after the first event
 
     if (!splashDone && (keyDuringSplash || millis() - bootMs > 2000))
@@ -3786,6 +3861,19 @@ int32_t AdvUI::runOnce()
         saveMsgs();
         g_msgsDirty = false;
         g_lastSaveMs = millis();
+    }
+
+    // Screen auto-off: no input for the configured time cuts the display rail.
+    // Setup/transient screens keep it awake, and a PIN request relights it (pairing
+    // needs the user). While dark, skip all rendering — the panel is unpowered.
+    bool sleepable = splashDone && g_screenOffSec > 0 && mode != MODE_BLEPIN && mode != MODE_BLESCAN && mode != MODE_REBOOT;
+    if (screenOn && sleepable && millis() - lastActivityMs >= (uint32_t)g_screenOffSec * 1000)
+        screenSleep();
+    if (!screenOn) {
+        if (splashDone && !sleepable && g_screenOffSec > 0)
+            screenWake(); // e.g. the pairing PIN screen opened while dark
+        else
+            return 200;
     }
 
     if (!splashDone)

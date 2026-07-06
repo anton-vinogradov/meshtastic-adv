@@ -114,6 +114,7 @@ the middle, the compose bar sits at the bottom.
 | **UTC**       | UTC-offset picker with city labels — drives all timestamps                   |
 | **WiFi**      | join a network (NTP time comes with it); enabling WiFi turns Bluetooth off   |
 | **MQTT**      | bridge the mesh to the internet: default public broker or your own           |
+| **Screen**    | auto-off timeout (15 s … 5 min, or never; default 5 min) — saves the battery |
 | **Radio**     | **Onboard (Cap LoRa)** or **Companion via BLE** — see below                  |
 
 **↑/↓** move, **Enter** edits (or toggles), **ESC** backs out. Changes that affect the radio
@@ -158,6 +159,9 @@ reminds you).
   persisted to flash, as are all settings.
 - **Sound + light:** one beep + green LED flash for favourites, a blue flash for everyone
   else — never a buzz per packet.
+- **Screen auto-off** cuts the whole display rail after the configured idle time. Any key
+  wakes it (that key is swallowed); incoming messages don't light it up — the beep and the
+  LED do the notifying, the unread badges are there when you wake it.
 - The node DB caps at 200 nodes on this hardware; the header shows `200+` when it's full.
   In companion mode the synced node table holds the 128 most recently heard nodes.
 - Other nodes' battery levels aren't stored by this build's compact node DB — only our own

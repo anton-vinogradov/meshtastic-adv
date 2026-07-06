@@ -35,6 +35,7 @@ You get a device that boots straight into a usable messenger: pick a contact, ty
 - **📡 WiFi + MQTT, on-device** — join WiFi and bridge the mesh to the internet over MQTT (default public broker or your own), configured right on the device — no phone needed. WiFi also sets the clock via NTP.
 - **💾 History that survives reboots** — the conversation ring is persisted to flash.
 - **⚙️ On-device settings** — name, region, modem preset, frequency, channel, UTC, WiFi and MQTT, all editable on the device (long-press **ESC**).
+- **🔋 Screen auto-off** — the display powers down after 15 s…5 min idle (your pick); any key wakes it, alerts still beep and flash the LED while it's dark.
 - **🔗 Companion mode** — no LoRa cap? Pair the Cardputer with **any stock Meshtastic node** (Heltec, T-Beam, RAK…) over Bluetooth and use its radio: the whole chat UI above, through the other node. [Details below.](#companion-mode-drive-another-node-over-ble)
 
 <p align="center">

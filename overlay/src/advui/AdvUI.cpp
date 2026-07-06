@@ -1,5 +1,6 @@
 #include "AdvUI.h"
 #include "AdvBle.h"
+#include "AdvFont.h"
 #include "BluetoothStatus.h"
 #include "CyrillicFont.h"
 #include "FSCommon.h"
@@ -114,13 +115,13 @@ const char *errName(uint8_t e)
     }
 }
 constexpr int kMaxMsgs = 32;
-constexpr int kNumSettings = 15; // the flat item table: Name..Channel, Role..Rebroadcast, UTC, WiFi, MQTT, Screen, Radio
+constexpr int kNumSettings = 16; // the flat item table: Name..Channel, Role..Rebroadcast, UTC, WiFi, MQTT, Screen, Radio, Font
 
 // The Settings menu is two-level: the top lists sections (plus WiFi/MQTT/Radio
 // as direct entries); a section lists indices into the flat item table.
 const uint8_t kSecNode[] = {0, 1};                    // Name, Short
 const uint8_t kSecLora[] = {2, 3, 4, 5, 6, 7, 8, 9};  // Region..Rebroadcast
-const uint8_t kSecDevice[] = {10, 13};                // UTC, Screen
+const uint8_t kSecDevice[] = {10, 13, 15};            // UTC, Screen, Font (read-only)
 constexpr int kTopCount = 6;                          // Node, LoRa, WiFi, MQTT, Device, Radio
 Msg g_msgs[kMaxMsgs];
 int g_msgCount = 0;         // populated slots (grows to kMaxMsgs)
@@ -1142,6 +1143,26 @@ int wrapLine(lgfx::LGFXBase *g, const char *s, int maxW, char *out, int outCap)
 }
 
 // Pixel width of a string with inline emoji (each emoji counts as its glyph advance).
+// Decodes one UTF-8 sequence of known length into a codepoint.
+uint32_t utf8Cp(const char *s, int len)
+{
+    unsigned char c = (unsigned char)s[0];
+    if (len == 2)
+        return ((c & 0x1F) << 6) | (s[1] & 0x3F);
+    if (len == 3)
+        return ((c & 0x0F) << 12) | ((s[1] & 0x3F) << 6) | (s[2] & 0x3F);
+    if (len == 4)
+        return ((c & 0x07) << 18) | ((s[1] & 0x3F) << 12) | ((s[2] & 0x3F) << 6) | (s[3] & 0x3F);
+    return c;
+}
+
+// What the embedded 9x15 font actually has: ASCII plus Cyrillic. Everything
+// else goes to the unicode font when present (and to the tofu box when not).
+bool flashFontCovers(uint32_t cp)
+{
+    return cp < 0x7F || (cp >= 0x400 && cp <= 0x45F) || cp == 0x490 || cp == 0x491;
+}
+
 int lineWidthEmotes(lgfx::LGFXBase *g, const char *s)
 {
     int w = 0;
@@ -1158,7 +1179,9 @@ int lineWidthEmotes(lgfx::LGFXBase *g, const char *s)
             for (; k < tlen && s[k]; k++)
                 cb[k] = s[k];
             cb[k] = 0;
-            w += g->textWidth(cb);
+            uint32_t cp = utf8Cp(cb, k);
+            int gw = !flashFontCovers(cp) ? sdGlyphWidth(cp) : 0;
+            w += gw ? gw + 1 : g->textWidth(cb);
             s += k;
         }
     }
@@ -1188,10 +1211,18 @@ int printLineEmotes(lgfx::LGFXBase *g, int x, int y, const char *s, uint16_t col
             for (; k < tlen && s[k]; k++)
                 cb[k] = s[k];
             cb[k] = 0;
-            g->setTextColor(color);
-            g->setCursor(cx, y);
-            g->print(cb);
-            cx += g->textWidth(cb);
+            uint32_t cp = utf8Cp(cb, k);
+            uint8_t bits[32];
+            int gw = !flashFontCovers(cp) ? sdGlyph(cp, bits) : 0;
+            if (gw) { // unicode glyph, aligned onto the emoji band
+                g->drawBitmap(cx, y + (17 - 16) / 2 + emojiDy, bits, gw, 16, color);
+                cx += gw + 1;
+            } else {
+                g->setTextColor(color);
+                g->setCursor(cx, y);
+                g->print(cb);
+                cx += g->textWidth(cb);
+            }
             s += k;
         }
     }
@@ -1216,6 +1247,8 @@ void utf8Copy(char *out, const char *s, int maxBytes)
 // stock emoji bitmaps) — the 9x15 font renders those as boxes. In place.
 void sanitizeDisplay(char *s)
 {
+    if (sdFontReady())
+        return; // the unicode font draws anything in the BMP — keep names whole
     char out[32];
     int o = 0;
     const char *p = s;
@@ -1331,6 +1364,7 @@ void AdvUI::initHardware()
     kb.begin();
     LOG_INFO("advui: keyboard ready");
 
+    sdFontInit(); // flash font partition (or /unifont.bin on SD) unlocks full-BMP text
     loadMsgs(); // restore the saved conversation from flash
     if (g_radioCompanion) {
         // The companion is a terminal to another node: free the RAM the stock BT
@@ -1720,15 +1754,14 @@ void AdvUI::openEntry(int s)
     pendingReplyId = 0;
     if (s < chanCount) {
         selectedChannel = chanList[s];
-        chatAnchorMsgIdx = firstUnreadIdx(); // capture the first unread before clearing it
-        markReadChannel(selectedChannel);
+        chatAnchorMsgIdx = firstUnreadIdx(); // jump target; read flags clear as lines get seen
         mode = MODE_NODE;
     } else if (nodeDB) {
         meshtastic_NodeInfoLite *node = nodeAt(filtered[s - chanCount]);
         if (node) {
             selectedChannel = -1;
             selectedNum = node->num;
-            chatAnchorMsgIdx = firstUnreadIdx(); // markReadFrom() runs later in drawNode
+            chatAnchorMsgIdx = firstUnreadIdx();
             mode = MODE_NODE;
         }
     }
@@ -1798,7 +1831,6 @@ void AdvUI::openConv(int i)
     if (conv[i].isChan) {
         selectedChannel = conv[i].ch;
         chatAnchorMsgIdx = firstUnreadIdx();
-        markReadChannel(selectedChannel);
     } else {
         selectedChannel = -1;
         selectedNum = conv[i].node;
@@ -2099,10 +2131,8 @@ void AdvUI::drawNode()
     meshtastic_NodeInfoLite *node = !isChan ? nodeByNum(selectedNum) : nullptr;
     uint32_t me = myNodeNum();
 
-    if (isChan)
-        markReadChannel(selectedChannel); // opening the thread clears its unread
-    else
-        markReadFrom(selectedNum);
+    // Read flags clear per message as its lines actually reach the screen (see
+    // the render loop below) — leaving mid-thread keeps the rest unread.
 
     // header: the channel, or the node's row (name + signal + hops + role), like the list
     if (isChan) {
@@ -2149,6 +2179,7 @@ void AdvUI::drawNode()
             char text[40];
             uint16_t color;
             bool last;        // final line of its message (draws the status marker)
+            int16_t msgIdx;   // g_msgs ring index (-1: quote/reaction decoration)
             bool out;
             uint8_t status;
             uint8_t err;
@@ -2156,15 +2187,20 @@ void AdvUI::drawNode()
             uint8_t nameLen;  // chars after the time that are the sender-name span (channels)
         };
         int32_t tzOff = g_utcOffsetMin * 60; // user-set UTC offset (Settings > UTC)
-        static DLine dl[80]; // single-threaded UI: static keeps it off the stack
+        static DLine dl[160]; // single-threaded UI: static keeps it off the stack; sized so
+                              // a full 32-message backlog rarely overflows (the unread anchor
+                              // lives or dies with its lines staying in this ring)
         int dlCount = 0;
-        int anchorLine = -1; // dl index of the first unread message's first line (on open)
+        int anchorLine = -1;       // dl index of the first unread message's first line (on open)
+        bool anchorDropped = false; // its lines got evicted: land at the top of what's left
         int selMsgIdx = reactSel >= 0 ? matchedFromNewest(reactSel) : -1;
         int selFirst = -1, selLast = -1; // dl range of the react-selected message
         auto pushLine = [&]() -> DLine & {
             if (dlCount >= (int)(sizeof(dl) / sizeof(dl[0]))) { // drop the oldest line
                 memmove(dl, dl + 1, sizeof(dl) - sizeof(dl[0]));
                 dlCount--;
+                if (anchorLine == 0)
+                    anchorDropped = true; // the anchor's first line is the one being dropped
                 if (anchorLine >= 0)
                     anchorLine--; // trackers shift up with the dropped line
                 if (selFirst >= 0)
@@ -2201,6 +2237,7 @@ void AdvUI::drawNode()
                         utf8Copy(snip, g_msgs[q].text, (int)sizeof(snip) - 1);
                         snprintf(d.text, sizeof(d.text), "    | %s", snip);
                         d.color = 0x630C; // extra dim: context, not content
+                        d.msgIdx = -1;
                         d.out = false;
                         d.status = 0;
                         d.err = 0;
@@ -2223,6 +2260,7 @@ void AdvUI::drawNode()
                 DLine &d = pushLine();
                 p += wrapLine(g, p, wrapW, d.text, sizeof(d.text));
                 d.color = out ? 0x07FF : 0xFFFF; // outgoing cyan, incoming white
+                d.msgIdx = (int16_t)matched[i];
                 d.out = out;
                 d.status = m.status;
                 d.err = m.err;
@@ -2250,6 +2288,7 @@ void AdvUI::drawNode()
                     DLine &d = pushLine();
                     snprintf(d.text, sizeof(d.text), "    %s", rl);
                     d.color = 0x8410; // dim: metadata, not a message
+                    d.msgIdx = -1;
                     d.out = false;
                     d.status = 0;
                     d.err = 0;
@@ -2264,7 +2303,12 @@ void AdvUI::drawNode()
         // chatScroll counts lines scrolled up from the bottom (0 = pinned to newest).
         int maxScroll = dlCount > maxLines ? dlCount - maxLines : 0;
         if (chatAnchorMsgIdx >= 0) { // first render after opening: jump to the first unread
-            chatScroll = (anchorLine >= 0 && anchorLine <= maxScroll) ? maxScroll - anchorLine : 0;
+            if (anchorLine >= 0 && anchorLine <= maxScroll)
+                chatScroll = maxScroll - anchorLine;
+            else if (anchorDropped)
+                chatScroll = maxScroll; // unread starts beyond the ring: as far back as we can show
+            else
+                chatScroll = 0;
             chatAnchorMsgIdx = -1;
         }
         if (chatScroll > maxScroll)
@@ -2286,6 +2330,10 @@ void AdvUI::drawNode()
         int y = fy0;
         for (int i = startL; i < startL + maxLines && i < dlCount; i++) {
             DLine &d = dl[i];
+            if (d.msgIdx >= 0 && !g_msgs[d.msgIdx].read) { // it's on screen now: that's "read"
+                g_msgs[d.msgIdx].read = true;
+                g_msgsDirty = true;
+            }
             if (selFirst >= 0 && i >= selFirst && i <= selLast)
                 g->fillRect(0, y - 1, 236, lh, 0x2945); // react-mode selection band
             int cx = 4;
@@ -2540,7 +2588,8 @@ void AdvUI::drawSettings()
 
     const char *labels[kNumSettings] = {"Name", "Short",       "Region", "Preset", "Frequency",
                                         "Channel", "Role",     "Hops",   "Power",  "Rebroadcast",
-                                        "UTC",     "WiFi",     "MQTT",   "Screen", "Radio"};
+                                        "UTC",     "WiFi",     "MQTT",   "Screen", "Radio",
+                                        "Font"};
     char vals[kNumSettings][24];
     if (g_radioCompanion) { // rows 0-5 show (and remote-admin edit) the linked node
         meshtastic_NodeInfoLite *me = g_linkMyNode ? nodeByNum(g_linkMyNode) : nullptr;
@@ -2606,6 +2655,7 @@ void AdvUI::drawSettings()
         snprintf(vals[14], sizeof(vals[14]), "BLE: %s", g_peerName[0] ? g_peerName : "(no node)");
     else
         strcpy(vals[14], "onboard");
+    snprintf(vals[15], sizeof(vals[15]), "%s", sdFontState()); // unicode font source (read-only)
 
     // What the current level shows: top = sections + direct entries (with a
     // representative value as the preview), sub = the section's flat items.

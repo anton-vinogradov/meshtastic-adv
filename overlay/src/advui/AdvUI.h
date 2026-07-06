@@ -162,6 +162,9 @@ class AdvUI : public concurrency::OSThread
     bool inited = false;
     bool screenOn = true;        // display rail up; false = auto-off engaged
     uint32_t lastActivityMs = 0; // last key press, for the auto-off timer
+    bool uiDirty = true;         // something changed since the last frame -> redraw
+    Mode lastDrawnMode = MODE_CHATS; // catches mode flips from non-key paths
+    uint32_t lastDrawMs = 0;     // periodic refresh (battery %, ages) every ~10 s
     bool haveCanvas = false;
     bool splashDone = false;
     bool announced = false; // sent our early boot NodeInfo announce yet

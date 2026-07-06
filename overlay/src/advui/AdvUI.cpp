@@ -4008,6 +4008,7 @@ int32_t AdvUI::runOnce()
 
     while (!g_radioCompanion && api.available() && api.getFromRadio(fromRadioBuf) > 0) {
         handleFromRadio(api.lastFromRadio()); // pick out incoming text messages (local radio mode)
+        uiDirty = true;
     }
 
     if (g_radioCompanion) { // companion: mesh packets arrive from the BLE pump's ring
@@ -4016,8 +4017,10 @@ int32_t AdvUI::runOnce()
         static meshtastic_FromRadio fr; // large struct: keep off the stack
         while (bleNextPacket(pbuf, &plen)) {
             fr = meshtastic_FromRadio_init_default;
-            if (pb_decode_from_bytes(pbuf, plen, &meshtastic_FromRadio_msg, &fr))
+            if (pb_decode_from_bytes(pbuf, plen, &meshtastic_FromRadio_msg, &fr)) {
                 handleFromRadio(fr); // same pipeline: messages, reactions, delivery ACKs
+                uiDirty = true;
+            }
         }
     }
 
@@ -4054,8 +4057,10 @@ int32_t AdvUI::runOnce()
             keyDuringSplash = true; // any key dismisses the splash early
         kb.trigger(); // re-read the FIFO as we drain (matches the stock poll loop)
     }
-    if (sawKey)
+    if (sawKey) {
         lastActivityMs = millis();
+        uiDirty = true;
+    }
     if (wakeOnly && sawKey)
         screenWake();
     kb.clearInt(); // re-arm the TCA8418 interrupt, else it stops reporting after the first event
@@ -4172,6 +4177,24 @@ int32_t AdvUI::runOnce()
         else
             return 200;
     }
+
+    // Redraw only when something changed: a key, a handled packet, a mode flip
+    // from a non-key path (auto-jump, PIN popups), a live screen (splash timing,
+    // scan hits, link counters), or the ~10 s refresh for battery %/ages. Idle
+    // frames cost a full 32 KB render + SPI push at 5 Hz otherwise.
+    bool liveScreen = !splashDone || mode == MODE_BLESCAN || mode == MODE_BLELINK;
+    if (!(uiDirty || liveScreen || mode != lastDrawnMode || millis() - lastDrawMs > 10000)) {
+#ifdef HAS_I2S
+        if (g_beeping)
+            return 20; // keep pumping the tone at the fast tick
+#endif
+        if (kb.navHeld())
+            return 40; // a held key is auto-repeating: keep the fast cadence
+        return 200;
+    }
+    uiDirty = false;
+    lastDrawnMode = mode;
+    lastDrawMs = millis();
 
     if (!splashDone)
         drawSplash();

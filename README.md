@@ -83,6 +83,8 @@ The Cardputer can act as a **keyboard + screen terminal for a separate Meshtasti
 
 A Bluetooth rune in the Chats header shows the link state; the link auto-reconnects after drops. **Settings → Radio** doubles as a status page (link signal, the node's battery, traffic; **R** reconnect, **F** forget the node). Switch back with **Radio → Onboard (Cap LoRa)**.
 
+You can also **configure the linked node from the Cardputer**, like the phone app does: Settings shows the *node's* values, **Name / Short / Channel** apply instantly over the link, and **Region / Preset / Frequency** make the node save and reboot itself while the link recovers on its own.
+
 > 📱 The node has a single Bluetooth slot — close the Meshtastic phone app while the Cardputer is linked, or they'll fight over it.
 
 ## Architecture
@@ -130,7 +132,7 @@ Requires PlatformIO. The build env is `m5stack-cardputer-adv-advui`. `scripts/sy
 
 The read **and** write paths are done and running on real hardware: node list, DMs, channels, delivery status, Cyrillic, emoji, reactions, replies, favourites, sound, timestamps, persisted history, on-device settings and BLE companion mode all work today. Companion mode is verified end-to-end over the air (encrypted DM through the linked node, routing ACK back).
 
-Next up: full-Unicode font from SD (CJK), remote node settings in companion mode, and quality-of-life polish.
+Next up: full-Unicode font from SD (CJK) and quality-of-life polish.
 
 ## License
 

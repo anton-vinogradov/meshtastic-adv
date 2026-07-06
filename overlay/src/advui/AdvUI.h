@@ -91,6 +91,8 @@ class AdvUI : public concurrency::OSThread
     void sendReaction(int msgIdx, const char *label); // tapback on g_msgs[msgIdx]
     int matchedFromNewest(int back); // ring index of the thread's back-th newest message
     void handleKey(char c);
+    void screenSleep(); // cut the display power rail (auto-off)
+    void screenWake();  // rail up + full panel re-init
 
     InternalAPI api;
     AdvDisplay display;
@@ -153,6 +155,8 @@ class AdvUI : public concurrency::OSThread
     bool companionEntered = false; // jumped to the scan screen after the splash yet
 
     bool inited = false;
+    bool screenOn = true;        // display rail up; false = auto-off engaged
+    uint32_t lastActivityMs = 0; // last key press, for the auto-off timer
     bool haveCanvas = false;
     bool splashDone = false;
     bool announced = false; // sent our early boot NodeInfo announce yet

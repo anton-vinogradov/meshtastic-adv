@@ -91,7 +91,9 @@ the middle, the compose bar sits at the bottom.
 - **↑ / ↓** scroll the history — **hold to keep scrolling** (arrows auto-repeat everywhere,
   and so does backspace while erasing text); opening a thread auto-jumps to the first unread.
 - **Type** and hit **Enter** to send. **Fn+L** toggles the Cyrillic transliteration layer
-  (the `RU`/`EN` badge on the compose bar; the choice persists). **Tab** opens the emoji
+  (the `RU`/`EN` badge on the compose bar; the choice persists). It's phonetic:
+  `zh`→ж · `sh`→ш · `ch`→ч · `sch`→щ · `ya`→я · `yu`→ю · `yo`→ё · `ye`→э · `y`→ы ·
+  `j`→й · `x`→ъ · `'`→ь · `h`→х · `c`→ц · `e`→е · `q`→я. **Tab** opens the emoji
   palette (~24 icons, arrows + Enter to insert; emoji render inline in text).
 - **← / →** enter *message pick* mode: ↑/↓ choose a received message, then
   - **→ reaction** — a quick strip of tapbacks (`</>` pick, Enter sends). Reactions from
@@ -111,6 +113,10 @@ the middle, the compose bar sits at the bottom.
 | **Preset**    | modem preset (LongFast, MediumFast, …)                                       |
 | **Frequency** | frequency-slot override in MHz                                               |
 | **Channel**   | primary channel name + PSK                                                   |
+| **Role**      | device role: Client, Client Mute/Hidden, Router (Late), Repeater, Tracker, Sensor, TAK |
+| **Hops**      | hop limit (1–7)                                                              |
+| **Power**     | TX power: region max, or 2–22 dBm                                            |
+| **Rebroadcast** | which packets the node relays: All, Local only, Known only, Core ports, None |
 | **UTC**       | UTC-offset picker with city labels — drives all timestamps                   |
 | **WiFi**      | join a network (NTP time comes with it); enabling WiFi turns Bluetooth off   |
 | **MQTT**      | bridge the mesh to the internet: default public broker or your own           |
@@ -118,7 +124,8 @@ the middle, the compose bar sits at the bottom.
 | **Radio**     | **Onboard (Cap LoRa)** or **Companion via BLE** — see below                  |
 
 **↑/↓** move, **Enter** edits (or toggles), **ESC** backs out. Changes that affect the radio
-(Region / Preset / Frequency / Channel, WiFi / MQTT, Radio mode) reboot the device to apply.
+(Region / Preset / Frequency / Channel / Role / Hops / Power / Rebroadcast, WiFi / MQTT,
+Radio mode) reboot the device to apply.
 
 In **companion mode** the Name → Channel rows show — and edit — **the linked node** instead
 (see below); UTC / WiFi / MQTT / Radio stay local to the Cardputer.
@@ -162,6 +169,9 @@ reminds you).
 - **Screen auto-off** cuts the whole display rail after the configured idle time. Any key
   wakes it (that key is swallowed); incoming messages don't light it up — the beep and the
   LED do the notifying, the unread badges are there when you wake it.
+- **Phone app:** the stock Bluetooth API is untouched, so the official Meshtastic app pairs
+  with the Cardputer like with any node — a passkey screen pops up (waking the display) with
+  the PIN to type on the phone. WiFi turns Bluetooth off, as in stock.
 - The node DB caps at 200 nodes on this hardware; the header shows `200+` when it's full.
   In companion mode the synced node table holds the 128 most recently heard nodes.
 - Other nodes' battery levels aren't stored by this build's compact node DB — only our own

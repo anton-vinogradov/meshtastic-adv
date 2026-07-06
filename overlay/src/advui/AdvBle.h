@@ -71,6 +71,8 @@ extern volatile bool g_linkConfigDone; // config download finished
 extern volatile int g_compPreset;      // the node's LoRa modem preset (blank primary shows it)
 extern meshtastic_Config_LoRaConfig g_compLora; // the node's full LoRa config (remote admin edits it)
 extern volatile bool g_compLoraValid;
+extern meshtastic_Config_DeviceConfig g_compDevice; // ditto for role / rebroadcast mode
+extern volatile bool g_compDeviceValid;
 extern volatile int g_linkNodeBatt;    // the radio node's battery % (-1 unknown)
 extern volatile int g_linkRssi;        // BLE link RSSI in dBm (0 unknown)
 

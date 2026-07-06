@@ -30,6 +30,7 @@ You get a device that boots straight into a usable messenger: pick a contact, ty
 - **📢 Channels** — read and broadcast to any channel, right alongside your DMs.
 - **✅ Delivery status** — every sent message shows *sending* (dot) → *delivered* (green check, from the routing ACK) → *failed* (red ✗ with the reason). Channel broadcasts get a "sent" check.
 - **⌨️ Cyrillic input + 😀 emoji** — type Russian on the Latin keyboard via a live transliteration layer (**Fn+L**); receive/render non-Latin text and inline emoji bitmaps; a **Tab** palette inserts emoji.
+- **🈶 Full Unicode text** — CJK, Greek, Hebrew, Arabic… any script in the Basic Multilingual Plane renders in messages and names, via a GNU Unifont partition the installer flashes automatically (Latin/Cyrillic stay on the fast embedded font).
 - **📇 Node list** — press **Tab** for everyone on the mesh, with a signal-bar meter (from SNR), hop count, last-heard age and role, in fixed columns.
 - **🔎 Contact search** — start typing to find any node and start a new chat.
 - **⭐ Favourites** — flag contacts and channels; they get priority alerts.
@@ -57,7 +58,7 @@ The easiest way is the **[web installer](https://anton-vinogradov.github.io/mesh
 3. Click **Install**. If the device isn't listed, hold **G0/BOOT** while connecting, then release.
 4. After flashing, long-press **ESC** → set your **Region** and **UTC**.
 
-Prefer the CLI? Grab `firmware.factory.bin` from the [latest release](https://github.com/anton-vinogradov/meshtastic-adv/releases) and flash at offset `0x0` with esptool.
+Prefer the CLI? Grab `firmware.factory.bin` from the [latest release](https://github.com/anton-vinogradov/meshtastic-adv/releases) and flash at offset `0x0` with esptool; add `unifont.bin` at `0x340000` for the full-Unicode font (or drop it on the SD card root instead).
 
 ## How to drive it
 
@@ -141,6 +142,6 @@ Next up: full-Unicode font from SD (CJK) and quality-of-life polish.
 
 ## License
 
-GPL-3.0 (matches the upstream Meshtastic firmware this builds on).
+GPL-3.0 (matches the upstream Meshtastic firmware this builds on). The bundled Unicode font is [GNU Unifont](https://unifoundry.com/unifont/) (SIL OFL 1.1 / GPLv2+ with the font-embedding exception).
 
 *Meshtastic® is a registered trademark of Meshtastic LLC. This is an unofficial, community project, not affiliated with or endorsed by Meshtastic LLC.*

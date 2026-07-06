@@ -117,7 +117,7 @@ a section (or WiFi / MQTT / Radio directly), ESC steps back up.
 | **LoRa**   | **Region** (required on first boot) · **Preset** (LongFast, MediumFast, …) · **Frequency** (slot override, MHz) · **Channel** (primary name; key kept) · **Role** (Client, Client Mute/Hidden, Router (Late), Repeater, Tracker, Sensor, TAK) · **Hops** (1–7) · **Power** (region max or 2–22 dBm) · **Rebroadcast** (All / Local only / Known only / Core ports only / None) |
 | **WiFi**   | join a network (NTP time comes with it); enabling WiFi turns Bluetooth off |
 | **MQTT**   | bridge the mesh to the internet: default public broker or your own         |
-| **Device** | **UTC** — offset picker with city labels, drives all timestamps · **Screen** — auto-off timeout (15 s … 5 min or never; default 5 min) |
+| **Device** | **UTC** — offset picker with city labels, drives all timestamps · **Screen** — auto-off timeout (15 s … 5 min or never; default 5 min) · **Font** — where the Unicode font came from (`flash` / `sd` / `off`), read-only |
 | **Radio**  | **Onboard (Cap LoRa)** or **Companion via BLE** — see below                |
 
 **↑/↓** move, **Enter** edits (or toggles), **ESC** backs out. Changes that affect the radio
@@ -165,6 +165,10 @@ reminds you).
 - **Screen auto-off** cuts the whole display rail after the configured idle time. Any key
   wakes it (that key is swallowed); incoming messages don't light it up — the beep and the
   LED do the notifying, the unread badges are there when you wake it.
+- **Full Unicode:** messages and names in any BMP script (CJK, Greek, Hebrew, Arabic, …)
+  render via GNU Unifont — the installer flashes it into a dedicated partition, no user
+  action; esptool users write `unifont.bin` at `0x340000` or drop it on the SD card root.
+  Latin and Cyrillic stay on the fast embedded font either way.
 - **Phone app:** the stock Bluetooth API is untouched, so the official Meshtastic app pairs
   with the Cardputer like with any node — a passkey screen pops up (waking the display) with
   the PIN to type on the phone. WiFi turns Bluetooth off, as in stock.

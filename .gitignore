@@ -13,6 +13,8 @@
 # (the versioned copies feed the installer's version picker)
 !docs/firmware.factory.bin
 !docs/versions/*/firmware.factory.bin
+# ...and the SD unicode font served from the site
+!docs/unifont.bin
 
 # Editors / OS
 .vscode/

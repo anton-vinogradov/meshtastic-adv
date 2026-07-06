@@ -1,6 +1,6 @@
 {
   "name": "Meshtastic ADV",
-  "version": "0.2.7 (advui · engine 2.8.0)",
+  "version": "0.2.7 (advui \u00b7 engine 2.8.0)",
   "new_install_prompt_erase": true,
   "builds": [
     {
@@ -9,6 +9,10 @@
         {
           "path": "firmware.factory.bin",
           "offset": 0
+        },
+        {
+          "path": "unifont.bin",
+          "offset": 3407872
         }
       ]
     }

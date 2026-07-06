@@ -73,7 +73,10 @@ jobs:
           # the 6 newest stay archived — older ones remain on the Releases page.
           mkdir -p "docs/versions/${GITHUB_REF_NAME}"
           cp /tmp/fw.bin "docs/versions/${GITHUB_REF_NAME}/firmware.factory.bin"
-          cp docs/manifest.json "docs/versions/${GITHUB_REF_NAME}/manifest.json"
+          # the font part resolves relative to the manifest: point the archived
+          # copy back at the single site-root unifont.bin (2 MB, not per-version)
+          jq '.builds[0].parts |= map(if .path == "unifont.bin" then .path = "../../unifont.bin" else . end)' \
+            docs/manifest.json > "docs/versions/${GITHUB_REF_NAME}/manifest.json"
           (cd docs/versions && ls -d v* | sort -rV | tail -n +7 | xargs -r rm -rf)
           (cd docs/versions && ls -d v* | sort -rV) | jq -R . | jq -s . > docs/versions/index.json
           git add docs/firmware.factory.bin docs/manifest.json docs/versions
@@ -87,10 +90,10 @@ jobs:
         run: |
           cp /tmp/fw.bin "meshtastic-adv-${GITHUB_REF_NAME}.factory.bin"
           if gh release view "${GITHUB_REF_NAME}" >/dev/null 2>&1; then
-            gh release upload "${GITHUB_REF_NAME}" "meshtastic-adv-${GITHUB_REF_NAME}.factory.bin" --clobber
+            gh release upload "${GITHUB_REF_NAME}" "meshtastic-adv-${GITHUB_REF_NAME}.factory.bin" docs/unifont.bin --clobber
           else
             gh release create "${GITHUB_REF_NAME}" \
               --title "Meshtastic ADV ${GITHUB_REF_NAME}" \
               --generate-notes \
-              "meshtastic-adv-${GITHUB_REF_NAME}.factory.bin"
+              "meshtastic-adv-${GITHUB_REF_NAME}.factory.bin" docs/unifont.bin
           fi

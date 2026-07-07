@@ -60,7 +60,8 @@ struct CompNode {
     char shortName[5];
     char longName[24];
 };
-constexpr int kMaxCompNodes = 128;
+constexpr int kMaxCompNodes = 64; // synced-node table; 64 is plenty and saves ~3 KB of
+                                   // static RAM this no-PSRAM board can't spare (see v0.3.2 heap notes)
 extern CompNode g_compNodes[kMaxCompNodes];
 extern volatile int g_compNodeCount;
 // Full channel objects from the config stream. Kept whole — the PSK included —

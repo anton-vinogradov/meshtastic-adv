@@ -2341,7 +2341,7 @@ void AdvUI::drawNode()
             uint8_t nameLen;  // chars after the time that are the sender-name span (channels)
         };
         int32_t tzOff = g_utcOffsetMin * 60; // user-set UTC offset (Settings > UTC)
-        static DLine dl[160]; // single-threaded UI: static keeps it off the stack; sized so
+        static DLine dl[128]; // single-threaded UI: static keeps it off the stack; sized so
                               // a full 32-message backlog rarely overflows (the unread anchor
                               // lives or dies with its lines staying in this ring)
         int dlCount = 0;

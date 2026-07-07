@@ -4280,14 +4280,15 @@ int32_t AdvUI::runOnce()
         inited = true;
     }
 
-    { // Heap watchdog: this board runs thin (no PSRAM; a connected phone + BLE eats
-      // most of it), so log free / min-ever / largest-block every 60 s to make a
-      // leak (falling min) or fragmentation (falling largest) visible in the logs.
-        static uint32_t lastHeapLog = 0;
-        if (millis() - lastHeapLog > 60000) {
-            lastHeapLog = millis();
-            LOG_INFO("advui: heap free=%u min=%u largest=%u", (unsigned)ESP.getFreeHeap(),
-                     (unsigned)ESP.getMinFreeHeap(), (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_8BIT));
+    { // Heap watchdog: log ONLY on a fresh all-time low (>=1 KB below the last), so a
+      // stable device stays silent — no periodic spam, nothing to grow an SD log. A
+      // leak shows as a stepping descent; steady operation prints nothing after warmup.
+        static uint32_t loggedMin = 0xFFFFFFFF;
+        uint32_t mn = ESP.getMinFreeHeap();
+        if (mn + 1024 < loggedMin) {
+            loggedMin = mn;
+            LOG_WARN("advui: heap new low free=%u min=%u largest=%u", (unsigned)ESP.getFreeHeap(), (unsigned)mn,
+                     (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_8BIT));
         }
     }
 

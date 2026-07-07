@@ -18,6 +18,8 @@
 #include "modules/NodeInfoModule.h"
 #ifdef HAS_NEOPIXEL
 #include "esp32-hal-rgb-led.h" // rgbLedWrite(): stateless RMT driver for the onboard RGB LED
+#include <Esp.h>
+#include <esp_heap_caps.h>
 #endif
 #include <algorithm>
 #include <cctype>
@@ -114,8 +116,9 @@ const char *errName(uint8_t e)
         return "fail";
     }
 }
-constexpr int kMaxMsgs = 64; // shared across all conversations; kept modest so the extra
-                             // bss doesn't starve the phone-config file manifest on a tight heap
+constexpr int kMaxMsgs = 32; // shared across all conversations; DMs are protected by the
+                             // channel-first eviction (addMsg), not by size, so this stays small
+                             // to keep the heap margin — a connected phone + BLE runs it thin
 constexpr int kNumSettings = 16; // the flat item table: Name..Channel, Role..Rebroadcast, UTC, WiFi, MQTT, Screen, Radio, Font
 
 // The Settings menu is two-level: the top lists sections (plus WiFi/MQTT/Radio
@@ -4275,6 +4278,17 @@ int32_t AdvUI::runOnce()
     if (!inited) {
         initHardware();
         inited = true;
+    }
+
+    { // Heap watchdog: this board runs thin (no PSRAM; a connected phone + BLE eats
+      // most of it), so log free / min-ever / largest-block every 60 s to make a
+      // leak (falling min) or fragmentation (falling largest) visible in the logs.
+        static uint32_t lastHeapLog = 0;
+        if (millis() - lastHeapLog > 60000) {
+            lastHeapLog = millis();
+            LOG_INFO("advui: heap free=%u min=%u largest=%u", (unsigned)ESP.getFreeHeap(),
+                     (unsigned)ESP.getMinFreeHeap(), (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_8BIT));
+        }
     }
 
 #ifdef ADVUI_SCREENSHOT

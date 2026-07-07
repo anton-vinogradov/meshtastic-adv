@@ -9,6 +9,36 @@ The engine underneath is unmodified upstream Meshtastic, so the node still behav
 normal Meshtastic device on the mesh — this only changes the local UI. In **companion
 mode** the same UI drives a *different* node's radio over Bluetooth instead (see the end).
 
+## Screens at a glance
+
+<table>
+<tr>
+<td align="center" width="33%"><img src="img/splash.png" width="230"><br><sub><b>Splash</b> — branded boot screen</sub></td>
+<td align="center" width="33%"><img src="img/chats.png" width="230"><br><sub><b>Chats</b> — home: recent DMs + channels, unread badges</sub></td>
+<td align="center" width="33%"><img src="img/chat.png" width="230"><br><sub><b>Conversation</b> — Cyrillic, inline emoji, delivery checks</sub></td>
+</tr>
+<tr>
+<td align="center" width="33%"><img src="img/unicode.png" width="230"><br><sub><b>Full Unicode</b> — CJK / Greek / Hebrew / Korean text</sub></td>
+<td align="center" width="33%"><img src="img/nodes.png" width="230"><br><sub><b>Node list</b> — signal, hops, last-heard, role</sub></td>
+<td align="center" width="33%"><img src="img/emoji.png" width="230"><br><sub><b>Emoji palette</b> — Tab to insert</sub></td>
+</tr>
+<tr>
+<td align="center" width="33%"><img src="img/react.png" width="230"><br><sub><b>Reactions</b> — tapback strip on a picked message</sub></td>
+<td align="center" width="33%"><img src="img/settings.png" width="230"><br><sub><b>Settings</b> — sectioned menu with value previews</sub></td>
+<td align="center" width="33%"><img src="img/lora.png" width="230"><br><sub><b>LoRa settings</b> — region, preset, role, hops, power</sub></td>
+</tr>
+<tr>
+<td align="center" width="33%"><img src="img/utc.png" width="230"><br><sub><b>UTC picker</b> — offset by city</sub></td>
+<td align="center" width="33%"><img src="img/wifi.png" width="230"><br><sub><b>WiFi</b> — join a network, NTP time</sub></td>
+<td align="center" width="33%"><img src="img/mqtt.png" width="230"><br><sub><b>MQTT</b> — bridge the mesh to the internet</sub></td>
+</tr>
+<tr>
+<td align="center" width="33%"><img src="img/bscan.png" width="230"><br><sub><b>Companion: find node</b> — scan for a stock node over BLE</sub></td>
+<td align="center" width="33%"><img src="img/bpin.png" width="230"><br><sub><b>Companion: pairing</b> — type the PIN from the node</sub></td>
+<td align="center" width="33%"><img src="img/blink.png" width="230"><br><sub><b>Companion: link status</b> — signal, node battery, synced nodes</sub></td>
+</tr>
+</table>
+
 ## Screens
 
 ### Splash

@@ -3187,9 +3187,17 @@ void AdvUI::runDemoDump()
     screenshot("emoji");
 
     setSel = 0;
+    setSection = -1; // the sectioned top menu (Node / LoRa / WiFi / ...)
     mode = MODE_SETTINGS;
     drawSettings();
     screenshot("settings");
+
+    setSection = 1; // the LoRa section expanded (region, preset, role, hops, power...)
+    setSel = 0;
+    setScroll = 0;
+    drawSettings();
+    screenshot("lora");
+    setSection = -1;
 
     pickTarget = 2;
     pickSel = optIndex(kUtcOpts, kUtcCount, 180); // Moscow, for a nice sample
@@ -3218,6 +3226,63 @@ void AdvUI::runDemoDump()
     screenshot("mqtt");
     config.network = bnet;
     moduleConfig.mqtt = bmqtt;
+
+    // Unicode showcase: several scripts in one thread (needs the font partition/SD)
+    g_msgCount = 0;
+    g_msgNext = 0;
+    g_reactCount = 0;
+    g_reactNext = 0;
+    addMsg(peer, me, 0, t - 200, false, "\xe4\xbd\xa0\xe5\xa5\xbd\xef\xbc\x81", 0, MSG_IN);         // 你好！ (Chinese)
+    addMsg(peer, me, 0, t - 160, false, "\xe3\x81\x93\xe3\x82\x93\xe3\x81\xab\xe3\x81\xa1\xe3\x81\xaf", 0, MSG_IN); // こんにちは (Japanese)
+    addMsg(me, peer, 0, t - 120, false, "\xce\x93\xce\xb5\xce\xb9\xce\xb1! \xd7\xa9\xd7\x9c\xd7\x95\xd7\x9d", 0, MSG_DELIVERED); // Γεια! שלום
+    addMsg(peer, me, 0, t - 60, false, "\xed\x95\x9c\xea\xb5\xad\xec\x96\xb4 \xf0\x9f\x91\x8d", 0, MSG_IN); // 한국어 👍 (Korean + emoji)
+    selectedChannel = -1;
+    selectedNum = peer;
+    chatScroll = 0;
+    mode = MODE_NODE;
+    drawNode();
+    screenshot("unicode");
+
+    // Companion screens (sample link state; these globals only matter in companion mode)
+    g_scanCount = 3;
+    g_scanning = false;
+    snprintf(g_scanHits[0].name, sizeof(g_scanHits[0].name), "Heltec-V3 mesh");
+    snprintf(g_scanHits[0].addr, sizeof(g_scanHits[0].addr), "a1:b2:c3:d4:e5:f6");
+    g_scanHits[0].rssi = -52;
+    snprintf(g_scanHits[1].name, sizeof(g_scanHits[1].name), "T-Beam Garden");
+    snprintf(g_scanHits[1].addr, sizeof(g_scanHits[1].addr), "11:22:33:44:55:66");
+    g_scanHits[1].rssi = -74;
+    snprintf(g_scanHits[2].name, sizeof(g_scanHits[2].name), "RAK-Roof");
+    snprintf(g_scanHits[2].addr, sizeof(g_scanHits[2].addr), "aa:bb:cc:dd:ee:ff");
+    g_scanHits[2].rssi = -81;
+    bleSel = 0;
+    mode = MODE_BLESCAN;
+    drawBleScan();
+    screenshot("bscan");
+
+    snprintf(g_peerName, sizeof(g_peerName), "Heltec-V3 mesh");
+    snprintf(pinBuf, sizeof(pinBuf), "6579");
+    pinLen = 4;
+    mode = MODE_BLEPIN;
+    drawBlePin();
+    screenshot("bpin");
+
+    g_linkState = BLE_CONNECTED;
+    g_linkConfigDone = true;
+    g_linkRxPkts = 214;
+    g_linkMyNode = 0x8fa02080;
+    g_linkRssi = -58;
+    g_linkNodeBatt = 87;
+    g_compNodeCount = 42;
+    mode = MODE_BLELINK;
+    drawBleLink();
+    screenshot("blink");
+    g_linkState = BLE_IDLE;
+    g_linkConfigDone = false;
+    g_scanCount = 0;
+    g_peerName[0] = 0;
+    pinLen = 0;
+    pinBuf[0] = 0;
 
     // --- Usage-scenario frames (a01..) for the animated hero: pick the chat,
     // type, send, get the delivery check, receive the reply, scroll the history.

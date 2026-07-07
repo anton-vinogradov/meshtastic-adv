@@ -75,6 +75,7 @@ class AdvUI : public concurrency::OSThread
     void drawChats();          // home: recent conversations
     void buildConversations(); // fill conv[]/convCount, newest first
     void openConv(int i);      // open conversation conv[i]
+    void deleteConversation(const Conv &c); // drop all its messages from the ring
 #ifdef ADVUI_SCREENSHOT
     void screenshot(const char *name); // dump the current canvas over serial
     void runDemoDump();                // render each screen with sample data + dump, then reboot
@@ -157,6 +158,7 @@ class AdvUI : public concurrency::OSThread
     uint32_t bleRetryMs = 0;      // last auto-reconnect attempt (backoff timer)
     bool linkJumped = false;      // already auto-jumped to Chats for this link session
     bool companionEntered = false; // jumped to the scan screen after the splash yet
+    bool confirmDel = false;       // Del pressed once on a chat -> next Del confirms delete
     Mode btPinReturn = MODE_CHATS; // where the phone-pairing PIN screen returns
 
     bool inited = false;

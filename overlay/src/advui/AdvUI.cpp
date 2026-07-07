@@ -114,7 +114,8 @@ const char *errName(uint8_t e)
         return "fail";
     }
 }
-constexpr int kMaxMsgs = 32;
+constexpr int kMaxMsgs = 64; // shared across all conversations; kept modest so the extra
+                             // bss doesn't starve the phone-config file manifest on a tight heap
 constexpr int kNumSettings = 16; // the flat item table: Name..Channel, Role..Rebroadcast, UTC, WiFi, MQTT, Screen, Radio, Font
 
 // The Settings menu is two-level: the top lists sections (plus WiFi/MQTT/Radio
@@ -125,7 +126,6 @@ const uint8_t kSecDevice[] = {10, 13, 15};            // UTC, Screen, Font (read
 constexpr int kTopCount = 6;                          // Node, LoRa, WiFi, MQTT, Device, Radio
 Msg g_msgs[kMaxMsgs];
 int g_msgCount = 0;         // populated slots (grows to kMaxMsgs)
-int g_msgNext = 0;          // next write slot (ring head)
 bool g_msgsDirty = false;   // ring changed since the last flash save
 uint32_t g_lastSaveMs = 0;  // when we last wrote the ring to flash
 
@@ -136,8 +136,29 @@ uint32_t g_msgReply[kMaxMsgs];
 void addMsg(uint32_t from, uint32_t to, uint8_t ch, uint32_t rxTime, bool unread, const char *text, uint32_t id,
            uint8_t status, uint32_t replyId = 0)
 {
-    g_msgReply[g_msgNext] = replyId;
-    Msg &m = g_msgs[g_msgNext];
+    // The ring is a compact chronological array (index 0 = oldest). When it's full
+    // we evict the oldest CHANNEL broadcast, not the oldest message — so a busy
+    // channel can never push a quiet DM thread out. Only when there are no
+    // broadcasts left (an all-DM ring) do we drop the oldest DM.
+    int slot;
+    if (g_msgCount < kMaxMsgs) {
+        slot = g_msgCount++;
+    } else {
+        int victim = -1;
+        for (int i = 0; i < g_msgCount; i++)
+            if (g_msgs[i].to == NODENUM_BROADCAST) {
+                victim = i;
+                break;
+            }
+        if (victim < 0)
+            victim = 0;
+        int tail = g_msgCount - 1 - victim;
+        memmove(&g_msgs[victim], &g_msgs[victim + 1], tail * sizeof(Msg));
+        memmove(&g_msgReply[victim], &g_msgReply[victim + 1], tail * sizeof(uint32_t));
+        slot = g_msgCount - 1;
+    }
+    g_msgReply[slot] = replyId;
+    Msg &m = g_msgs[slot];
     m.from = from;
     m.to = to;
     m.ch = ch;
@@ -148,9 +169,6 @@ void addMsg(uint32_t from, uint32_t to, uint8_t ch, uint32_t rxTime, bool unread
     m.read = !unread;
     strncpy(m.text, text, sizeof(m.text) - 1);
     m.text[sizeof(m.text) - 1] = 0;
-    g_msgNext = (g_msgNext + 1) % kMaxMsgs;
-    if (g_msgCount < kMaxMsgs)
-        g_msgCount++;
     g_msgsDirty = true;
 }
 
@@ -459,31 +477,150 @@ void markReadChannel(int chIdx)
 
 // Persist the message ring (with delivery status + read flags) to flash, so a
 // reboot keeps the conversation. Written debounced from runOnce.
-constexpr uint32_t kMsgMagic = 0x41565332; // "AVS2" — bump when the saved layout changes
+constexpr uint32_t kMsgMagic = 0x41565333;   // "AVS3" — count-based, independent of kMaxMsgs
+constexpr uint32_t kMsgMagicV2 = 0x41565332; // "AVS2" — legacy fixed-32 ring, migrated on load
 const char *kMsgPath = "/advui_msgs.bin";
+
+// The message ring is a circular buffer; iterate it oldest-first (matches the
+// chronological order the loaders write/read).
+static int ringIdx(int i, int count, int next, int cap) { return count == cap ? (next + i) % cap : i; }
 
 void saveMsgs()
 {
     auto f = FSCom.open(kMsgPath, FILE_O_WRITE);
     if (!f)
         return;
+    // Count-based layout: only the populated messages are written, oldest-first,
+    // so the file size tracks history depth, not kMaxMsgs — growing the ring in a
+    // future build keeps loading old saves (and vice-versa).
     uint32_t magic = kMsgMagic;
-    int32_t cnt = g_msgCount, nxt = g_msgNext;
+    int32_t cnt = g_msgCount;
+    uint8_t ru = g_ruMode ? 1 : 0, rc = (uint8_t)g_reactCount;
     f.write((const uint8_t *)&magic, sizeof(magic));
     f.write((const uint8_t *)&cnt, sizeof(cnt));
-    f.write((const uint8_t *)&nxt, sizeof(nxt));
     f.write((const uint8_t *)&g_favChannels, sizeof(g_favChannels));
-    f.write((const uint8_t *)g_msgs, sizeof(g_msgs));
-    f.write((const uint8_t *)&g_utcOffsetMin, sizeof(g_utcOffsetMin)); // optional tail
-    uint8_t ru = g_ruMode ? 1 : 0;
-    f.write(&ru, 1); // optional tail: input layout
-    uint8_t rc = (uint8_t)g_reactCount, rn = (uint8_t)g_reactNext;
-    f.write(&rc, 1); // optional tail: reactions ring
-    f.write(&rn, 1);
-    f.write((const uint8_t *)g_reacts, sizeof(g_reacts));
-    f.write((const uint8_t *)g_msgReply, sizeof(g_msgReply)); // optional tail: reply links
-    f.write((const uint8_t *)&g_screenOffSec, sizeof(g_screenOffSec)); // optional tail: screen auto-off
+    f.write((const uint8_t *)&g_utcOffsetMin, sizeof(g_utcOffsetMin));
+    f.write((const uint8_t *)&g_screenOffSec, sizeof(g_screenOffSec));
+    f.write(&ru, 1);
+    f.write(&rc, 1);
+    for (int i = 0; i < g_msgCount; i++) {
+        f.write((const uint8_t *)&g_msgs[i], sizeof(Msg));
+        f.write((const uint8_t *)&g_msgReply[i], sizeof(uint32_t));
+    }
+    for (int i = 0; i < g_reactCount; i++) {
+        int idx = ringIdx(i, g_reactCount, g_reactNext, kMaxReacts);
+        f.write((const uint8_t *)&g_reacts[idx], sizeof(Reaction));
+    }
     f.close();
+}
+
+// AVS3: the current count-based format. Messages/reactions were written
+// oldest-first; keep the newest kMaxMsgs / kMaxReacts if an older, bigger save
+// ever holds more than this build's ring.
+static bool loadMsgsV3(File &f)
+{
+    int32_t cnt = 0, off = 0, so = 0;
+    uint8_t ru = 0, rc = 0;
+    if (f.read((uint8_t *)&cnt, 4) != 4 || cnt < 0)
+        return false;
+    f.read((uint8_t *)&g_favChannels, sizeof(g_favChannels));
+    f.read((uint8_t *)&off, 4);
+    f.read((uint8_t *)&so, 4);
+    f.read(&ru, 1);
+    f.read(&rc, 1);
+
+    int mskip = cnt > kMaxMsgs ? cnt - kMaxMsgs : 0;
+    for (int i = 0; i < mskip; i++) { // discard the oldest overflow
+        Msg t;
+        uint32_t r;
+        if (f.read((uint8_t *)&t, sizeof(Msg)) != (int)sizeof(Msg))
+            return false;
+        f.read((uint8_t *)&r, 4);
+    }
+    int mkeep = cnt - mskip;
+    for (int i = 0; i < mkeep; i++) {
+        if (f.read((uint8_t *)&g_msgs[i], sizeof(Msg)) != (int)sizeof(Msg))
+            return false;
+        if (f.read((uint8_t *)&g_msgReply[i], 4) != 4)
+            g_msgReply[i] = 0;
+    }
+    g_msgCount = mkeep;
+
+    int rkeep = rc > kMaxReacts ? kMaxReacts : rc;
+    for (int i = 0; i < rc - rkeep; i++) {
+        Reaction t;
+        f.read((uint8_t *)&t, sizeof(Reaction));
+    }
+    int got = 0;
+    for (int i = 0; i < rkeep; i++)
+        if (f.read((uint8_t *)&g_reacts[i], sizeof(Reaction)) == (int)sizeof(Reaction))
+            got++;
+    g_reactCount = got;
+    g_reactNext = got % kMaxReacts;
+
+    g_utcOffsetMin = off;
+    g_ruMode = ru != 0;
+    if (so == 0 || (so >= 15 && so <= 3600))
+        g_screenOffSec = so;
+    return true;
+}
+
+// AVS2: the legacy fixed 32-slot layout — read the old arrays and linearise the
+// old circular ring into the current one so a firmware update keeps history.
+static void loadMsgsV2(File &f)
+{
+    constexpr int OLD = 32; // old kMaxMsgs and kMaxReacts were both 32
+    int32_t cnt = 0, nxt = 0;
+    f.read((uint8_t *)&cnt, 4);
+    f.read((uint8_t *)&nxt, 4);
+    f.read((uint8_t *)&g_favChannels, sizeof(g_favChannels));
+    // one-time migration temps: on the heap (plenty free at boot), freed below —
+    // no permanent bss for a path that runs at most once per device
+    Msg *om = (Msg *)malloc(OLD * sizeof(Msg));
+    Reaction *orr = (Reaction *)malloc(OLD * sizeof(Reaction));
+    uint32_t *ore = (uint32_t *)malloc(OLD * sizeof(uint32_t));
+    if (!om || !orr || !ore) {
+        free(om);
+        free(orr);
+        free(ore);
+        return;
+    }
+    size_t n = f.read((uint8_t *)om, OLD * sizeof(Msg));
+    int32_t off = 0;
+    f.read((uint8_t *)&off, 4);
+    uint8_t ru = 0, rc = 0, rn = 0;
+    f.read(&ru, 1);
+    f.read(&rc, 1);
+    f.read(&rn, 1);
+    size_t rb = f.read((uint8_t *)orr, OLD * sizeof(Reaction));
+    size_t reb = f.read((uint8_t *)ore, OLD * sizeof(uint32_t));
+    int32_t so = 0;
+    size_t sob = f.read((uint8_t *)&so, 4);
+    if (n != OLD * sizeof(Msg) || cnt < 0 || cnt > OLD || nxt < 0 || nxt >= OLD) {
+        free(om);
+        free(orr);
+        free(ore);
+        return;
+    }
+    for (int i = 0; i < cnt; i++) {
+        int idx = ringIdx(i, cnt, nxt, OLD);
+        g_msgs[i] = om[idx];
+        g_msgReply[i] = (reb == OLD * sizeof(uint32_t)) ? ore[idx] : 0;
+    }
+    g_msgCount = cnt;
+    if (rb == OLD * sizeof(Reaction) && rc <= OLD && rn < OLD) {
+        for (int i = 0; i < rc; i++)
+            g_reacts[i] = orr[ringIdx(i, rc, rn, OLD)];
+        g_reactCount = rc;
+        g_reactNext = rc % kMaxReacts;
+    }
+    g_utcOffsetMin = off;
+    g_ruMode = ru != 0;
+    if (sob == sizeof(so) && (so == 0 || (so >= 15 && so <= 3600)))
+        g_screenOffSec = so;
+    free(om);
+    free(orr);
+    free(ore);
 }
 
 void loadMsgs()
@@ -492,41 +629,13 @@ void loadMsgs()
     if (!f)
         return;
     uint32_t magic = 0;
-    int32_t cnt = 0, nxt = 0;
     f.read((uint8_t *)&magic, sizeof(magic));
-    f.read((uint8_t *)&cnt, sizeof(cnt));
-    f.read((uint8_t *)&nxt, sizeof(nxt));
-    f.read((uint8_t *)&g_favChannels, sizeof(g_favChannels));
-    size_t n = f.read((uint8_t *)g_msgs, sizeof(g_msgs));
-    int32_t off = 0;
-    f.read((uint8_t *)&off, sizeof(off)); // optional tail; stays 0 for pre-offset files
-    uint8_t ru = 0;
-    f.read(&ru, 1); // optional tail: input layout (0 for older files)
-    uint8_t rc = 0, rn = 0;
-    static Reaction tmpR[kMaxReacts];
-    f.read(&rc, 1); // optional tail: reactions ring
-    f.read(&rn, 1);
-    size_t rBytes = f.read((uint8_t *)tmpR, sizeof(tmpR));
-    static uint32_t tmpRe[kMaxMsgs];
-    size_t reBytes = f.read((uint8_t *)tmpRe, sizeof(tmpRe)); // optional tail: reply links
-    int32_t so = 0;
-    size_t soBytes = f.read((uint8_t *)&so, sizeof(so)); // optional tail: screen auto-off
+    if (magic == kMsgMagic)
+        loadMsgsV3(f);
+    else if (magic == kMsgMagicV2)
+        loadMsgsV2(f);
     f.close();
-    if (magic != kMsgMagic || n != sizeof(g_msgs) || cnt < 0 || cnt > kMaxMsgs || nxt < 0 || nxt >= kMaxMsgs)
-        return;
-    g_utcOffsetMin = off;
-    g_ruMode = ru != 0;
-    if (soBytes == sizeof(so) && (so == 0 || (so >= 15 && so <= 3600)))
-        g_screenOffSec = so;
-    if (rBytes == sizeof(tmpR) && rc <= kMaxReacts && rn < kMaxReacts) {
-        memcpy(g_reacts, tmpR, sizeof(g_reacts));
-        g_reactCount = rc;
-        g_reactNext = rn;
-    }
-    if (reBytes == sizeof(tmpRe))
-        memcpy(g_msgReply, tmpRe, sizeof(g_msgReply));
-    g_msgCount = cnt;
-    g_msgNext = nxt;
+
     uint32_t me = myNodeNum();
     for (int i = 0; i < g_msgCount; i++) {
         // an outgoing DM still "sending" before the reboot can't get its ACK now
@@ -907,11 +1016,11 @@ void drawNodeRow(lgfx::LGFXBase *g, const meshtastic_NodeInfoLite *n, int y, boo
     g->print(nm);
 }
 
-void drawFooter(lgfx::LGFXBase *g, const char *hint)
+void drawFooter(lgfx::LGFXBase *g, const char *hint, uint16_t color = 0x630c)
 {
     g->setFont(&lgfx::fonts::Font0);
     g->setTextSize(1);
-    g->setTextColor(0x630c); // dim gray
+    g->setTextColor(color); // dim gray by default
     g->setCursor(4, 126);
     g->print(hint);
 }
@@ -1716,7 +1825,7 @@ int AdvUI::firstUnreadIdx()
 {
     bool isChan = selectedChannel >= 0;
     for (int i = 0; i < g_msgCount; i++) {
-        int idx = (g_msgCount == kMaxMsgs) ? (g_msgNext + i) % kMaxMsgs : i;
+        int idx = i;
         Msg &m = g_msgs[idx];
         if (m.read)
             continue;
@@ -1734,7 +1843,7 @@ int AdvUI::matchedFromNewest(int back)
     bool isChan = selectedChannel >= 0;
     int seen = 0;
     for (int i = g_msgCount - 1; i >= 0; i--) {
-        int idx = (g_msgCount == kMaxMsgs) ? (g_msgNext + i) % kMaxMsgs : i;
+        int idx = i;
         Msg &m = g_msgs[idx];
         bool match = isChan ? (m.to == NODENUM_BROADCAST && m.ch == selectedChannel)
                             : ((m.from == selectedNum || m.to == selectedNum) && m.to != NODENUM_BROADCAST);
@@ -1767,6 +1876,45 @@ void AdvUI::openEntry(int s)
     }
 }
 
+// Removes every message of a conversation from the ring (compacting it), plus any
+// now-orphaned reactions, and persists. Channel = its broadcasts; DM = both directions.
+void AdvUI::deleteConversation(const Conv &c)
+{
+    int w = 0;
+    for (int r = 0; r < g_msgCount; r++) {
+        Msg &m = g_msgs[r];
+        bool mine = c.isChan ? (m.to == NODENUM_BROADCAST && m.ch == c.ch)
+                             : (m.to != NODENUM_BROADCAST && (m.from == c.node || m.to == c.node));
+        if (mine)
+            continue; // drop it
+        if (w != r) {
+            g_msgs[w] = m;
+            g_msgReply[w] = g_msgReply[r];
+        }
+        w++;
+    }
+    g_msgCount = w;
+    // drop reactions whose target message no longer exists
+    int rw = 0;
+    for (int r = 0; r < g_reactCount; r++) {
+        bool live = false;
+        for (int i = 0; i < g_msgCount; i++)
+            if (g_msgs[i].id && g_msgs[i].id == g_reacts[r].msgId) {
+                live = true;
+                break;
+            }
+        if (live) {
+            if (rw != r)
+                g_reacts[rw] = g_reacts[r];
+            rw++;
+        }
+    }
+    g_reactCount = rw;
+    g_reactNext = rw % kMaxReacts;
+    g_msgsDirty = true;
+    saveMsgs();
+}
+
 void AdvUI::favEntry(int s, bool on)
 {
     if (s < chanCount) {
@@ -1790,7 +1938,7 @@ void AdvUI::buildConversations()
     convCount = 0;
     uint32_t me = myNodeNum();
     for (int i = 0; i < g_msgCount; i++) {
-        int idx = (g_msgCount == kMaxMsgs) ? (g_msgNext + i) % kMaxMsgs : i;
+        int idx = i;
         Msg &m = g_msgs[idx];
         bool isChan = (m.to == NODENUM_BROADCAST);
         uint32_t node = isChan ? 0 : (m.from == me ? m.to : m.from);
@@ -1978,7 +2126,10 @@ void AdvUI::drawChats()
         printLineEmotes(g, 6, y + 14, pv, 0x9CD3);
         y += rowH;
     }
-    drawFooter(g, "ENTER open  type find  Tab nodes");
+    if (confirmDel && sel < convCount)
+        drawFooter(g, "Delete this chat? Enter = yes   ESC = no", 0xF800); // red
+    else
+        drawFooter(g, "ENTER open  Del erase  Tab nodes");
 
     if (haveCanvas)
         canvas.pushSprite(0, 0);
@@ -2155,7 +2306,7 @@ void AdvUI::drawNode()
     int matched[kMaxMsgs], mc = 0;
     bool hasFailed = false; // any failed outgoing DM here -> offer ENTER resend
     for (int i = 0; i < g_msgCount; i++) {
-        int idx = (g_msgCount == kMaxMsgs) ? (g_msgNext + i) % kMaxMsgs : i;
+        int idx = i;
         bool match = isChan ? (g_msgs[idx].to == NODENUM_BROADCAST && g_msgs[idx].ch == selectedChannel)
                             : ((g_msgs[idx].from == selectedNum || g_msgs[idx].to == selectedNum) &&
                                g_msgs[idx].to != NODENUM_BROADCAST);
@@ -3126,7 +3277,7 @@ void AdvUI::runDemoDump()
     static Reaction rBackup[kMaxReacts];
     memcpy(rBackup, g_reacts, sizeof(g_reacts));
     int brC = g_reactCount, brN = g_reactNext;
-    int bCount = g_msgCount, bNext = g_msgNext;
+    int bCount = g_msgCount;
     bool bDirty = g_msgsDirty;
     Mode bMode = mode;
     uint32_t bSel = selectedNum;
@@ -3145,7 +3296,6 @@ void AdvUI::runDemoDump()
     // Controlled demo history: clear the real ring (restored from backup on exit) so
     // screenshots show only our sample data, not real (possibly non-English) chats.
     g_msgCount = 0;
-    g_msgNext = 0;
     uint32_t peer = (filteredCount > 0 && nodeDB) ? nodeDB->getMeshNodeByIndex(filtered[0])->num : me;
     uint32_t other = (filteredCount > 1 && nodeDB) ? nodeDB->getMeshNodeByIndex(filtered[1])->num : peer + 1;
     uint32_t t = 1751720400;
@@ -3229,7 +3379,6 @@ void AdvUI::runDemoDump()
 
     // Unicode showcase: several scripts in one thread (needs the font partition/SD)
     g_msgCount = 0;
-    g_msgNext = 0;
     g_reactCount = 0;
     g_reactNext = 0;
     addMsg(peer, me, 0, t - 200, false, "\xe4\xbd\xa0\xe5\xa5\xbd\xef\xbc\x81", 0, MSG_IN);         // 你好！ (Chinese)
@@ -3289,7 +3438,6 @@ void AdvUI::runDemoDump()
     bool bRu = g_ruMode;
     g_ruMode = false;
     g_msgCount = 0;
-    g_msgNext = 0;
     g_reactCount = 0;
     g_reactNext = 0;
     addMsg(peer, me, 0, t - 900, false, "Radio check?", 11, MSG_IN);
@@ -3356,7 +3504,6 @@ void AdvUI::runDemoDump()
     g_reactCount = brC;
     g_reactNext = brN;
     g_msgCount = bCount;
-    g_msgNext = bNext;
     g_msgsDirty = bDirty;
     mode = bMode;
     selectedNum = bSel;
@@ -3871,7 +4018,7 @@ void AdvUI::handleKey(char ch)
         } else if (enter && selectedChannel < 0) { // resend the newest failed DM in place
             uint32_t me = myNodeNum();
             for (int i = g_msgCount - 1; i >= 0; i--) {
-                int idx = (g_msgCount == kMaxMsgs) ? (g_msgNext + i) % kMaxMsgs : i;
+                int idx = i;
                 Msg &m = g_msgs[idx];
                 if (m.from == me && m.to == selectedNum && m.status == MSG_FAILED) {
                     uint32_t id = sendTextPacket(selectedNum, m.text);
@@ -3974,6 +4121,21 @@ void AdvUI::handleKey(char ch)
     // Home: recent conversations. Typing opens node search; Tab switches to all nodes.
     if (mode == MODE_CHATS) {
         buildConversations();
+        if (bksp) { // Del arms the delete confirmation
+            if (sel < convCount)
+                confirmDel = true;
+            return;
+        }
+        if (confirmDel) { // pending delete: Enter confirms, any other key cancels
+            if (enter && sel < convCount) {
+                deleteConversation(conv[sel]);
+                buildConversations();
+                if (sel >= convCount)
+                    sel = convCount ? convCount - 1 : 0;
+            }
+            confirmDel = false;
+            return;
+        }
         if (up) {
             if (sel > 0)
                 sel--;

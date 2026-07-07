@@ -49,6 +49,8 @@ UI, написанный с нуля ради одной цели: чтобы **
   <img src="docs/img/utc.png" width="32%" alt="Выбор сдвига UTC по городам"/>
 </p>
 
+<p align="center"><b><a href="docs/interface.ru.md#экраны-с-одного-взгляда">▶ Все экраны с подписями →</a></b></p>
+
 ## Установка
 
 Проще всего — **[веб-инсталлятор](https://anton-vinogradov.github.io/meshtastic-adv/)** (ESP Web Tools):

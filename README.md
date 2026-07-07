@@ -49,6 +49,8 @@ You get a device that boots straight into a usable messenger: pick a contact, ty
   <img src="docs/img/utc.png" width="32%" alt="UTC offset picker with cities"/>
 </p>
 
+<p align="center"><b><a href="docs/interface.md#screens-at-a-glance">▶ See every screen with captions →</a></b></p>
+
 ## Install
 
 The easiest way is the **[web installer](https://anton-vinogradov.github.io/meshtastic-adv/)** (ESP Web Tools):

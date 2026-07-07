@@ -129,6 +129,13 @@
             var first = sel.selectedIndex === 0;
             btn.setAttribute('manifest', first || !sel.value ? './manifest.json' : './versions/' + sel.value + '/manifest.json');
           });
+          // Count install attempts (per version) — cookieless, no personal data.
+          var act = document.querySelector('button[slot="activate"]');
+          if (act) act.addEventListener('click', function () {
+            if (window.goatcounter) window.goatcounter.count({
+              path: 'install/' + (sel.value || 'latest'), title: 'Install clicked', event: true
+            });
+          });
         })();
       </script>
     </div>
@@ -174,5 +181,8 @@
       Device imagery © <a href="https://shop.m5stack.com/products/m5stack-cardputer-adv">M5Stack</a>.
     </footer>
   </main>
+  <!-- GoatCounter: cookieless, privacy-first page-view + install-click stats -->
+  <script data-goatcounter="https://meshtastic-adv.goatcounter.com/count"
+          async src="//gc.zgo.at/count.js"></script>
 </body>
 </html>

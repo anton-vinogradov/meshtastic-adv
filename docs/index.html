@@ -67,6 +67,8 @@
       background:#000; border:3px solid var(--line); padding:6px 10px;
     }
     .verrow select:focus{ outline:none; border-color:var(--cyanD); }
+    .installs{ margin:12px 0 0; font-family:"Press Start 2P", monospace; font-size:11px;
+               color:var(--amber); letter-spacing:1px; }
 
     /* --- gallery --- */
     .shots{ display:grid; grid-template-columns:1fr 1fr; gap:14px; }
@@ -110,6 +112,7 @@
         <label for="ver">version</label>
         <select id="ver"><option value="">latest</option></select>
       </div>
+      <p id="installs" class="installs" hidden></p>
       <script>
         (function () {
           var sel = document.getElementById('ver');
@@ -129,13 +132,21 @@
             var first = sel.selectedIndex === 0;
             btn.setAttribute('manifest', first || !sel.value ? './manifest.json' : './versions/' + sel.value + '/manifest.json');
           });
-          // Count install attempts (per version) — cookieless, no personal data.
+          // Count install attempts — cookieless, no personal data. One flat "install"
+          // path so the total is a single countable number for the badge below.
           var act = document.querySelector('button[slot="activate"]');
           if (act) act.addEventListener('click', function () {
-            if (window.goatcounter) window.goatcounter.count({
-              path: 'install/' + (sel.value || 'latest'), title: 'Install clicked', event: true
-            });
+            if (window.goatcounter) window.goatcounter.count({ path: 'install', title: 'Install clicked', event: true });
           });
+          // Show that running install count from GoatCounter's visitor counter.
+          fetch('https://randoom.goatcounter.com/counter/install.json')
+            .then(function (r) { return r.ok ? r.json() : null; })
+            .then(function (d) {
+              if (!d || !d.count) return;
+              var el = document.getElementById('installs');
+              el.textContent = '⬇ ' + d.count + ' installs';
+              el.hidden = false;
+            }).catch(function () {});
         })();
       </script>
     </div>

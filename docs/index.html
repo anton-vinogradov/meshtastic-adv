@@ -45,7 +45,9 @@
                letter-spacing:1px; text-transform:uppercase; }
 
     /* --- install button --- */
-    esp-web-install-button{ display:block; }
+    esp-web-install-button{ display:block;
+      --esp-tools-button-color:var(--cyan); --esp-tools-button-text-color:#04121a;
+      --esp-tools-button-border-radius:0; }
     button[slot="activate"]{
       appearance:none; cursor:pointer; width:100%;
       font-family:"Press Start 2P", monospace; font-size:15px; color:#04121a;
@@ -57,6 +59,45 @@
     button[slot="activate"]:active{ transform:translateY(6px);
       box-shadow: 0 0 0 var(--cyanD), 0 0 0 3px #04121a; }
     .unsupported,.blocked{ display:block; color:var(--amber); font-size:20px; }
+
+    /* --- esp-web-tools install dialog → 8-bit theme ---
+       The dialog paints its theme on its own :host (a pseudo-class that
+       out-specificities a plain type selector), so we override the Material
+       design tokens on the host element with !important. It mounts in
+       document.body as <ewt-install-dialog>; custom props cascade into its
+       shadow tree and every ew-* child. */
+    ewt-install-dialog{
+      --roboto-font:"VT323", ui-monospace, monospace !important;
+      --md-ref-typeface-plain:"VT323", ui-monospace, monospace !important;
+      --md-ref-typeface-brand:"Press Start 2P", monospace !important;
+      --md-sys-typescale-title-font:"Press Start 2P", monospace !important;
+      --md-sys-typescale-headline-font:"Press Start 2P", monospace !important;
+
+      --md-sys-color-primary:var(--cyan) !important;
+      --md-sys-color-on-primary:#04121a !important;
+
+      --md-sys-color-surface:var(--panel) !important;
+      --md-sys-color-surface-container:var(--panel) !important;
+      --md-sys-color-surface-container-high:var(--panel) !important;
+      --md-sys-color-surface-container-highest:#0e1420 !important;
+      --md-sys-color-secondary-container:#12233d !important;
+      --md-sys-color-on-secondary-container:var(--ink) !important;
+
+      --md-sys-color-on-surface:var(--ink) !important;
+      --md-sys-color-on-surface-variant:var(--dim) !important;
+      --md-sys-color-outline:var(--line) !important;
+      --md-sys-color-outline-variant:var(--line) !important;
+
+      --text-color:var(--dim) !important;
+      --danger-color:var(--red) !important;
+
+      /* square corners to match the page's pixel panels */
+      --md-dialog-container-shape:0 !important;
+      --md-sys-shape-corner-large:0 !important;
+      --md-sys-shape-corner-medium:0 !important;
+      --md-sys-shape-corner-small:0 !important;
+      --md-sys-shape-corner-extra-small:0 !important;
+    }
 
     /* --- version picker --- */
     .verrow{ display:flex; align-items:center; gap:12px; margin-top:14px; }

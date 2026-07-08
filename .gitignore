@@ -21,3 +21,6 @@
 .idea/
 .DS_Store
 *.swp
+
+# M5Burner combined image (derivative of docs/*.bin)
+dist/

@@ -86,3 +86,10 @@ for attempt in range(3):
 if not booted:
     print(">> flashed, but couldn't confirm the reset — if the screen stays black, unplug/replug once")
 PYEOF
+
+# No battery-backed RTC: every flash boots clockless and messages would stamp
+# timeless until a phone/NTP/mesh sync. Push the host's time over the serial
+# PhoneAPI once the app is up. Best-effort: a failure never fails the flash.
+echo ">> setting the device clock from the host"
+sleep 8 # let the app finish booting before opening an API session
+"$PY" "$ROOT/scripts/settime.py" "$(find_port)" || true

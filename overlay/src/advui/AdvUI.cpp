@@ -687,7 +687,8 @@ struct HistRec {
 constexpr int kHistRec = (int)sizeof(HistRec); // 184: Msg is 180 with no tail padding
 constexpr int kHistCap = 256;
 constexpr int kHistSlack = 64;
-constexpr int kHistWin = 16; // staged page size (static RAM cost: 16 records)
+constexpr int kHistWin = 16;  // staged slice size (static RAM cost: 16 records)
+constexpr int kHistSlide = 8; // window slide step: half the slice keeps the anchor in view
 Msg g_arch[kHistWin];
 uint32_t g_archReply[kHistWin];
 int g_histTotal = -1; // records on disk; -1 = not read yet
@@ -2094,25 +2095,37 @@ int AdvUI::matchedFromNewest(int back)
     return -1;
 }
 
-// Stage an archive page for the open thread; page 0 = the newest evicted slice.
-void AdvUI::histLoadPage(int page)
+// Stage the archive slice for `depth` archived messages above the seam. The
+// staged window is the oldest-most 16 of those; the gap up to the seam (if
+// any) stays unrendered, and the live ring renders only when the slice
+// touches the seam — one continuous timeline either way. The view anchor
+// keeps the screen position stable across restagings, so sliding the window
+// feels like plain scrolling, never like a page swap.
+void AdvUI::histStage(int depth)
 {
+    if (depth <= 0) {
+        histExit();
+        return;
+    }
+    if (histAvail >= 0 && depth > histAvail)
+        depth = histAvail;
     bool isChan = selectedChannel >= 0;
-    int got = histLoadSlice(isChan, (uint8_t)(isChan ? selectedChannel : 0), selectedNum, page * kHistWin, kHistWin);
+    int sliceLen = depth < kHistWin ? depth : kHistWin;
+    int skipNewest = depth - sliceLen; // matches between the slice and the seam
+    int got = histLoadSlice(isChan, (uint8_t)(isChan ? selectedChannel : 0), selectedNum, skipNewest, sliceLen);
     if (got <= 0)
-        return; // nothing there: stay where we are
-    histPage = page;
+        return; // racing purge/compaction: keep the current window
+    histDepth = depth;
     histCount = got;
-    chatScroll = 0; // land at the page bottom — the newest of the older slice
-    viewAnchorId = 0;
-    lastDrawScroll = 0;
+    histSeam = (skipNewest == 0); // touching the seam: render the live ring after the slice
 }
 
 void AdvUI::histExit()
 {
-    histPage = -1;
+    histDepth = 0;
     histCount = 0;
-    chatScroll = 0; // pinned back to the live newest (histEnterAtTop may override)
+    histSeam = true;
+    chatScroll = 0; // pinned back to the live newest
     viewAnchorId = 0;
     lastDrawScroll = 0;
 }
@@ -2125,10 +2138,10 @@ void AdvUI::openEntry(int s)
     reactSel = -1;
     reactStrip = false;
     pendingReplyId = 0;
-    histPage = -1;           // live view; archive re-counted lazily per thread
+    histDepth = 0;           // live view; archive re-counted lazily per thread
     histCount = 0;
+    histSeam = true;
     histAvail = -1;
-    histEnterAtTop = false;
     chatAtTop = false;
     viewAnchorId = 0;
     lastDrawScroll = 0;
@@ -2248,10 +2261,10 @@ void AdvUI::openConv(int i)
     reactSel = -1;
     reactStrip = false;
     pendingReplyId = 0;
-    histPage = -1; // live view; archive re-counted lazily per thread
+    histDepth = 0; // live view; archive re-counted lazily per thread
     histCount = 0;
+    histSeam = true;
     histAvail = -1;
-    histEnterAtTop = false;
     chatAtTop = false;
     viewAnchorId = 0;
     lastDrawScroll = 0;
@@ -2598,20 +2611,27 @@ void AdvUI::drawNode()
     const int fy0 = 24, lh = 17;
     int bottom = (mode == MODE_COMPOSE) ? (pendingReplyId ? 96 : 112) : 122; // room for compose (+ quote line)
     int maxLines = (bottom - fy0) / lh;
-    int matched[kMaxMsgs], mc = 0;
+    // One continuous timeline: the staged archive slice first, then the live
+    // ring whenever the window touches the seam — scrolling slides the window,
+    // it never swaps a "page" in front of the reader.
+    struct SrcRef {
+        const Msg *m;
+        uint32_t rid;
+        int16_t ringIdx; // g_msgs index for live messages, -1 for archived ones
+    };
+    SrcRef srcs[kMaxMsgs + kHistWin];
+    int mc = 0;
     bool hasFailed = false; // any failed outgoing DM here -> offer ENTER resend
-    if (histPage >= 0) { // a staged flash-archive page replaces the live slice
-        for (int i = 0; i < histCount; i++)
-            matched[mc++] = i;
-    } else {
+    for (int i = 0; i < histCount; i++)
+        srcs[mc++] = {&g_arch[i], g_archReply[i], (int16_t)-1};
+    if (histSeam) {
         for (int i = 0; i < g_msgCount; i++) {
-            int idx = i;
-            bool match = isChan ? (g_msgs[idx].to == NODENUM_BROADCAST && g_msgs[idx].ch == selectedChannel)
-                                : ((g_msgs[idx].from == selectedNum || g_msgs[idx].to == selectedNum) &&
-                                   g_msgs[idx].to != NODENUM_BROADCAST);
+            bool match = isChan ? (g_msgs[i].to == NODENUM_BROADCAST && g_msgs[i].ch == selectedChannel)
+                                : ((g_msgs[i].from == selectedNum || g_msgs[i].to == selectedNum) &&
+                                   g_msgs[i].to != NODENUM_BROADCAST);
             if (match) {
-                matched[mc++] = idx;
-                if (!isChan && g_msgs[idx].from == me && g_msgs[idx].status == MSG_FAILED)
+                srcs[mc++] = {&g_msgs[i], g_msgReply[i], (int16_t)i};
+                if (!isChan && g_msgs[i].from == me && g_msgs[i].status == MSG_FAILED)
                     hasFailed = true;
             }
         }
@@ -2638,6 +2658,7 @@ void AdvUI::drawNode()
             uint8_t timeLen;  // leading chars that are the dim "HH:MM " prefix (0 on continuation lines)
             uint8_t nameLen;  // chars after the time that are the sender-name span (channels)
             bool quote;       // the replied-to snippet: drawn inside a frame, not as plain text
+            uint32_t msgId;   // packet id of the owning message (0: decoration/no id) — view anchor
         };
         int32_t tzOff = g_utcOffsetMin * 60; // user-set UTC offset (Settings > UTC)
         static DLine dl[128]; // single-threaded UI: static keeps it off the stack; sized so
@@ -2666,13 +2687,12 @@ void AdvUI::drawNode()
             }
             return dl[dlCount++];
         };
-        Msg *mbase = histPage >= 0 ? g_arch : g_msgs; // where matched[] indices point
         for (int i = 0; i < mc; i++) {
-            Msg &m = mbase[matched[i]];
-            uint32_t replyId = histPage >= 0 ? g_archReply[matched[i]] : g_msgReply[matched[i]];
+            const Msg &m = *srcs[i].m;
+            uint32_t replyId = srcs[i].rid;
             bool out = (m.from == me);
             bool failed = out && m.status == MSG_FAILED;
-            bool isSel = histPage < 0 && (selMsgIdx >= 0 && matched[i] == selMsgIdx);
+            bool isSel = (selMsgIdx >= 0 && srcs[i].ringIdx >= 0 && srcs[i].ringIdx == selMsgIdx);
             int wrapW = !out ? 232 : (failed ? 162 : 214); // reserve room for the marker
             char tpre[8];
             msgTimePrefix(m.rxTime, tzOff, tpre, sizeof(tpre)); // "HH:MM " before the arrow
@@ -2689,7 +2709,7 @@ void AdvUI::drawNode()
             }
             if (replyId) { // a reply: quote the original above it, if we still hold it
                 const Msg *om = nullptr; // the staged page first, then the live ring
-                for (int q = 0; histPage >= 0 && q < histCount && !om; q++)
+                for (int q = 0; q < histCount && !om; q++)
                     if (g_arch[q].id == replyId && g_arch[q].id != 0)
                         om = &g_arch[q];
                 for (int q = 0; q < g_msgCount && !om; q++)
@@ -2725,6 +2745,7 @@ void AdvUI::drawNode()
                     d.nameLen = 0;
                     d.last = false;
                     d.quote = true;
+                    d.msgId = 0;
                     if (isSel) {
                         if (selFirst < 0)
                             selFirst = dlCount - 1;
@@ -2732,9 +2753,9 @@ void AdvUI::drawNode()
                     }
                 }
             }
-            if (histPage < 0 && matched[i] == chatAnchorMsgIdx)
+            if (chatAnchorMsgIdx >= 0 && srcs[i].ringIdx == chatAnchorMsgIdx)
                 anchorLine = dlCount; // this message's first line
-            if (histPage < 0 && viewAnchorId && m.id == viewAnchorId && anchorNewLine < 0)
+            if (viewAnchorId && m.id == viewAnchorId && anchorNewLine < 0)
                 anchorNewLine = dlCount; // where the view-anchor message begins this frame
             const char *p = full;
             bool first = true;
@@ -2742,7 +2763,7 @@ void AdvUI::drawNode()
                 DLine &d = pushLine();
                 p += wrapLine(g, p, wrapW, d.text, sizeof(d.text));
                 d.color = out ? 0x07FF : 0xFFFF; // outgoing cyan, incoming white
-                d.msgIdx = histPage >= 0 ? -1 : (int16_t)matched[i]; // archive lines: no read/pick
+                d.msgIdx = srcs[i].ringIdx; // -1 for archived lines: no read-marking or picking
                 d.out = out;
                 d.status = m.status;
                 d.err = m.err;
@@ -2750,6 +2771,7 @@ void AdvUI::drawNode()
                 d.nameLen = first ? nlen : 0;
                 d.last = (*p == 0);
                 d.quote = false;
+                d.msgId = m.id;
                 if (isSel) {
                     if (selFirst < 0)
                         selFirst = dlCount - 1;
@@ -2779,6 +2801,7 @@ void AdvUI::drawNode()
                     d.nameLen = 0;
                     d.last = false;
                     d.quote = false;
+                    d.msgId = 0;
                     if (isSel)
                         selLast = dlCount - 1;
                 }
@@ -2787,11 +2810,6 @@ void AdvUI::drawNode()
         // chatScroll counts lines scrolled up from the bottom (0 = pinned to newest).
         int maxScroll = dlCount > maxLines ? dlCount - maxLines : 0;
         bool jumpedNow = false;
-        if (histEnterAtTop) { // paged toward newer: keep reading from the seam down
-            chatScroll = maxScroll;
-            histEnterAtTop = false;
-            jumpedNow = true;
-        }
         if (chatAnchorMsgIdx >= 0) { // first render after opening: jump to the first unread
             if (anchorLine >= 0 && anchorLine <= maxScroll)
                 chatScroll = maxScroll - anchorLine;
@@ -2802,10 +2820,11 @@ void AdvUI::drawNode()
             chatAnchorMsgIdx = -1;
             jumpedNow = true;
         }
-        if (histPage < 0 && !jumpedNow && chatScroll > 0 && viewAnchorId && anchorNewLine >= 0) {
+        if (!jumpedNow && viewAnchorId && anchorNewLine >= 0) {
             // Re-anchor the view to the message it was showing: arrivals grow the
-            // bottom and evictions eat the top, but the reader shouldn't move.
-            // userDelta = scrolling done since the last draw; identity when idle.
+            // bottom, evictions eat the top and window slides restage the archive
+            // part — the reader shouldn't move for any of them. userDelta is the
+            // scrolling done since the last draw; the math is an identity when idle.
             int userDelta = chatScroll - lastDrawScroll;
             chatScroll = maxScroll - (anchorNewLine + viewAnchorOff - userDelta);
         }
@@ -2828,13 +2847,16 @@ void AdvUI::drawNode()
         int startL = maxScroll - chatScroll;
         lastDrawScroll = chatScroll;
         viewAnchorId = 0;
-        if (histPage < 0 && chatScroll > 0) { // scrolled up: remember what the reader sees
+        // Remember what the reader sees whenever the view isn't pinned to the
+        // newest message (deep windows are "unpinned" even at scroll 0: their
+        // bottom is an archive message, not the newest).
+        if (chatScroll > 0 || (histDepth > 0 && !histSeam)) {
             for (int i = startL; i < dlCount; i++)
-                if (dl[i].msgIdx >= 0 && g_msgs[dl[i].msgIdx].id) {
+                if (dl[i].msgId) {
                     int a = i;
-                    while (a > 0 && dl[a - 1].msgIdx == dl[i].msgIdx)
+                    while (a > 0 && dl[a - 1].msgId == dl[i].msgId)
                         a--; // back up to the message's first line
-                    viewAnchorId = g_msgs[dl[i].msgIdx].id;
+                    viewAnchorId = dl[i].msgId;
                     viewAnchorOff = startL - a;
                     break;
                 }
@@ -2950,10 +2972,8 @@ void AdvUI::drawNode()
         }
         const char *hint;
         char histHint[36];
-        if (histPage >= 0) { // paged into the flash archive: show where we are in it
-            int newest = histAvail - histPage * kHistWin; // 1-based match index of the page's newest
-            snprintf(histHint, sizeof(histHint), "history %d-%d/%d  ESC latest", newest - histCount + 1, newest,
-                     histAvail);
+        if (histDepth > 0) { // the window reaches into the flash archive
+            snprintf(histHint, sizeof(histHint), "history %d/%d  ESC latest", histDepth, histAvail);
             hint = histHint;
         } else if (reactStrip) {
             hint = "</> pick  ENTER send  ESC";
@@ -4412,7 +4432,7 @@ void AdvUI::handleKey(char ch)
 
     if (mode == MODE_NODE) {
         if (esc || bksp) {
-            if (histPage >= 0) { // first ESC leaves the archive, not the chat
+            if (histDepth > 0) { // first ESC leaves the archive, not the chat
                 histExit();
                 return;
             }
@@ -4424,28 +4444,28 @@ void AdvUI::handleKey(char ch)
             mode = nodeReturn;
         } else if (up) {
             // A held arrow drains several key events between two frames, but the
-            // paging conditions describe the LAST DRAWN frame — each transition
-            // consumes its flag so a hold hops at most one page per rendered frame.
-            if (chatAtTop && !histEnterAtTop) { // at the very top: page back into the archive
-                chatAtTop = false; // consumed; the next draw recomputes it
+            // edge conditions describe the LAST DRAWN frame — consuming chatAtTop
+            // limits window slides to one per rendered frame; the view anchor then
+            // keeps the content still, so a slide reads as one more line of scroll.
+            if (chatAtTop) { // window top: slide the window deeper into the archive
+                chatAtTop = false;
                 if (histAvail < 0) // lazy: counted only when someone actually scrolls up here
                     histAvail = histCountFor(selectedChannel >= 0, (uint8_t)(selectedChannel >= 0 ? selectedChannel : 0),
                                              selectedNum);
-                int next = histPage + 1;
-                if (histAvail > next * kHistWin)
-                    histLoadPage(next);
+                if (histDepth < histAvail) {
+                    int want = histDepth + kHistSlide;
+                    histStage(want > histAvail ? histAvail : want);
+                    chatScroll = lastDrawScroll + 1; // the keypress itself still moves a line
+                } // else: the very top of everything we have
             } else
                 chatScroll++; // older; drawNode clamps to the top of the thread
         } else if (down) {
-            if (histPage >= 0 && chatScroll == 0 && !histEnterAtTop) { // page bottom: toward newer
-                if (histPage == 0)
-                    histExit();
-                else
-                    histLoadPage(histPage - 1);
-                histEnterAtTop = true; // land at the seam; also swallows queued downs this frame
+            if (histDepth > 0 && !histSeam && chatScroll == 0) { // window bottom, gap below
+                histStage(histDepth - kHistSlide); // slide back toward the seam
+                chatScroll = lastDrawScroll - 1;   // and keep moving one line newer
             } else if (chatScroll > 0)
                 chatScroll--; // back toward the newest
-        } else if (histPage >= 0) { // any action key returns to the live view first
+        } else if (histDepth > 0) { // any action key returns to the live view first
             histExit();
         } else if (right || left) { // pick a message: RIGHT = react, LEFT = reply
             if (matchedFromNewest(0) >= 0) {

@@ -90,6 +90,9 @@ PYEOF
 # No battery-backed RTC: every flash boots clockless and messages would stamp
 # timeless until a phone/NTP/mesh sync. Push the host's time over the serial
 # PhoneAPI once the app is up. Best-effort: a failure never fails the flash.
-echo ">> setting the device clock from the host"
-sleep 8 # let the app finish booting before opening an API session
-"$PY" "$ROOT/scripts/settime.py" "$(find_port)" || true
+# SETTIME=0 skips it (e.g. to test the clockless path on purpose).
+if [ "${SETTIME:-1}" != "0" ]; then
+    echo ">> setting the device clock from the host"
+    sleep 8 # let the app finish booting before opening an API session
+    "$PY" "$ROOT/scripts/settime.py" "$(find_port)" || true
+fi

@@ -64,6 +64,11 @@ constexpr int kMaxCompNodes = 64; // synced-node table; 64 is plenty and saves ~
                                    // static RAM this no-PSRAM board can't spare (see v0.3.2 heap notes)
 extern CompNode g_compNodes[kMaxCompNodes];
 extern volatile int g_compNodeCount;
+// Honest size of the linked node's DB: the config stream sends each entry once
+// per sync (reset on my_info, counted through config_complete), then live
+// node_info for genuinely new nodes keeps it current. Can exceed the 64-slot
+// mirror above — the header shows this number, the list shows the mirror.
+extern volatile int g_compNodesSeen;
 // Full channel objects from the config stream. Kept whole — the PSK included —
 // so a rename can round-trip the channel back via set_channel without wiping
 // the key (the same reason the phone can edit channels).

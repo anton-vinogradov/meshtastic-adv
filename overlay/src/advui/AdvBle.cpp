@@ -27,6 +27,7 @@ char g_linkErr[28] = {0};
 
 CompNode g_compNodes[kMaxCompNodes];
 volatile int g_compNodeCount = 0;
+volatile int g_compNodesSeen = 0;
 meshtastic_Channel g_compChans[8];
 volatile bool g_linkConfigDone = false;
 volatile int g_compPreset = 0;
@@ -253,6 +254,7 @@ void routeFromRadio(const uint8_t *bytes, uint16_t len)
     switch (fr.which_payload_variant) {
     case meshtastic_FromRadio_my_info_tag:
         g_linkMyNode = fr.my_info.my_node_num;
+        g_compNodesSeen = 0; // my_info opens every config stream: recount the DB
         break;
     case meshtastic_FromRadio_node_info_tag: {
         const meshtastic_NodeInfo &ni = fr.node_info;
@@ -260,6 +262,11 @@ void routeFromRadio(const uint8_t *bytes, uint16_t len)
         for (int i = 0; i < g_compNodeCount; i++)
             if (g_compNodes[i].num == ni.num)
                 slot = i;
+        // Config stream: one node_info per DB entry, so counting the stream gives
+        // the node's true DB size even past our 64-slot mirror. Live phase: only
+        // genuinely new nodes (not in the mirror) grow it.
+        if (!g_linkConfigDone || slot < 0)
+            g_compNodesSeen++;
         if (slot < 0 && g_compNodeCount < kMaxCompNodes)
             slot = g_compNodeCount++;
         if (slot < 0) { // table full: evict the longest-silent node

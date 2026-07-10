@@ -76,7 +76,7 @@ Your recent conversations — DMs and channels mixed, newest first.
 Everyone the node DB knows, one row per node.
 
 ```
- 42 nodes                  [2 new]  78%    <- node count (200+ at the DB cap) · battery
+ 42 nodes                  [2 new]  78%    <- nodes known to the mesh · battery
  ------------------------------------------
  ✉ ksv-relay      ▂▄▆_   →1   4m    CLI
  * SPb Gate       ▂▄▆█   →0   now   RTR    <- * favourite (yellow)
@@ -206,7 +206,10 @@ reminds you).
 - **Phone app:** the stock Bluetooth API is untouched, so the official Meshtastic app pairs
   with the Cardputer like with any node — a passkey screen pops up (waking the display) with
   the PIN to type on the phone. WiFi turns Bluetooth off, as in stock.
-- The node DB caps at 200 nodes on this hardware; the header shows `200+` when it's full.
-  In companion mode the synced node table holds the 128 most recently heard nodes.
+- The header counts every node identity the device remembers — the 200-entry hot DB (full
+  data) **plus** the warm tier of up to 150 evicted identities the engine keeps for PKI, so
+  on a big mesh it reads honestly past 200 (up to 350, then `+`). The list itself shows the
+  hot entries; in companion mode it mirrors the 64 most recently heard nodes while the
+  header counts the linked node's whole DB from the sync stream.
 - Other nodes' battery levels aren't stored by this build's compact node DB — only our own
   battery (header/footer) and, in companion mode, the linked node's.

@@ -2184,8 +2184,24 @@ void AdvUI::drawNodeList()
 
     g->fillScreen(0x0000);
 
-    size_t total = g_radioCompanion ? (size_t)g_compNodeCount : (nodeDB ? nodeDB->getNumMeshNodes() : 0);
-    size_t cap = g_radioCompanion ? (size_t)kMaxCompNodes : (size_t)::advui_max_num_nodes();
+    // The honest node count, not the table size. Local: hot store + the warm tier
+    // (evicted identities the engine still remembers — already allocated, so the
+    // number is free). Companion: the config stream sends each of the node's DB
+    // entries exactly once per sync, so counting the stream beats our 64-slot
+    // mirror. The list below still shows only nodes we hold full data for.
+    size_t total, cap = SIZE_MAX;
+    if (g_radioCompanion) {
+        total = (size_t)(g_compNodesSeen > g_compNodeCount ? g_compNodesSeen : (int)g_compNodeCount);
+    } else {
+        total = nodeDB ? nodeDB->getNumMeshNodes() : 0;
+        cap = (size_t)::advui_max_num_nodes();
+#if WARM_NODE_COUNT > 0
+        if (nodeDB) {
+            total += nodeDB->warmStore.count();
+            cap += WARM_NODE_COUNT;
+        }
+#endif
+    }
     uint32_t me = myNodeNum();
 
     g->setFont(&lgfx::fonts::Font0); // header stays on the compact bitmap font
@@ -2197,8 +2213,8 @@ void AdvUI::drawNodeList()
 
     g->setTextColor(0x07FF); // cyan
     g->setCursor(4, 3);
-    // At the cap the table is full and pinned there (new nodes evict old ones),
-    // so show "200+" to make the cap visible rather than a suspicious flat count.
+    // "+" only when even the warm tier is pinned at capacity — beyond that point
+    // the oldest identities really do fall off and the count stops being exact.
     g->printf("%u%s nodes", (unsigned)total, total >= cap ? "+" : "");
 
     int bw = g->textWidth(bbuf);

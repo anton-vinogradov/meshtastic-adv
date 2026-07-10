@@ -119,13 +119,13 @@ const char *errName(uint8_t e)
 constexpr int kMaxMsgs = 32; // shared across all conversations; DMs are protected by the
                              // channel-first eviction (addMsg), not by size, so this stays small
                              // to keep the heap margin — a connected phone + BLE runs it thin
-constexpr int kNumSettings = 16; // the flat item table: Name..Channel, Role..Rebroadcast, UTC, WiFi, MQTT, Screen, Radio, Font
+constexpr int kNumSettings = 17; // the flat item table: Name..Channel, Role..Rebroadcast, UTC, WiFi, MQTT, Screen, Radio, Font, Clock
 
 // The Settings menu is two-level: the top lists sections (plus WiFi/MQTT/Radio
 // as direct entries); a section lists indices into the flat item table.
 const uint8_t kSecNode[] = {0, 1};                    // Name, Short
 const uint8_t kSecLora[] = {2, 3, 4, 5, 6, 7, 8, 9};  // Region..Rebroadcast
-const uint8_t kSecDevice[] = {10, 13, 15};            // UTC, Screen, Font (read-only)
+const uint8_t kSecDevice[] = {10, 16, 13, 15};        // UTC, Clock, Screen, Font (read-only)
 constexpr int kTopCount = 6;                          // Node, LoRa, WiFi, MQTT, Device, Radio
 Msg g_msgs[kMaxMsgs];
 int g_msgCount = 0;         // populated slots (grows to kMaxMsgs)
@@ -837,7 +837,7 @@ int optIndex(const EnumOpt *opts, int cnt, int value)
     return 0;
 }
 
-// Text-editor (MODE_SETNAME) targets: 0 long name, 1 short name, 2 frequency, 3 channel.
+// Text-editor (MODE_SETNAME) targets: 0 long name, 1 short name, 2 frequency, 3 channel, 4 clock.
 // --- WiFi / MQTT sub-settings (MODE_NETPAGE) -----------------------------------
 // Two pages of fields backed by the stock config/moduleConfig; no engine changes.
 struct NetField {
@@ -916,7 +916,7 @@ unsigned editMax(int t)
         netTextDecode(t, p, i);
         return netTextMax(p, i);
     }
-    return t == 1 ? 4 : t == 2 ? 9 : t == 3 ? 11 : 24;
+    return t == 1 ? 4 : t == 2 ? 9 : t == 3 ? 11 : t == 4 ? 5 : 24;
 }
 const char *editTitle(int t)
 {
@@ -925,7 +925,11 @@ const char *editTitle(int t)
         netTextDecode(t, p, i);
         return netFields(p)[i].label;
     }
-    return t == 1 ? "Set short name" : t == 2 ? "Set frequency (MHz)" : t == 3 ? "Set channel name" : "Set long name";
+    return t == 1   ? "Set short name"
+           : t == 2 ? "Set frequency (MHz)"
+           : t == 3 ? "Set channel name"
+           : t == 4 ? "Set clock (HH:MM local)"
+                    : "Set long name";
 }
 
 // The node row (list and picker): proportional name on the left, then a compact
@@ -1062,6 +1066,24 @@ void drawMsgStatus(lgfx::LGFXBase *g, int x, int y, uint8_t status)
 
 // Compact "HH:MM " prefix for a message's epoch time (local), or "" when the clock
 // wasn't set when the message was stamped (avoids showing bogus 00:xx times).
+// Midnight UTC of the firmware build date. The manual clock (Settings > Device >
+// Clock) asks only for HH:MM, so the date part comes from here: the displayed
+// time is exact, the date is at worst a little stale, and any real time source
+// still outranks it and corrects the full date.
+uint32_t buildDateEpoch()
+{
+    static const char mn[] = "JanFebMarAprMayJunJulAugSepOctNovDec";
+    char m[4] = {__DATE__[0], __DATE__[1], __DATE__[2], 0};
+    const char *hit = strstr(mn, m);
+    int mo = hit ? (int)(hit - mn) / 3 : 0;            // 0-based month
+    int d = atoi(__DATE__ + 4), y = atoi(__DATE__ + 7);
+    y -= mo <= 1; // days-from-civil (Hinnant): shift Jan/Feb to the previous March-year
+    int era = y / 400, yoe = y - era * 400;
+    int doy = (153 * (mo <= 1 ? mo + 10 : mo - 2) + 2) / 5 + d - 1;
+    int doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    return (uint32_t)(((int64_t)era * 146097 + doe - 719468) * 86400);
+}
+
 void msgTimePrefix(uint32_t rxTime, int32_t tzOff, char *out, int cap)
 {
     if (rxTime < 1600000000u) { // before 2020-09 => no valid RTC at stamp time
@@ -2339,6 +2361,7 @@ void AdvUI::drawNode()
             uint8_t err;
             uint8_t timeLen;  // leading chars that are the dim "HH:MM " prefix (0 on continuation lines)
             uint8_t nameLen;  // chars after the time that are the sender-name span (channels)
+            bool quote;       // the replied-to snippet: drawn inside a frame, not as plain text
         };
         int32_t tzOff = g_utcOffsetMin * 60; // user-set UTC offset (Settings > UTC)
         static DLine dl[128]; // single-threaded UI: static keeps it off the stack; sized so
@@ -2387,10 +2410,27 @@ void AdvUI::drawNode()
                 for (int q = 0; q < g_msgCount; q++)
                     if (g_msgs[q].id == g_msgReply[matched[i]] && g_msgs[q].id != 0) {
                         DLine &d = pushLine();
-                        char snip[30];
-                        utf8Copy(snip, g_msgs[q].text, (int)sizeof(snip) - 1);
-                        snprintf(d.text, sizeof(d.text), "    | %s", snip);
-                        d.color = 0x630C; // extra dim: context, not content
+                        Msg &om = g_msgs[q];
+                        char qt[8]; // the original's own arrival time — the frame is often
+                        msgTimePrefix(om.rxTime, tzOff, qt, sizeof(qt)); // its only surviving trace
+                        char qs[10];
+                        if (om.from != me && isChan) {
+                            char sn[8];
+                            shortNameOf(om.from, sn, sizeof(sn));
+                            snprintf(qs, sizeof(qs), "%s: ", sn);
+                        } else
+                            snprintf(qs, sizeof(qs), om.from == me ? "> " : "< ");
+                        char snip[24];
+                        utf8Copy(snip, om.text, (int)sizeof(snip) - 1);
+                        snprintf(d.text, sizeof(d.text), "%s%s%s", qt, qs, snip);
+                        while (lineWidthEmotes(g, d.text) > 204) { // keep the text inside the frame
+                            int L = (int)strlen(d.text);
+                            do {
+                                L--;
+                            } while (L > 0 && (d.text[L] & 0xC0) == 0x80); // drop whole UTF-8 char
+                            d.text[L] = 0;
+                        }
+                        d.color = 0x8410; // readable, but subordinate to its frame
                         d.msgIdx = -1;
                         d.out = false;
                         d.status = 0;
@@ -2398,6 +2438,7 @@ void AdvUI::drawNode()
                         d.timeLen = 0;
                         d.nameLen = 0;
                         d.last = false;
+                        d.quote = true;
                         if (isSel) {
                             if (selFirst < 0)
                                 selFirst = dlCount - 1;
@@ -2421,6 +2462,7 @@ void AdvUI::drawNode()
                 d.timeLen = first ? tlen : 0; // time + name sit only on the first line
                 d.nameLen = first ? nlen : 0;
                 d.last = (*p == 0);
+                d.quote = false;
                 if (isSel) {
                     if (selFirst < 0)
                         selFirst = dlCount - 1;
@@ -2449,6 +2491,7 @@ void AdvUI::drawNode()
                     d.timeLen = 0;
                     d.nameLen = 0;
                     d.last = false;
+                    d.quote = false;
                     if (isSel)
                         selLast = dlCount - 1;
                 }
@@ -2490,6 +2533,19 @@ void AdvUI::drawNode()
             }
             if (selFirst >= 0 && i >= selFirst && i <= selLast)
                 g->fillRect(0, y - 1, 236, lh, 0x2945); // react-mode selection band
+            if (d.quote) { // the replied-to message: frame it so the reply reads as a reply
+                g->setFont(&cyrFont);
+                g->setTextSize(1);
+                int qx = 10;
+                int bw = lineWidthEmotes(g, d.text) + 10;
+                if (bw > 224)
+                    bw = 224;
+                g->drawRect(qx, y - 1, bw, lh - 2, 0x4a49);   // frame
+                g->drawFastVLine(qx, y - 1, lh - 2, 0x07FF);  // cyan reply accent on the left edge
+                printLineEmotes(g, qx + 6, y, d.text, d.color, 2);
+                y += lh;
+                continue;
+            }
             int cx = 4;
             if (d.timeLen) { // dim the "HH:MM " prefix (ASCII, no emoji)
                 g->setFont(&cyrFont);
@@ -2688,6 +2744,21 @@ bool AdvUI::applyName()
         return true;
     }
 
+    if (editTarget == 4) { // manual clock: HH:MM local -> RTC, for meshes with no time source
+        int hh = -1, mm = -1;
+        if (sscanf(nameBuf, "%d:%d", &hh, &mm) != 2 && strlen(nameBuf) == 4 &&
+            strspn(nameBuf, "0123456789") == 4) { // bare HHMM, no colon
+            hh = (nameBuf[0] - '0') * 10 + nameBuf[1] - '0';
+            mm = (nameBuf[2] - '0') * 10 + nameBuf[3] - '0';
+        }
+        if (hh < 0 || hh > 23 || mm < 0 || mm > 59)
+            return false; // unparsable: back to Settings, row still shows "not set"
+        int64_t utc = (int64_t)buildDateEpoch() + hh * 3600 + mm * 60 - (int64_t)g_utcOffsetMin * 60;
+        struct timeval tv = {(time_t)utc, 0};
+        perhapsSetRTC(RTCQualityDevice, &tv, true); // Device quality: phone/mesh still outrank it
+        return false;
+    }
+
     // name (long / short): applied live, no reboot
     if (g_radioCompanion) { // rename the linked node via set_owner, like the phone
         meshtastic_AdminMessage adm = meshtastic_AdminMessage_init_default;
@@ -2743,7 +2814,7 @@ void AdvUI::drawSettings()
     const char *labels[kNumSettings] = {"Name", "Short",       "Region", "Preset", "Frequency",
                                         "Channel", "Role",     "Hops",   "Power",  "Rebroadcast",
                                         "UTC",     "WiFi",     "MQTT",   "Screen", "Radio",
-                                        "Font"};
+                                        "Font",    "Clock"};
     char vals[kNumSettings][24];
     if (g_radioCompanion) { // rows 0-5 show (and remote-admin edit) the linked node
         meshtastic_NodeInfoLite *me = g_linkMyNode ? nodeByNum(g_linkMyNode) : nullptr;
@@ -2810,6 +2881,15 @@ void AdvUI::drawSettings()
     else
         strcpy(vals[14], "onboard");
     snprintf(vals[15], sizeof(vals[15]), "%s", sdFontState()); // unicode font source (read-only)
+    {
+        uint32_t now = getTime(false); // device clock: the row doubles as the RTC status
+        if (now >= 1600000000u) {
+            uint32_t loc = now + g_utcOffsetMin * 60;
+            snprintf(vals[16], sizeof(vals[16]), "%02u:%02u", (unsigned)((loc / 3600u) % 24u),
+                     (unsigned)((loc / 60u) % 60u));
+        } else
+            strcpy(vals[16], "not set");
+    }
 
     // What the current level shows: top = sections + direct entries (with a
     // representative value as the preview), sub = the section's flat items.
@@ -3238,6 +3318,8 @@ void AdvUI::drawEmoji()
 }
 
 #ifdef ADVUI_SCREENSHOT
+static bool shotLive = false; // 'L' over serial: dump the frame right after the next render
+
 // Dumps the current canvas (rgb332) as hex over serial, framed by markers, so a host
 // script can rebuild a PNG. Dev-only: gated out of the release build.
 void AdvUI::screenshot(const char *name)
@@ -3668,6 +3750,12 @@ void AdvUI::openSetting(int item)
         pickSel = optIndex(kUtcOpts, kUtcCount, g_utcOffsetMin);
         pickScroll = 0;
         mode = MODE_PICKLIST;
+    } else if (item == 16) { // manual clock -> HH:MM entry (applied in applyName)
+        editTarget = 4;
+        nameBuf[0] = 0;
+        nameLen = 0;
+        nameReturn = MODE_SETTINGS;
+        mode = MODE_SETNAME;
     } else if (item == 13) { // Screen auto-off -> timeout picker
         pickTarget = 4;
         pickSel = optIndex(kScreenOpts, kScreenCount, (int)g_screenOffSec);
@@ -3717,7 +3805,7 @@ void AdvUI::handleKey(char ch)
 
     if (mode == MODE_SETNAME) {
         unsigned maxLen = editMax(editTarget);
-        bool numeric = (editTarget == 2);
+        bool numeric = (editTarget == 2 || editTarget == 4); // frequency: digits + '.'; clock: digits + ':'
         if (esc) {
             mode = nameReturn;
         } else if (enter) {
@@ -3736,7 +3824,8 @@ void AdvUI::handleKey(char ch)
             }
         } else if (g_ruMode && !numeric && editTarget < 20 && printable && nameLen + 2 < sizeof(nameBuf)) {
             translitFeed(nameBuf, nameLen, sizeof(nameBuf), c, pendingLat); // WiFi/MQTT fields stay Latin
-        } else if (printable && nameLen < maxLen && (!numeric || (c >= '0' && c <= '9') || c == '.')) {
+        } else if (printable && nameLen < maxLen &&
+                   (!numeric || (c >= '0' && c <= '9') || c == (editTarget == 4 ? ':' : '.'))) {
             nameBuf[nameLen++] = c;
             nameBuf[nameLen] = 0;
         }
@@ -4293,9 +4382,42 @@ int32_t AdvUI::runOnce()
     }
 
 #ifdef ADVUI_SCREENSHOT
-    while (Serial.available())
-        if (Serial.read() == 'S')
-            runDemoDump(); // host sends 'S' -> dump every screen, then reboot
+    // Remote debug driving over serial (dev builds only): 'S' = demo dump,
+    // 'L' = live screenshot, 'K'+byte = inject a key ('^'=ESC '~'=ENTER
+    // 'U'/'D'/'<'/'>'=arrows '!'=long-ESC, anything else = the char itself).
+    static bool shotPendingKey = false;
+    while (Serial.available()) {
+        int sc = Serial.read();
+        if (!screenOn)
+            screenWake(); // remote session must survive the screen auto-off: the
+                          // render (and so the 'L' dump) is gated on a lit screen
+        if (shotPendingKey) {
+            shotPendingKey = false;
+            unsigned char k = (unsigned char)sc;
+            if (sc == '^')
+                k = 0x1b;
+            else if (sc == '~')
+                k = 0x0d;
+            else if (sc == 'U')
+                k = 0xb5;
+            else if (sc == 'D')
+                k = 0xb6;
+            else if (sc == '<')
+                k = 0xb4;
+            else if (sc == '>')
+                k = 0xb7;
+            else if (sc == '!')
+                k = AdvKeyboard::kLongEsc;
+            handleKey((char)k);
+            lastActivityMs = millis(); // remote keys hold the screen awake like real ones
+            uiDirty = true;
+        } else if (sc == 'S')
+            runDemoDump(); // dump every screen with sample data, then reboot
+        else if (sc == 'L')
+            shotLive = true;
+        else if (sc == 'K')
+            shotPendingKey = true;
+    }
 #endif
 
     while (!g_radioCompanion && api.available() && api.getFromRadio(fromRadioBuf) > 0) {
@@ -4518,6 +4640,13 @@ int32_t AdvUI::runOnce()
         drawNodeList();
     else
         drawChats();
+
+#ifdef ADVUI_SCREENSHOT
+    if (shotLive) {
+        shotLive = false;
+        screenshot("live"); // whatever just rendered — real state, not demo data
+    }
+#endif
 
 #ifdef HAS_I2S
     if (g_beeping)

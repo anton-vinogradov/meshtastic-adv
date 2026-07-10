@@ -31,4 +31,14 @@ if [ -f "$MC" ] && ! grep -q 'advui-inject' "$MC"; then
   echo "injected advui hooks into main.cpp"
 fi
 
+# SerialConsole.cpp: in the ADVUI_SCREENSHOT dev build the remote-debug driver
+# owns serial input (keys/screenshots); the stock console polls-and-drains the
+# same port whenever USB is plugged and would eat those bytes. Dead code in
+# release builds (the flag is never set there).
+SC="$FW/src/SerialConsole.cpp"
+if [ -f "$SC" ] && ! grep -q 'advui-inject' "$SC"; then
+  perl -0pi -e 's{(int32_t SerialConsole::runOnce\(\)\n\{\n)}{$1#ifdef ADVUI_SCREENSHOT\n    return 250; // advui-inject: the screenshot build reads serial itself\n#endif\n}' "$SC"
+  echo "injected advui hook into SerialConsole.cpp"
+fi
+
 echo "overlay synced into $FW"

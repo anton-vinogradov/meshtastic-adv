@@ -107,8 +107,8 @@ the middle, the compose bar sits at the bottom.
  SPb Gate         ▂▄▆█   →0   now   RTR
  ------------------------------------------
  13:58 > Are you around?             ✓     <- our message · delivery check
- 14:02 < yes! near the bridge              <- their message
-       ↳ Are you around?                   <- it quotes ours (reply)
+ [13:58 > Are you around?]                 <- framed quote of the original
+ 14:02 < yes! near the bridge              <- their reply to it
  14:03 > 👍
  _                                    RU   <- compose bar · input-mode badge
  type  Tab emoji  <reply  >react
@@ -130,8 +130,10 @@ the middle, the compose bar sits at the bottom.
 - **← / →** enter *message pick* mode: ↑/↓ choose a received message, then
   - **→ reaction** — a quick strip of tapbacks (`</>` pick, Enter sends). Reactions from
     others (including phone apps) show under the message they refer to.
-  - **← reply** — quotes the picked message in your next send; the thread shows the quote
-    above your message, phone apps render it as a proper reply.
+  - **← reply** — quotes the picked message in your next send; the thread draws the quote
+    in a frame above your message, with the original's time and sender inside (often its
+    only surviving trace once the original scrolls out of history), and phone apps render
+    it as a proper reply.
   - Messages from very old history (pre-reactions builds) have no packet id and can't be
     reacted to — the footer says so.
 - **ESC** goes back. The footer's right corner always shows **our own battery**.
@@ -147,7 +149,7 @@ a section (or WiFi / MQTT / Radio directly), ESC steps back up.
 | **LoRa**   | **Region** (required on first boot) · **Preset** (LongFast, MediumFast, …) · **Frequency** (slot override, MHz) · **Channel** (primary name; key kept) · **Role** (Client, Client Mute/Hidden, Router (Late), Repeater, Tracker, Sensor, TAK) · **Hops** (1–7) · **Power** (region max or 2–22 dBm) · **Rebroadcast** (All / Local only / Known only / Core ports only / None) |
 | **WiFi**   | join a network (NTP time comes with it); enabling WiFi turns Bluetooth off |
 | **MQTT**   | bridge the mesh to the internet: default public broker or your own         |
-| **Device** | **UTC** — offset picker with city labels, drives all timestamps · **Screen** — auto-off timeout (15 s … 5 min or never; default 5 min) · **Font** — where the Unicode font came from (`flash` / `sd` / `off`), read-only |
+| **Device** | **UTC** — offset picker with city labels, drives all timestamps · **Clock** — the device time, `not set` until it syncs; type `HH:MM` to set it by hand when there's no phone, NTP or GPS node around (the clock resets on every reboot, and messages received while it's unset stay timeless) · **Screen** — auto-off timeout (15 s … 5 min or never; default 5 min) · **Font** — where the Unicode font came from (`flash` / `sd` / `off`), read-only |
 | **Radio**  | **Onboard (Cap LoRa)** or **Companion via BLE** — see below                |
 
 **↑/↓** move, **Enter** edits (or toggles), **ESC** backs out. Changes that affect the radio

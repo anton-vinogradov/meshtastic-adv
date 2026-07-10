@@ -163,14 +163,37 @@ void addMsg(uint32_t from, uint32_t to, uint8_t ch, uint32_t rxTime, bool unread
     if (g_msgCount < kMaxMsgs) {
         slot = g_msgCount++;
     } else {
+        // Victim tiers: trim conversations before erasing them. A conversation's
+        // NEWEST message is what keeps it on the Chats list (and previews it), so
+        // it goes last: (1) an old broadcast with a newer same-channel message,
+        // (2) an old DM with a newer same-peer message, (3) any broadcast,
+        // (4) anything. Evicted content stays readable via the flash archive.
+        auto samePair = [](const Msg &a, const Msg &b) {
+            if ((a.to == NODENUM_BROADCAST) != (b.to == NODENUM_BROADCAST))
+                return false;
+            if (a.to == NODENUM_BROADCAST)
+                return a.ch == b.ch;
+            return (a.from == b.from && a.to == b.to) || (a.from == b.to && a.to == b.from);
+        };
+        auto hasNewer = [&](int i) {
+            for (int j = i + 1; j < g_msgCount; j++)
+                if (samePair(g_msgs[i], g_msgs[j]))
+                    return true;
+            return false;
+        };
         int victim = -1;
-        for (int i = 0; i < g_msgCount; i++)
-            if (g_msgs[i].to == NODENUM_BROADCAST) {
-                victim = i;
-                break;
+        for (int pass = 0; pass < 4 && victim < 0; pass++)
+            for (int i = 0; i < g_msgCount; i++) {
+                bool bcast = g_msgs[i].to == NODENUM_BROADCAST;
+                bool ok = pass == 0   ? (bcast && hasNewer(i))
+                          : pass == 1 ? (!bcast && hasNewer(i))
+                          : pass == 2 ? bcast
+                                      : true;
+                if (ok) {
+                    victim = i;
+                    break;
+                }
             }
-        if (victim < 0)
-            victim = 0;
         histAppend(g_msgs[victim], g_msgReply[victim]); // evicted, not gone: pageable in the thread view
         int tail = g_msgCount - 1 - victim;
         memmove(&g_msgs[victim], &g_msgs[victim + 1], tail * sizeof(Msg));
@@ -687,11 +710,30 @@ struct HistRec {
 constexpr int kHistRec = (int)sizeof(HistRec); // 184: Msg is 180 with no tail padding
 constexpr int kHistCap = 256;
 constexpr int kHistSlack = 64;
-constexpr int kHistWin = 16;  // staged slice size (static RAM cost: 16 records)
-constexpr int kHistSlide = 8; // window slide step: half the slice keeps the anchor in view
-Msg g_arch[kHistWin];
-uint32_t g_archReply[kHistWin];
+constexpr int kHistWin = 8;   // staged slice size — RAM is precious on this board,
+                              // so the window is small and slides often instead
+constexpr int kHistSlide = 4; // half the slice: the anchor message survives every restage
+// Lazily allocated on the first scroll into history: cardless-of-history users
+// (and the tight boot window) never pay the ~1.5 KB. Kept once allocated.
+Msg *g_arch = nullptr;
+uint32_t *g_archReply = nullptr;
 int g_histTotal = -1; // records on disk; -1 = not read yet
+
+bool histStagingReady()
+{
+    if (g_arch)
+        return true;
+    g_arch = (Msg *)calloc(kHistWin, sizeof(Msg));
+    g_archReply = (uint32_t *)calloc(kHistWin, sizeof(uint32_t));
+    if (!g_arch || !g_archReply) { // heap too tight right now: history waits, UI lives
+        free(g_arch);
+        free(g_archReply);
+        g_arch = nullptr;
+        g_archReply = nullptr;
+        return false;
+    }
+    return true;
+}
 
 int histTotal()
 {
@@ -786,6 +828,8 @@ int histCountFor(bool isChan, uint8_t ch, uint32_t node)
 // newest `skipNewest` matches (i.e. page p = skipNewest p*16). Returns the count.
 int histLoadSlice(bool isChan, uint8_t ch, uint32_t node, int skipNewest, int max)
 {
+    if (!histStagingReady())
+        return 0;
     int matches = histCountFor(isChan, ch, node);
     int end = matches - skipNewest; // exclusive match-index of the slice end
     int start = end - max;
@@ -2661,8 +2705,8 @@ void AdvUI::drawNode()
             uint32_t msgId;   // packet id of the owning message (0: decoration/no id) — view anchor
         };
         int32_t tzOff = g_utcOffsetMin * 60; // user-set UTC offset (Settings > UTC)
-        static DLine dl[128]; // single-threaded UI: static keeps it off the stack; sized so
-                              // a full 32-message backlog rarely overflows (the unread anchor
+        static DLine dl[96];  // single-threaded UI: static keeps it off the stack; sized so
+                              // a typical backlog window rarely overflows (the unread anchor
                               // lives or dies with its lines staying in this ring)
         int dlCount = 0;
         int anchorLine = -1;       // dl index of the first unread message's first line (on open)

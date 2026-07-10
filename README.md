@@ -35,7 +35,7 @@ You get a device that boots straight into a usable messenger: pick a contact, ty
 - **🔎 Contact search** — start typing to find any node and start a new chat.
 - **⭐ Favourites** — flag contacts and channels; they get priority alerts.
 - **🔔 Sound + light** — a single beep **and** a green LED flash from a favourite; a blue flash for everyone else (no buzzing on every packet).
-- **🕘 Timestamps** — compact local `HH:MM` on every message, with a UTC-offset (city) picker.
+- **🕘 Timestamps** — compact local `HH:MM` on every message, with a UTC-offset (city) picker and a manual clock setting for meshes with no time source.
 - **📡 WiFi + MQTT, on-device** — join WiFi and bridge the mesh to the internet over MQTT (default public broker or your own), configured right on the device — no phone needed. WiFi also sets the clock via NTP.
 - **💾 History that survives reboots** — the conversation ring is persisted to flash.
 - **⚙️ On-device settings** — name, region, modem preset, frequency, channel, role, hop limit, TX power, rebroadcast mode, UTC, WiFi and MQTT, all editable on the device (long-press **ESC**).

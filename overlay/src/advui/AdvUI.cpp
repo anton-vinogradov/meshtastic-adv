@@ -2104,6 +2104,8 @@ void AdvUI::histLoadPage(int page)
     histPage = page;
     histCount = got;
     chatScroll = 0; // land at the page bottom — the newest of the older slice
+    viewAnchorId = 0;
+    lastDrawScroll = 0;
 }
 
 void AdvUI::histExit()
@@ -2111,6 +2113,8 @@ void AdvUI::histExit()
     histPage = -1;
     histCount = 0;
     chatScroll = 0; // pinned back to the live newest (histEnterAtTop may override)
+    viewAnchorId = 0;
+    lastDrawScroll = 0;
 }
 
 void AdvUI::openEntry(int s)
@@ -2126,6 +2130,8 @@ void AdvUI::openEntry(int s)
     histAvail = -1;
     histEnterAtTop = false;
     chatAtTop = false;
+    viewAnchorId = 0;
+    lastDrawScroll = 0;
     if (s < chanCount) {
         selectedChannel = chanList[s];
         chatAnchorMsgIdx = firstUnreadIdx(); // jump target; read flags clear as lines get seen
@@ -2247,6 +2253,8 @@ void AdvUI::openConv(int i)
     histAvail = -1;
     histEnterAtTop = false;
     chatAtTop = false;
+    viewAnchorId = 0;
+    lastDrawScroll = 0;
     if (conv[i].isChan) {
         selectedChannel = conv[i].ch;
         chatAnchorMsgIdx = firstUnreadIdx();
@@ -2638,6 +2646,7 @@ void AdvUI::drawNode()
         int dlCount = 0;
         int anchorLine = -1;       // dl index of the first unread message's first line (on open)
         bool anchorDropped = false; // its lines got evicted: land at the top of what's left
+        int anchorNewLine = -1;     // dl index where the view-anchor message starts this frame
         int selMsgIdx = reactSel >= 0 ? matchedFromNewest(reactSel) : -1;
         int selFirst = -1, selLast = -1; // dl range of the react-selected message
         auto pushLine = [&]() -> DLine & {
@@ -2648,6 +2657,8 @@ void AdvUI::drawNode()
                     anchorDropped = true; // the anchor's first line is the one being dropped
                 if (anchorLine >= 0)
                     anchorLine--; // trackers shift up with the dropped line
+                if (anchorNewLine >= 0)
+                    anchorNewLine--; // may reach -1: the anchor message fell off entirely
                 if (selFirst >= 0)
                     selFirst--;
                 if (selLast >= 0)
@@ -2723,6 +2734,8 @@ void AdvUI::drawNode()
             }
             if (histPage < 0 && matched[i] == chatAnchorMsgIdx)
                 anchorLine = dlCount; // this message's first line
+            if (histPage < 0 && viewAnchorId && m.id == viewAnchorId && anchorNewLine < 0)
+                anchorNewLine = dlCount; // where the view-anchor message begins this frame
             const char *p = full;
             bool first = true;
             do {
@@ -2773,9 +2786,11 @@ void AdvUI::drawNode()
         }
         // chatScroll counts lines scrolled up from the bottom (0 = pinned to newest).
         int maxScroll = dlCount > maxLines ? dlCount - maxLines : 0;
+        bool jumpedNow = false;
         if (histEnterAtTop) { // paged toward newer: keep reading from the seam down
             chatScroll = maxScroll;
             histEnterAtTop = false;
+            jumpedNow = true;
         }
         if (chatAnchorMsgIdx >= 0) { // first render after opening: jump to the first unread
             if (anchorLine >= 0 && anchorLine <= maxScroll)
@@ -2785,6 +2800,14 @@ void AdvUI::drawNode()
             else
                 chatScroll = 0;
             chatAnchorMsgIdx = -1;
+            jumpedNow = true;
+        }
+        if (histPage < 0 && !jumpedNow && chatScroll > 0 && viewAnchorId && anchorNewLine >= 0) {
+            // Re-anchor the view to the message it was showing: arrivals grow the
+            // bottom and evictions eat the top, but the reader shouldn't move.
+            // userDelta = scrolling done since the last draw; identity when idle.
+            int userDelta = chatScroll - lastDrawScroll;
+            chatScroll = maxScroll - (anchorNewLine + viewAnchorOff - userDelta);
         }
         if (chatScroll > maxScroll)
             chatScroll = maxScroll;
@@ -2803,6 +2826,19 @@ void AdvUI::drawNode()
                 chatScroll = 0;
         }
         int startL = maxScroll - chatScroll;
+        lastDrawScroll = chatScroll;
+        viewAnchorId = 0;
+        if (histPage < 0 && chatScroll > 0) { // scrolled up: remember what the reader sees
+            for (int i = startL; i < dlCount; i++)
+                if (dl[i].msgIdx >= 0 && g_msgs[dl[i].msgIdx].id) {
+                    int a = i;
+                    while (a > 0 && dl[a - 1].msgIdx == dl[i].msgIdx)
+                        a--; // back up to the message's first line
+                    viewAnchorId = g_msgs[dl[i].msgIdx].id;
+                    viewAnchorOff = startL - a;
+                    break;
+                }
+        }
         int y = fy0;
         for (int i = startL; i < startL + maxLines && i < dlCount; i++) {
             DLine &d = dl[i];

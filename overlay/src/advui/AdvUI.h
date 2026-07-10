@@ -128,6 +128,12 @@ class AdvUI : public concurrency::OSThread
     int histAvail = -1;  // archive matches for the open thread; -1 = not counted yet (lazy)
     bool chatAtTop = false;      // the last draw was clamped at the top of the thread
     bool histEnterAtTop = false; // next draw positions at the page top (paging toward newer)
+    // While scrolled up, the view anchors to a MESSAGE, not to a bottom distance:
+    // arrivals/evictions rebuild the lines, and without this the content slides
+    // under the reader and the scrollbar "breathes" the view away.
+    uint32_t viewAnchorId = 0; // packet id of the message at the view top (0 = none)
+    int viewAnchorOff = 0;     // view-top line offset from that message's first line
+    int lastDrawScroll = 0;    // chatScroll at the end of the last draw (user-delta base)
     void histLoadPage(int page); // stage a page into g_arch; enters/steps history mode
     void histExit();             // back to the live thread view
     int reactSel = -1;        // >= 0: picking a message (0 = newest, counts back)

@@ -121,6 +121,15 @@ class AdvUI : public concurrency::OSThread
     int selectedChannel = -1; // >= 0 when the open thread is a channel (else a node DM)
     int chatScroll = 0;       // thread view: lines scrolled up from the bottom (0 = newest)
     int chatAnchorMsgIdx = -1; // on open: ring index to scroll to (first unread), -1 = bottom
+    // Flash-archive paging: scrolling past the top of the live ring pages into
+    // /advui_hist.bin, 16 messages at a time (see histLoadSlice).
+    int histPage = -1;   // -1 = live view; >= 0 = that page of older history (0 = newest page)
+    int histCount = 0;   // messages staged in g_arch for the current page
+    int histAvail = -1;  // archive matches for the open thread; -1 = not counted yet (lazy)
+    bool chatAtTop = false;      // the last draw was clamped at the top of the thread
+    bool histEnterAtTop = false; // next draw positions at the page top (paging toward newer)
+    void histLoadPage(int page); // stage a page into g_arch; enters/steps history mode
+    void histExit();             // back to the live thread view
     int reactSel = -1;        // >= 0: picking a message (0 = newest, counts back)
     bool pickReply = false;   // the pick is for a reply (LEFT) rather than a reaction (RIGHT)
     bool reactStrip = false;  // the quick-reaction strip is open

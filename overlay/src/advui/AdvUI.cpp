@@ -143,6 +143,8 @@ uint32_t g_msgReply[kMaxMsgs];
 // can't be recovered (the powered-off gap is unknowable) and load as 0.
 constexpr uint32_t kValidEpoch = 1600000000u;
 
+void histAppend(const Msg &m, uint32_t replyId); // eviction victims go to the flash archive
+
 void addMsg(uint32_t from, uint32_t to, uint8_t ch, uint32_t rxTime, bool unread, const char *text, uint32_t id,
            uint8_t status, uint32_t replyId = 0)
 {
@@ -169,6 +171,7 @@ void addMsg(uint32_t from, uint32_t to, uint8_t ch, uint32_t rxTime, bool unread
             }
         if (victim < 0)
             victim = 0;
+        histAppend(g_msgs[victim], g_msgReply[victim]); // evicted, not gone: pageable in the thread view
         int tail = g_msgCount - 1 - victim;
         memmove(&g_msgs[victim], &g_msgs[victim + 1], tail * sizeof(Msg));
         memmove(&g_msgReply[victim], &g_msgReply[victim + 1], tail * sizeof(uint32_t));
@@ -666,6 +669,182 @@ void loadMsgs()
         if (g_msgs[i].rxTime < kValidEpoch)
             g_msgs[i].rxTime = 0;
     }
+}
+
+// Evicted-message archive on the internal LittleFS. The RAM ring stays the
+// small live window; eviction victims are appended here and the thread view
+// pages back into them (16 at a time, a static staging buffer). Fixed
+// 184-byte records — Msg + reply id — oldest first behind an "AVH1" magic;
+// the newest kHistCap records are kept, compacting once the tail overgrows.
+// Internal flash shares no bus with the LoRa cap, so paging can't stall RX.
+const char *kHistPath = "/advui_hist.bin";
+const char *kHistTmp = "/advui_hist.tmp";
+constexpr uint32_t kHistMagic = 0x31485641; // "AVH1"
+struct HistRec {
+    Msg m;
+    uint32_t rid;
+};
+constexpr int kHistRec = (int)sizeof(HistRec); // 184: Msg is 180 with no tail padding
+constexpr int kHistCap = 256;
+constexpr int kHistSlack = 64;
+constexpr int kHistWin = 16; // staged page size (static RAM cost: 16 records)
+Msg g_arch[kHistWin];
+uint32_t g_archReply[kHistWin];
+int g_histTotal = -1; // records on disk; -1 = not read yet
+
+int histTotal()
+{
+    if (g_histTotal >= 0)
+        return g_histTotal;
+    g_histTotal = 0;
+    auto f = FSCom.open(kHistPath, FILE_O_READ);
+    if (f) {
+        uint32_t magic = 0;
+        bool ok = f.read((uint8_t *)&magic, 4) == 4 && magic == kHistMagic;
+        if (ok)
+            g_histTotal = (int)((f.size() - 4) / kHistRec);
+        f.close();
+        if (!ok)
+            FSCom.remove(kHistPath); // unknown leftovers: start clean
+    }
+    return g_histTotal;
+}
+
+bool histMatch(const Msg &m, bool isChan, uint8_t ch, uint32_t node)
+{
+    return isChan ? (m.to == NODENUM_BROADCAST && m.ch == ch)
+                  : (m.to != NODENUM_BROADCAST && (m.from == node || m.to == node));
+}
+
+void histCompact()
+{
+    auto in = FSCom.open(kHistPath, FILE_O_READ);
+    if (!in)
+        return;
+    auto out = FSCom.open(kHistTmp, FILE_O_WRITE);
+    if (!out) {
+        in.close();
+        return;
+    }
+    out.write((const uint8_t *)&kHistMagic, 4);
+    in.seek(4 + (uint32_t)(g_histTotal - kHistCap) * kHistRec);
+    HistRec rec;
+    int kept = 0;
+    while (in.read((uint8_t *)&rec, kHistRec) == kHistRec && kept < kHistCap) {
+        out.write((const uint8_t *)&rec, kHistRec);
+        kept++;
+    }
+    in.close();
+    out.close();
+    FSCom.remove(kHistPath);
+    renameFile(kHistTmp, kHistPath);
+    g_histTotal = kept;
+}
+
+void histAppend(const Msg &m, uint32_t replyId)
+{
+    bool fresh = histTotal() == 0;
+    auto f = FSCom.open(kHistPath, fresh ? FILE_O_WRITE : "a");
+    if (!f)
+        return;
+    if (fresh)
+        f.write((const uint8_t *)&kHistMagic, 4);
+    Msg rec = m;
+    rec.read = true; // history is read by definition
+    if (rec.rxTime < kValidEpoch)
+        rec.rxTime = 0; // an uptime stamp is meaningless once archived: honest blank
+    f.write((const uint8_t *)&rec, sizeof(rec));
+    f.write((const uint8_t *)&replyId, 4);
+    f.close();
+    if (++g_histTotal >= kHistCap + kHistSlack)
+        histCompact();
+}
+
+int histCountFor(bool isChan, uint8_t ch, uint32_t node)
+{
+    int total = histTotal(), n = 0;
+    if (!total)
+        return 0;
+    auto f = FSCom.open(kHistPath, FILE_O_READ);
+    if (!f)
+        return 0;
+    f.seek(4);
+    Msg m;
+    for (int i = 0; i < total; i++) {
+        if (f.read((uint8_t *)&m, sizeof(m)) != (int)sizeof(m))
+            break;
+        f.seek(f.position() + 4);
+        if (histMatch(m, isChan, ch, node))
+            n++;
+    }
+    f.close();
+    return n;
+}
+
+// Stages into g_arch the `max` conversation messages that come right before the
+// newest `skipNewest` matches (i.e. page p = skipNewest p*16). Returns the count.
+int histLoadSlice(bool isChan, uint8_t ch, uint32_t node, int skipNewest, int max)
+{
+    int matches = histCountFor(isChan, ch, node);
+    int end = matches - skipNewest; // exclusive match-index of the slice end
+    int start = end - max;
+    if (start < 0)
+        start = 0;
+    if (end <= 0)
+        return 0;
+    auto f = FSCom.open(kHistPath, FILE_O_READ);
+    if (!f)
+        return 0;
+    f.seek(4);
+    Msg m;
+    uint32_t rid;
+    int seen = 0, got = 0, total = histTotal();
+    for (int i = 0; i < total && got < end - start; i++) {
+        if (f.read((uint8_t *)&m, sizeof(m)) != (int)sizeof(m) || f.read((uint8_t *)&rid, 4) != 4)
+            break;
+        if (!histMatch(m, isChan, ch, node))
+            continue;
+        if (seen >= start) {
+            g_arch[got] = m;
+            g_archReply[got] = rid;
+            got++;
+        }
+        seen++;
+    }
+    f.close();
+    return got;
+}
+
+void histPurge(bool isChan, uint8_t ch, uint32_t node)
+{
+    int total = histTotal();
+    if (!total)
+        return;
+    auto in = FSCom.open(kHistPath, FILE_O_READ);
+    if (!in)
+        return;
+    auto out = FSCom.open(kHistTmp, FILE_O_WRITE);
+    if (!out) {
+        in.close();
+        return;
+    }
+    out.write((const uint8_t *)&kHistMagic, 4);
+    in.seek(4);
+    HistRec rec;
+    int kept = 0;
+    for (int i = 0; i < total; i++) {
+        if (in.read((uint8_t *)&rec, kHistRec) != kHistRec)
+            break;
+        if (histMatch(rec.m, isChan, ch, node))
+            continue; // deleting the conversation drops its archive too
+        out.write((const uint8_t *)&rec, kHistRec);
+        kept++;
+    }
+    in.close();
+    out.close();
+    FSCom.remove(kHistPath);
+    renameFile(kHistTmp, kHistPath);
+    g_histTotal = kept;
 }
 
 // Default node ordering: favourites first, then nodes we have a conversation with,
@@ -1915,6 +2094,25 @@ int AdvUI::matchedFromNewest(int back)
     return -1;
 }
 
+// Stage an archive page for the open thread; page 0 = the newest evicted slice.
+void AdvUI::histLoadPage(int page)
+{
+    bool isChan = selectedChannel >= 0;
+    int got = histLoadSlice(isChan, (uint8_t)(isChan ? selectedChannel : 0), selectedNum, page * kHistWin, kHistWin);
+    if (got <= 0)
+        return; // nothing there: stay where we are
+    histPage = page;
+    histCount = got;
+    chatScroll = 0; // land at the page bottom — the newest of the older slice
+}
+
+void AdvUI::histExit()
+{
+    histPage = -1;
+    histCount = 0;
+    chatScroll = 0; // pinned back to the live newest (histEnterAtTop may override)
+}
+
 void AdvUI::openEntry(int s)
 {
     nodeReturn = (mode == MODE_PICKER) ? MODE_PICKER : MODE_NODES;
@@ -1923,6 +2121,11 @@ void AdvUI::openEntry(int s)
     reactSel = -1;
     reactStrip = false;
     pendingReplyId = 0;
+    histPage = -1;           // live view; archive re-counted lazily per thread
+    histCount = 0;
+    histAvail = -1;
+    histEnterAtTop = false;
+    chatAtTop = false;
     if (s < chanCount) {
         selectedChannel = chanList[s];
         chatAnchorMsgIdx = firstUnreadIdx(); // jump target; read flags clear as lines get seen
@@ -1975,6 +2178,7 @@ void AdvUI::deleteConversation(const Conv &c)
     g_reactNext = rw % kMaxReacts;
     g_msgsDirty = true;
     saveMsgs();
+    histPurge(c.isChan, c.ch, c.node); // erase means erase: the flash archive too
 }
 
 void AdvUI::favEntry(int s, bool on)
@@ -2038,6 +2242,11 @@ void AdvUI::openConv(int i)
     reactSel = -1;
     reactStrip = false;
     pendingReplyId = 0;
+    histPage = -1; // live view; archive re-counted lazily per thread
+    histCount = 0;
+    histAvail = -1;
+    histEnterAtTop = false;
+    chatAtTop = false;
     if (conv[i].isChan) {
         selectedChannel = conv[i].ch;
         chatAnchorMsgIdx = firstUnreadIdx();
@@ -2383,21 +2592,27 @@ void AdvUI::drawNode()
     int maxLines = (bottom - fy0) / lh;
     int matched[kMaxMsgs], mc = 0;
     bool hasFailed = false; // any failed outgoing DM here -> offer ENTER resend
-    for (int i = 0; i < g_msgCount; i++) {
-        int idx = i;
-        bool match = isChan ? (g_msgs[idx].to == NODENUM_BROADCAST && g_msgs[idx].ch == selectedChannel)
-                            : ((g_msgs[idx].from == selectedNum || g_msgs[idx].to == selectedNum) &&
-                               g_msgs[idx].to != NODENUM_BROADCAST);
-        if (match) {
-            matched[mc++] = idx;
-            if (!isChan && g_msgs[idx].from == me && g_msgs[idx].status == MSG_FAILED)
-                hasFailed = true;
+    if (histPage >= 0) { // a staged flash-archive page replaces the live slice
+        for (int i = 0; i < histCount; i++)
+            matched[mc++] = i;
+    } else {
+        for (int i = 0; i < g_msgCount; i++) {
+            int idx = i;
+            bool match = isChan ? (g_msgs[idx].to == NODENUM_BROADCAST && g_msgs[idx].ch == selectedChannel)
+                                : ((g_msgs[idx].from == selectedNum || g_msgs[idx].to == selectedNum) &&
+                                   g_msgs[idx].to != NODENUM_BROADCAST);
+            if (match) {
+                matched[mc++] = idx;
+                if (!isChan && g_msgs[idx].from == me && g_msgs[idx].status == MSG_FAILED)
+                    hasFailed = true;
+            }
         }
     }
     if (mc == 0) {
         g->setTextColor(0x630C);
         g->setCursor(4, fy0);
         g->print("(no messages yet)");
+        chatAtTop = true; // even an empty live view can page into the archive
     } else {
         g->setFont(&cyrFont); // Cyrillic-capable, so Russian message text renders
         g->setTextSize(1);
@@ -2440,11 +2655,13 @@ void AdvUI::drawNode()
             }
             return dl[dlCount++];
         };
+        Msg *mbase = histPage >= 0 ? g_arch : g_msgs; // where matched[] indices point
         for (int i = 0; i < mc; i++) {
-            Msg &m = g_msgs[matched[i]];
+            Msg &m = mbase[matched[i]];
+            uint32_t replyId = histPage >= 0 ? g_archReply[matched[i]] : g_msgReply[matched[i]];
             bool out = (m.from == me);
             bool failed = out && m.status == MSG_FAILED;
-            bool isSel = (selMsgIdx >= 0 && matched[i] == selMsgIdx);
+            bool isSel = histPage < 0 && (selMsgIdx >= 0 && matched[i] == selMsgIdx);
             int wrapW = !out ? 232 : (failed ? 162 : 214); // reserve room for the marker
             char tpre[8];
             msgTimePrefix(m.rxTime, tzOff, tpre, sizeof(tpre)); // "HH:MM " before the arrow
@@ -2459,48 +2676,52 @@ void AdvUI::drawNode()
             } else {
                 snprintf(full, sizeof(full), "%s%s%s", tpre, out ? "> " : "< ", m.text);
             }
-            if (g_msgReply[matched[i]]) { // a reply: quote the original above it, if still in the ring
-                for (int q = 0; q < g_msgCount; q++)
-                    if (g_msgs[q].id == g_msgReply[matched[i]] && g_msgs[q].id != 0) {
-                        DLine &d = pushLine();
-                        Msg &om = g_msgs[q];
-                        char qt[8]; // the original's own arrival time — the frame is often
-                        msgTimePrefix(om.rxTime, tzOff, qt, sizeof(qt)); // its only surviving trace
-                        char qs[10];
-                        if (om.from != me && isChan) {
-                            char sn[8];
-                            shortNameOf(om.from, sn, sizeof(sn));
-                            snprintf(qs, sizeof(qs), "%s: ", sn);
-                        } else
-                            snprintf(qs, sizeof(qs), om.from == me ? "> " : "< ");
-                        char snip[24];
-                        utf8Copy(snip, om.text, (int)sizeof(snip) - 1);
-                        snprintf(d.text, sizeof(d.text), "%s%s%s", qt, qs, snip);
-                        while (lineWidthEmotes(g, d.text) > 204) { // keep the text inside the frame
-                            int L = (int)strlen(d.text);
-                            do {
-                                L--;
-                            } while (L > 0 && (d.text[L] & 0xC0) == 0x80); // drop whole UTF-8 char
-                            d.text[L] = 0;
-                        }
-                        d.color = 0x8410; // readable, but subordinate to its frame
-                        d.msgIdx = -1;
-                        d.out = false;
-                        d.status = 0;
-                        d.err = 0;
-                        d.timeLen = 0;
-                        d.nameLen = 0;
-                        d.last = false;
-                        d.quote = true;
-                        if (isSel) {
-                            if (selFirst < 0)
-                                selFirst = dlCount - 1;
-                            selLast = dlCount - 1;
-                        }
-                        break;
+            if (replyId) { // a reply: quote the original above it, if we still hold it
+                const Msg *om = nullptr; // the staged page first, then the live ring
+                for (int q = 0; histPage >= 0 && q < histCount && !om; q++)
+                    if (g_arch[q].id == replyId && g_arch[q].id != 0)
+                        om = &g_arch[q];
+                for (int q = 0; q < g_msgCount && !om; q++)
+                    if (g_msgs[q].id == replyId && g_msgs[q].id != 0)
+                        om = &g_msgs[q];
+                if (om) {
+                    DLine &d = pushLine();
+                    char qt[8]; // the original's own arrival time — the frame is often
+                    msgTimePrefix(om->rxTime, tzOff, qt, sizeof(qt)); // its only surviving trace
+                    char qs[10];
+                    if (om->from != me && isChan) {
+                        char sn[8];
+                        shortNameOf(om->from, sn, sizeof(sn));
+                        snprintf(qs, sizeof(qs), "%s: ", sn);
+                    } else
+                        snprintf(qs, sizeof(qs), om->from == me ? "> " : "< ");
+                    char snip[24];
+                    utf8Copy(snip, om->text, (int)sizeof(snip) - 1);
+                    snprintf(d.text, sizeof(d.text), "%s%s%s", qt, qs, snip);
+                    while (lineWidthEmotes(g, d.text) > 204) { // keep the text inside the frame
+                        int L = (int)strlen(d.text);
+                        do {
+                            L--;
+                        } while (L > 0 && (d.text[L] & 0xC0) == 0x80); // drop whole UTF-8 char
+                        d.text[L] = 0;
                     }
+                    d.color = 0x8410; // readable, but subordinate to its frame
+                    d.msgIdx = -1;
+                    d.out = false;
+                    d.status = 0;
+                    d.err = 0;
+                    d.timeLen = 0;
+                    d.nameLen = 0;
+                    d.last = false;
+                    d.quote = true;
+                    if (isSel) {
+                        if (selFirst < 0)
+                            selFirst = dlCount - 1;
+                        selLast = dlCount - 1;
+                    }
+                }
             }
-            if (matched[i] == chatAnchorMsgIdx)
+            if (histPage < 0 && matched[i] == chatAnchorMsgIdx)
                 anchorLine = dlCount; // this message's first line
             const char *p = full;
             bool first = true;
@@ -2508,7 +2729,7 @@ void AdvUI::drawNode()
                 DLine &d = pushLine();
                 p += wrapLine(g, p, wrapW, d.text, sizeof(d.text));
                 d.color = out ? 0x07FF : 0xFFFF; // outgoing cyan, incoming white
-                d.msgIdx = (int16_t)matched[i];
+                d.msgIdx = histPage >= 0 ? -1 : (int16_t)matched[i]; // archive lines: no read/pick
                 d.out = out;
                 d.status = m.status;
                 d.err = m.err;
@@ -2552,6 +2773,10 @@ void AdvUI::drawNode()
         }
         // chatScroll counts lines scrolled up from the bottom (0 = pinned to newest).
         int maxScroll = dlCount > maxLines ? dlCount - maxLines : 0;
+        if (histEnterAtTop) { // paged toward newer: keep reading from the seam down
+            chatScroll = maxScroll;
+            histEnterAtTop = false;
+        }
         if (chatAnchorMsgIdx >= 0) { // first render after opening: jump to the first unread
             if (anchorLine >= 0 && anchorLine <= maxScroll)
                 chatScroll = maxScroll - anchorLine;
@@ -2565,6 +2790,7 @@ void AdvUI::drawNode()
             chatScroll = maxScroll;
         if (chatScroll < 0)
             chatScroll = 0;
+        chatAtTop = (chatScroll >= maxScroll); // "up" past this point pages into the archive
         if (reactSel >= 0 && selFirst >= 0) { // keep the react-selected message in view
             int vis0 = maxScroll - chatScroll;
             if (selFirst < vis0)
@@ -2687,7 +2913,13 @@ void AdvUI::drawNode()
             }
         }
         const char *hint;
-        if (reactStrip) {
+        char histHint[36];
+        if (histPage >= 0) { // paged into the flash archive: show where we are in it
+            int newest = histAvail - histPage * kHistWin; // 1-based match index of the page's newest
+            snprintf(histHint, sizeof(histHint), "history %d-%d/%d  ESC latest", newest - histCount + 1, newest,
+                     histAvail);
+            hint = histHint;
+        } else if (reactStrip) {
             hint = "</> pick  ENTER send  ESC";
         } else if (reactSel >= 0) {
             int smi = matchedFromNewest(reactSel); // old history has no packet id to reference
@@ -4144,22 +4376,42 @@ void AdvUI::handleKey(char ch)
 
     if (mode == MODE_NODE) {
         if (esc || bksp) {
+            if (histPage >= 0) { // first ESC leaves the archive, not the chat
+                histExit();
+                return;
+            }
             if (g_msgsDirty) { // flush read-state now — a reset right after would lose it
                 saveMsgs();
                 g_msgsDirty = false;
                 g_lastSaveMs = millis();
             }
             mode = nodeReturn;
+        } else if (up) {
+            if (chatAtTop) { // at the very top: page back into the flash archive
+                if (histAvail < 0) // lazy: counted only when someone actually scrolls up here
+                    histAvail = histCountFor(selectedChannel >= 0, (uint8_t)(selectedChannel >= 0 ? selectedChannel : 0),
+                                             selectedNum);
+                int next = histPage + 1;
+                if (histAvail > next * kHistWin)
+                    histLoadPage(next);
+            } else
+                chatScroll++; // older; drawNode clamps to the top of the thread
+        } else if (down) {
+            if (histPage >= 0 && chatScroll == 0) { // page bottom: continue toward newer
+                if (histPage == 0)
+                    histExit();
+                else
+                    histLoadPage(histPage - 1);
+                histEnterAtTop = true; // land at the seam and keep reading down
+            } else if (chatScroll > 0)
+                chatScroll--; // back toward the newest
+        } else if (histPage >= 0) { // any action key returns to the live view first
+            histExit();
         } else if (right || left) { // pick a message: RIGHT = react, LEFT = reply
             if (matchedFromNewest(0) >= 0) {
                 reactSel = 0;
                 pickReply = left;
             }
-        } else if (up) {
-            chatScroll++; // older; drawNode clamps to the top of the thread
-        } else if (down) {
-            if (chatScroll > 0)
-                chatScroll--; // back toward the newest
         } else if (enter && selectedChannel < 0) { // resend the newest failed DM in place
             uint32_t me = myNodeNum();
             for (int i = g_msgCount - 1; i >= 0; i--) {
@@ -4496,6 +4748,13 @@ int32_t AdvUI::runOnce()
             addMsg(0x000BEEF1, myNodeNum(), 0, 0, true, "SMP: \U0001F480\U0001F923\U0001F970 sel: ❤️ ok", 777,
                    MSG_IN);
             addReaction(777, 0x000BEEF1, "\U0001F480");
+            uiDirty = true;
+        } else if (sc == 'H') { // 48 numbered ghost DMs: overflows the ring into the archive
+            char t[40];
+            for (int i = 1; i <= 48; i++) {
+                snprintf(t, sizeof(t), "hist test %d/48", i);
+                addMsg(0x000BEEF1, myNodeNum(), 0, 0, i > 40, t, 7000 + i, MSG_IN);
+            }
             uiDirty = true;
         }
     }

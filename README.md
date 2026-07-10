@@ -37,7 +37,7 @@ You get a device that boots straight into a usable messenger: pick a contact, ty
 - **🔔 Sound + light** — a single beep **and** a green LED flash from a favourite; a blue flash for everyone else (no buzzing on every packet).
 - **🕘 Timestamps** — compact local `HH:MM` on every message, with a UTC-offset (city) picker and a manual clock setting for meshes with no time source.
 - **📡 WiFi + MQTT, on-device** — join WiFi and bridge the mesh to the internet over MQTT (default public broker or your own), configured right on the device — no phone needed. WiFi also sets the clock via NTP.
-- **💾 History that survives reboots** — the conversation ring is persisted to flash.
+- **💾 History that survives reboots — and eviction** — the live conversation window is persisted to flash, and older messages move to a 256-deep flash archive you can page back into right in the thread.
 - **⚙️ On-device settings** — name, region, modem preset, frequency, channel, role, hop limit, TX power, rebroadcast mode, UTC, WiFi and MQTT, all editable on the device (long-press **ESC**).
 - **🔋 Screen auto-off** — the display powers down after 15 s…5 min idle (your pick); any key wakes it, alerts still beep and flash the LED while it's dark.
 - **📱 Phone app still works** — the stock Bluetooth API stays on: pair the official Meshtastic app (the Cardputer shows the pairing PIN) and use it alongside the on-device UI.

@@ -36,7 +36,8 @@ import sys
 out, off = sys.argv[1], int(sys.argv[2], 0)
 b = open(out, 'rb').read()
 assert b[0] == 0xE9, "bad image: no 0xE9 boot magic at 0x0"
-assert b[off:off+4] == b'AUF1', "bad image: no AUF1 font blob at font offset"
-print(f"ok: {out} ({len(b):,} bytes) — boot magic + AUF1 verified")
+magic = b[off:off+4]
+assert magic in (b'AUF1', b'AUF2'), "bad image: no AUF font blob at font offset"
+print(f"ok: {out} ({len(b):,} bytes) — boot magic + {magic.decode()} verified")
 PY
 echo "flash at offset 0x0 in M5Burner."

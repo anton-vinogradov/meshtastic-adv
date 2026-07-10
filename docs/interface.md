@@ -200,9 +200,12 @@ reminds you).
   wakes it (that key is swallowed); incoming messages don't light it up — the beep and the
   LED do the notifying, the unread badges are there when you wake it.
 - **Full Unicode:** messages and names in any BMP script (CJK, Greek, Hebrew, Arabic, …)
-  render via GNU Unifont — the installer flashes it into a dedicated partition, no user
-  action; esptool users write `unifont.bin` at `0x340000` or drop it on the SD card root.
-  Latin and Cyrillic stay on the fast embedded font either way.
+  **plus the emoji blocks** (U+1F000–U+1FBFF — so reactions and messages from phone users
+  render as Unifont glyphs instead of tofu boxes; invisible modifiers like variation
+  selectors, ZWJ and skin tones are skipped) via GNU Unifont — the installer flashes it
+  into a dedicated partition, no user action; esptool users write `unifont.bin` at
+  `0x340000` or drop it on the SD card root. Latin and Cyrillic stay on the fast embedded
+  font either way.
 - **Phone app:** the stock Bluetooth API is untouched, so the official Meshtastic app pairs
   with the Cardputer like with any node — a passkey screen pops up (waking the display) with
   the PIN to type on the phone. WiFi turns Bluetooth off, as in stock.

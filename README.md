@@ -30,7 +30,7 @@ You get a device that boots straight into a usable messenger: pick a contact, ty
 - **📢 Channels** — read and broadcast to any channel, right alongside your DMs.
 - **✅ Delivery status** — every sent message shows *sending* (dot) → *delivered* (green check, from the routing ACK) → *failed* (red ✗ with the reason). Channel broadcasts get a "sent" check.
 - **⌨️ Cyrillic input + 😀 emoji** — type Russian on the Latin keyboard via a live transliteration layer (**Fn+L**); receive/render non-Latin text and inline emoji bitmaps; a **Tab** palette inserts emoji.
-- **🈶 Full Unicode text** — CJK, Greek, Hebrew, Arabic… any script in the Basic Multilingual Plane renders in messages and names, via a GNU Unifont partition the installer flashes automatically (Latin/Cyrillic stay on the fast embedded font).
+- **🈶 Full Unicode text** — CJK, Greek, Hebrew, Arabic… any script in the Basic Multilingual Plane, plus the emoji blocks (reactions from phone users render as glyphs, not tofu), via a GNU Unifont partition the installer flashes automatically (Latin/Cyrillic stay on the fast embedded font).
 - **📇 Node list** — press **Tab** for everyone on the mesh, with a signal-bar meter (from SNR), hop count, last-heard age and role, in fixed columns.
 - **🔎 Contact search** — start typing to find any node and start a new chat.
 - **⭐ Favourites** — flag contacts and channels; they get priority alerts.

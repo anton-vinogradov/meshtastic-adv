@@ -1254,6 +1254,9 @@ int emoteMatch(const char *s, const graphics::Emote **em)
     return bestLen;
 }
 
+uint32_t utf8Cp(const char *s, int len);
+bool cpInvisible(uint32_t cp);
+
 // Copies the leading run of `s` that fits `maxW` px in the current font into `out`
 // (breaking at a space when the line overflows), and returns how many bytes of `s`
 // were consumed. Emoji sequences are atomic tokens of width kEmoteAdv, so they wrap
@@ -1274,7 +1277,7 @@ int wrapLine(lgfx::LGFXBase *g, const char *s, int maxW, char *out, int outCap)
             for (; k < tlen && s[consumed + k]; k++)
                 cb[k] = s[consumed + k];
             cb[k] = 0;
-            tw = g->textWidth(cb);
+            tw = cpInvisible(utf8Cp(cb, k)) ? 0 : g->textWidth(cb);
         }
         if (consumed > 0 && w + tw > maxW)
             break; // doesn't fit -> wrap here
@@ -1315,6 +1318,16 @@ bool flashFontCovers(uint32_t cp)
     return cp < 0x7F || (cp >= 0x400 && cp <= 0x45F) || cp == 0x490 || cp == 0x491;
 }
 
+// Codepoints that shape neighbours but have no visual of their own — phone
+// emoji lean on them heavily ("❤️" = U+2764 + FE0F). Unifont has literal
+// glyphs for some, so without this they'd draw as stray boxes mid-text.
+bool cpInvisible(uint32_t cp)
+{
+    return cp == 0xFE0E || cp == 0xFE0F                 // variation selectors (text/emoji style)
+           || cp == 0x200D                              // zero-width joiner (family/profession combos)
+           || (cp >= 0x1F3FB && cp <= 0x1F3FF);         // skin-tone modifiers
+}
+
 int lineWidthEmotes(lgfx::LGFXBase *g, const char *s)
 {
     int w = 0;
@@ -1332,8 +1345,10 @@ int lineWidthEmotes(lgfx::LGFXBase *g, const char *s)
                 cb[k] = s[k];
             cb[k] = 0;
             uint32_t cp = utf8Cp(cb, k);
-            int gw = !flashFontCovers(cp) ? sdGlyphWidth(cp) : 0;
-            w += gw ? gw + 1 : g->textWidth(cb);
+            if (!cpInvisible(cp)) {
+                int gw = !flashFontCovers(cp) ? sdGlyphWidth(cp) : 0;
+                w += gw ? gw + 1 : g->textWidth(cb);
+            }
             s += k;
         }
     }
@@ -1364,6 +1379,10 @@ int printLineEmotes(lgfx::LGFXBase *g, int x, int y, const char *s, uint16_t col
                 cb[k] = s[k];
             cb[k] = 0;
             uint32_t cp = utf8Cp(cb, k);
+            if (cpInvisible(cp)) {
+                s += k;
+                continue;
+            }
             uint8_t bits[32];
             int gw = !flashFontCovers(cp) ? sdGlyph(cp, bits) : 0;
             if (gw) { // unicode glyph, aligned onto the emoji band
@@ -4473,6 +4492,12 @@ int32_t AdvUI::runOnce()
             shotLive = true;
         else if (sc == 'K')
             shotPendingKey = true;
+        else if (sc == 'G') { // ghost DM with supplementary-plane emoji (render test)
+            addMsg(0x000BEEF1, myNodeNum(), 0, 0, true, "SMP: \U0001F480\U0001F923\U0001F970 sel: ❤️ ok", 777,
+                   MSG_IN);
+            addReaction(777, 0x000BEEF1, "\U0001F480");
+            uiDirty = true;
+        }
     }
 #endif
 

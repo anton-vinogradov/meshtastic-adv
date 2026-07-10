@@ -19,12 +19,27 @@ namespace
 constexpr int kSdCs = 12;
 constexpr uint32_t kSdHz = 16000000;
 const char *kFontPath = "/unifont.bin";
-constexpr size_t kFontSize = 4 + 65536UL * 33;
+// AUF1 = the BMP only; AUF2 appends the supplementary emoji blocks
+// (U+1F000..U+1FBFF) as records 65536.. — see scripts/mkunifont.py.
+constexpr uint32_t kSmpBase = 0x1F000, kSmpEnd = 0x1FBFF;
+constexpr size_t kFontSizeV1 = 4 + 65536UL * 33;
+constexpr size_t kFontSizeV2 = 4 + (65536UL + (kSmpEnd - kSmpBase + 1)) * 33;
 
 File g_font;
 bool g_ready = false;
+bool g_v2 = false;              // blob has the supplementary emoji records
 const uint8_t *g_map = nullptr; // memory-mapped "font" flash partition (fast path)
 char g_state[24] = "off";       // what Settings shows: flash / sd / off / error tag
+
+// Byte offset of a codepoint's record, or -1 when the blob can't have it.
+int32_t recOff(uint32_t cp)
+{
+    if (cp <= 0xFFFF)
+        return 4 + (int32_t)cp * 33;
+    if (g_v2 && cp >= kSmpBase && cp <= kSmpEnd)
+        return 4 + (int32_t)(65536UL + cp - kSmpBase) * 33;
+    return -1;
+}
 
 // A small LRU-ish glyph cache (round-robin eviction): allocated only when the
 // font is actually present, so cardless setups pay nothing. Misses cost one
@@ -41,7 +56,8 @@ int g_hand = 0;
 
 CacheEnt *lookup(uint32_t cp) // SD path only; the mapped partition needs no cache
 {
-    if (!g_ready || cp > 0xFFFF)
+    int32_t off = recOff(cp);
+    if (!g_ready || off < 0)
         return nullptr;
     for (int i = 0; i < kCacheN; i++)
         if (g_cache[i].cp == cp)
@@ -50,7 +66,7 @@ CacheEnt *lookup(uint32_t cp) // SD path only; the mapped partition needs no cac
     uint8_t rec[33];
     {
         concurrency::LockGuard guard(spiLock);
-        if (!g_font.seek(4 + (uint32_t)cp * 33) || g_font.read(rec, sizeof(rec)) != (int)sizeof(rec))
+        if (!g_font.seek((uint32_t)off) || g_font.read(rec, sizeof(rec)) != (int)sizeof(rec))
             return nullptr;
     }
     CacheEnt &e = g_cache[g_hand];
@@ -70,22 +86,29 @@ void sdFontInit()
     const esp_partition_t *part = esp_partition_find_first(ESP_PARTITION_TYPE_DATA, ESP_PARTITION_SUBTYPE_ANY, "font");
     if (!part) {
         snprintf(g_state, sizeof(g_state), "no partition");
-    } else if (part->size < kFontSize) {
+    } else if (part->size < kFontSizeV1) {
         snprintf(g_state, sizeof(g_state), "part too small");
     } else {
+        // Peek the magic first: it decides how much we map (V2 adds the emoji records).
+        char magic[4] = {0};
+        bool v2 = esp_partition_read(part, 0, magic, 4) == ESP_OK && memcmp(magic, "AUF2", 4) == 0;
+        bool v1 = !v2 && memcmp(magic, "AUF1", 4) == 0;
+        size_t need = v2 ? kFontSizeV2 : kFontSizeV1;
         const void *ptr = nullptr;
         esp_partition_mmap_handle_t h;
-        esp_err_t err = esp_partition_mmap(part, 0, kFontSize, ESP_PARTITION_MMAP_DATA, &ptr, &h);
-        if (err != ESP_OK) {
-            snprintf(g_state, sizeof(g_state), "mmap 0x%x", (unsigned)err);
-        } else if (memcmp(ptr, "AUF1", 4) != 0) {
+        esp_err_t err;
+        if (!v1 && !v2) {
             snprintf(g_state, sizeof(g_state), "not flashed");
-            esp_partition_munmap(h);
+        } else if (part->size < need) {
+            snprintf(g_state, sizeof(g_state), "part too small");
+        } else if ((err = esp_partition_mmap(part, 0, need, ESP_PARTITION_MMAP_DATA, &ptr, &h)) != ESP_OK) {
+            snprintf(g_state, sizeof(g_state), "mmap 0x%x", (unsigned)err);
         } else {
             g_map = (const uint8_t *)ptr;
+            g_v2 = v2;
             g_ready = true;
             snprintf(g_state, sizeof(g_state), "flash");
-            LOG_INFO("advui: unicode font mapped from the flash partition");
+            LOG_INFO("advui: unicode font mapped from the flash partition (%s)", v2 ? "AUF2" : "AUF1");
             return;
         }
     }
@@ -99,12 +122,16 @@ void sdFontInit()
     }
     g_font = SD.open(kFontPath, FILE_READ);
     char magic[5] = {0};
-    if (!g_font || g_font.size() < kFontSize || g_font.read((uint8_t *)magic, 4) != 4 || strcmp(magic, "AUF1") != 0) {
+    bool ok = g_font && g_font.read((uint8_t *)magic, 4) == 4;
+    bool v2 = ok && strcmp(magic, "AUF2") == 0;
+    ok = ok && (v2 ? g_font.size() >= kFontSizeV2 : (strcmp(magic, "AUF1") == 0 && g_font.size() >= kFontSizeV1));
+    if (!ok) {
         LOG_INFO("advui: %s missing/invalid, unicode font off", kFontPath);
         if (g_font)
             g_font.close();
         return;
     }
+    g_v2 = v2;
     g_cache = (CacheEnt *)calloc(kCacheN, sizeof(CacheEnt));
     if (!g_cache) {
         g_font.close();
@@ -130,9 +157,10 @@ bool sdFontReady()
 int sdGlyph(uint32_t cp, uint8_t *out)
 {
     if (g_map) {
-        if (cp > 0xFFFF)
+        int32_t off = recOff(cp);
+        if (off < 0)
             return 0;
-        const uint8_t *rec = g_map + 4 + (uint32_t)cp * 33;
+        const uint8_t *rec = g_map + off;
         if (!rec[0])
             return 0;
         memcpy(out, rec + 1, 32);
@@ -148,9 +176,10 @@ int sdGlyph(uint32_t cp, uint8_t *out)
 int sdGlyphWidth(uint32_t cp)
 {
     if (g_map) {
-        if (cp > 0xFFFF)
+        int32_t off = recOff(cp);
+        if (off < 0)
             return 0;
-        uint8_t w = g_map[4 + (uint32_t)cp * 33];
+        uint8_t w = g_map[off];
         return w == 2 ? 16 : w == 1 ? 8 : 0;
     }
     CacheEnt *e = lookup(cp);

@@ -4387,7 +4387,11 @@ void AdvUI::handleKey(char ch)
             }
             mode = nodeReturn;
         } else if (up) {
-            if (chatAtTop) { // at the very top: page back into the flash archive
+            // A held arrow drains several key events between two frames, but the
+            // paging conditions describe the LAST DRAWN frame — each transition
+            // consumes its flag so a hold hops at most one page per rendered frame.
+            if (chatAtTop && !histEnterAtTop) { // at the very top: page back into the archive
+                chatAtTop = false; // consumed; the next draw recomputes it
                 if (histAvail < 0) // lazy: counted only when someone actually scrolls up here
                     histAvail = histCountFor(selectedChannel >= 0, (uint8_t)(selectedChannel >= 0 ? selectedChannel : 0),
                                              selectedNum);
@@ -4397,12 +4401,12 @@ void AdvUI::handleKey(char ch)
             } else
                 chatScroll++; // older; drawNode clamps to the top of the thread
         } else if (down) {
-            if (histPage >= 0 && chatScroll == 0) { // page bottom: continue toward newer
+            if (histPage >= 0 && chatScroll == 0 && !histEnterAtTop) { // page bottom: toward newer
                 if (histPage == 0)
                     histExit();
                 else
                     histLoadPage(histPage - 1);
-                histEnterAtTop = true; // land at the seam and keep reading down
+                histEnterAtTop = true; // land at the seam; also swallows queued downs this frame
             } else if (chatScroll > 0)
                 chatScroll--; // back toward the newest
         } else if (histPage >= 0) { // any action key returns to the live view first

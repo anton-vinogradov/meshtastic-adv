@@ -136,9 +136,23 @@ uint32_t g_lastSaveMs = 0;  // when we last wrote the ring to flash
 // A separate array so the Msg layout (and the saved-file magic) stays unchanged.
 uint32_t g_msgReply[kMaxMsgs];
 
+// Real epochs start past this; anything below is "the clock wasn't set". The
+// range doubles as storage for clockless arrivals: they are stamped with the
+// UPTIME second instead, and backfilled to real time once the clock syncs
+// (see the transition check in runOnce). Uptime stamps from a previous boot
+// can't be recovered (the powered-off gap is unknowable) and load as 0.
+constexpr uint32_t kValidEpoch = 1600000000u;
+
 void addMsg(uint32_t from, uint32_t to, uint8_t ch, uint32_t rxTime, bool unread, const char *text, uint32_t id,
            uint8_t status, uint32_t replyId = 0)
 {
+    if (rxTime < kValidEpoch) {
+        // The engine quality-gates rx_time, so it hands us 0 even when the system
+        // clock is actually fine (it survives soft resets). Prefer the live clock;
+        // only truly clockless arrivals fall back to the uptime moment.
+        uint32_t now = getTime(false);
+        rxTime = now >= kValidEpoch ? now : millis() / 1000 + 1;
+    }
     // The ring is a compact chronological array (index 0 = oldest). When it's full
     // we evict the oldest CHANNEL broadcast, not the oldest message — so a busy
     // channel can never push a quiet DM thread out. Only when there are no
@@ -647,6 +661,10 @@ void loadMsgs()
         // upgrade our own channel sends saved before MSG_SENT existed
         else if (g_msgs[i].status == MSG_IN && me && g_msgs[i].from == me && g_msgs[i].to == NODENUM_BROADCAST)
             g_msgs[i].status = MSG_SENT;
+        // an uptime stamp from a previous boot: the powered-off gap is unknowable,
+        // so the arrival time is permanently lost — 0 keeps it blank, not backfilled
+        if (g_msgs[i].rxTime < kValidEpoch)
+            g_msgs[i].rxTime = 0;
     }
 }
 
@@ -1086,7 +1104,7 @@ uint32_t buildDateEpoch()
 
 void msgTimePrefix(uint32_t rxTime, int32_t tzOff, char *out, int cap)
 {
-    if (rxTime < 1600000000u) { // before 2020-09 => no valid RTC at stamp time
+    if (rxTime < kValidEpoch) { // no valid RTC at stamp time (see kValidEpoch)
         out[0] = 0;
         return;
     }
@@ -2883,7 +2901,7 @@ void AdvUI::drawSettings()
     snprintf(vals[15], sizeof(vals[15]), "%s", sdFontState()); // unicode font source (read-only)
     {
         uint32_t now = getTime(false); // device clock: the row doubles as the RTC status
-        if (now >= 1600000000u) {
+        if (now >= kValidEpoch) {
             uint32_t loc = now + g_utcOffsetMin * 60;
             snprintf(vals[16], sizeof(vals[16]), "%02u:%02u", (unsigned)((loc / 3600u) % 24u),
                      (unsigned)((loc / 60u) % 60u));
@@ -4378,6 +4396,28 @@ int32_t AdvUI::runOnce()
             loggedMin = mn;
             LOG_WARN("advui: heap new low free=%u min=%u largest=%u", (unsigned)ESP.getFreeHeap(), (unsigned)mn,
                      (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_8BIT));
+        }
+    }
+
+    { // The clock just synced (phone, NTP, mesh or the Clock setting): messages that
+      // arrived clockless this boot carry uptime stamps — rewrite them to real time,
+      // real = now - (uptime_now - uptime_then). One-shot per boot.
+        static bool clockSeen = false;
+        uint32_t now = getTime(false);
+        if (!clockSeen && now >= kValidEpoch) {
+            clockSeen = true;
+            uint32_t up = millis() / 1000;
+            int fixed = 0;
+            for (int i = 0; i < g_msgCount; i++) {
+                uint32_t rt = g_msgs[i].rxTime;
+                if (rt && rt < kValidEpoch) {
+                    g_msgs[i].rxTime = now - (up > rt ? up - rt : 0);
+                    g_msgsDirty = true;
+                    uiDirty = true;
+                    fixed++;
+                }
+            }
+            LOG_INFO("advui: clock synced at uptime %us, backfilled %d stamps", (unsigned)up, fixed);
         }
     }
 

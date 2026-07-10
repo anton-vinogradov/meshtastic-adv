@@ -116,7 +116,9 @@ the middle, the compose bar sits at the bottom.
 
 - **Every message** carries a compact local `HH:MM` (set your UTC offset in Settings) and a
   direction mark: `>` sent, `<` received. In channels received messages also show the
-  sender's short name.
+  sender's short name. Messages that arrive before the clock has synced are remembered by
+  their uptime moment and get their real stamps backfilled the instant time arrives (within
+  the same boot; across a power loss the arrival time is genuinely unknowable and stays blank).
 - **Delivery status** on your messages: a grey dot while sending → a **green ✓** on the
   routing ACK (channel broadcasts get their ✓ on transmit) → a **red ✗ with the reason** on
   failure. When the newest message has failed, **Enter resends it**.

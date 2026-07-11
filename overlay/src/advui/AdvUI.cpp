@@ -892,6 +892,101 @@ void histPurge(bool isChan, uint8_t ch, uint32_t node)
     g_histTotal = kept;
 }
 
+// Distinct-node ledger on flash: one {num, lastHeard} record per node ever
+// heard, reconciled against the hot store when the node list opens. The header
+// counts entries heard in the last 24 h — the size of the LIVING mesh — with
+// zero RAM per node, so it never saturates at the hot+warm identity caps
+// (those still bound stored DATA and PKI keys, not this number).
+const char *kSeenPath = "/advui_seen.bin";
+constexpr uint32_t kSeenMagic = 0x314E5641; // "AVN1"
+struct SeenRec {
+    uint32_t num;
+    uint32_t last;
+};
+constexpr int kSeenCap = 2048; // at most ~16 KB of LittleFS
+int g_seen24 = -1;             // nodes heard in the last 24 h (-1 = not computed yet)
+
+void seenReconcile()
+{
+    uint32_t now = getTime(false);
+    if (!nodeDB || now < kValidEpoch)
+        return; // clockless: a 24 h window is meaningless right now
+    int hotN = (int)nodeDB->getNumMeshNodes();
+    if (hotN > 250)
+        hotN = 250;
+    uint32_t hotId[250];
+    uint32_t hotLast[250];
+    bool inFile[250];
+    for (int i = 0; i < hotN; i++) {
+        meshtastic_NodeInfoLite *n = nodeDB->getMeshNodeByIndex(i);
+        hotId[i] = n ? n->num : 0;
+        hotLast[i] = n ? n->last_heard : 0;
+        inFile[i] = false;
+    }
+    bool fresh = false;
+    auto f = FSCom.open(kSeenPath, "r+");
+    if (!f) {
+        f = FSCom.open(kSeenPath, FILE_O_WRITE);
+        if (!f)
+            return;
+        f.write((const uint8_t *)&kSeenMagic, 4);
+        fresh = true;
+    } else {
+        uint32_t magic = 0;
+        if (f.read((uint8_t *)&magic, 4) != 4 || magic != kSeenMagic) {
+            f.close();
+            FSCom.remove(kSeenPath); // unknown leftovers: start clean next pass
+            return;
+        }
+    }
+    int active = 0, total = 0;
+    uint32_t dayAgo = now - 86400;
+    if (!fresh) {
+        SeenRec chunk[32];
+        uint32_t pos = 4;
+        for (;;) {
+            f.seek(pos);
+            int got = (int)f.read((uint8_t *)chunk, sizeof(chunk)) / (int)sizeof(SeenRec);
+            if (got <= 0)
+                break;
+            bool dirty = false;
+            for (int i = 0; i < got; i++) {
+                for (int h = 0; h < hotN; h++)
+                    if (hotId[h] && hotId[h] == chunk[i].num) {
+                        inFile[h] = true;
+                        if (hotLast[h] > chunk[i].last) {
+                            chunk[i].last = hotLast[h];
+                            dirty = true;
+                        }
+                        break;
+                    }
+                if (chunk[i].last >= dayAgo)
+                    active++;
+            }
+            if (dirty) {
+                f.seek(pos);
+                f.write((const uint8_t *)chunk, got * sizeof(SeenRec));
+            }
+            total += got;
+            pos += got * sizeof(SeenRec);
+        }
+    }
+    // nodes the ledger has never met: append them (the file only ever grows by
+    // genuinely new identities, so entries stay distinct by construction)
+    f.seek(f.size());
+    for (int h = 0; h < hotN && total < kSeenCap; h++) {
+        if (!hotId[h] || inFile[h])
+            continue;
+        SeenRec r = {hotId[h], hotLast[h]};
+        f.write((const uint8_t *)&r, sizeof(r));
+        total++;
+        if (r.last >= dayAgo)
+            active++;
+    }
+    f.close();
+    g_seen24 = active;
+}
+
 // Default node ordering: favourites first, then nodes we have a conversation with,
 // then everyone else by hop distance (nearest first; unknown hops last). Ties are
 // broken by most-recently-heard.
@@ -2477,23 +2572,35 @@ void AdvUI::drawNodeList()
 
     g->fillScreen(0x0000);
 
-    // The honest node count, not the table size. Local: hot store + the warm tier
-    // (evicted identities the engine still remembers — already allocated, so the
-    // number is free). Companion: the config stream sends each of the node's DB
-    // entries exactly once per sync, so counting the stream beats our 64-slot
-    // mirror. The list below still shows only nodes we hold full data for.
+    // The honest node count. Local: the flash ledger's 24 h window — the size of
+    // the LIVING mesh, unbounded by the hot/warm identity caps (reconciled at
+    // most once a minute; hot+warm is the fallback until the clock lets the
+    // window mean something). Companion: the config stream sends each of the
+    // node's DB entries exactly once per sync, so counting the stream beats our
+    // 64-slot mirror. The list below still shows only full-data nodes either way.
     size_t total, cap = SIZE_MAX;
+    bool day = false;
     if (g_radioCompanion) {
         total = (size_t)(g_compNodesSeen > g_compNodeCount ? g_compNodesSeen : (int)g_compNodeCount);
     } else {
-        total = nodeDB ? nodeDB->getNumMeshNodes() : 0;
-        cap = (size_t)::advui_max_num_nodes();
-#if WARM_NODE_COUNT > 0
-        if (nodeDB) {
-            total += nodeDB->warmStore.count();
-            cap += WARM_NODE_COUNT;
+        static uint32_t lastRecon = 0;
+        if (g_seen24 < 0 || millis() - lastRecon > 60000) {
+            seenReconcile();
+            lastRecon = millis();
         }
+        if (g_seen24 > 0) {
+            total = (size_t)g_seen24;
+            day = true;
+        } else {
+            total = nodeDB ? nodeDB->getNumMeshNodes() : 0;
+            cap = (size_t)::advui_max_num_nodes();
+#if WARM_NODE_COUNT > 0
+            if (nodeDB) {
+                total += nodeDB->warmStore.count();
+                cap += WARM_NODE_COUNT;
+            }
 #endif
+        }
     }
     uint32_t me = myNodeNum();
 
@@ -2506,9 +2613,12 @@ void AdvUI::drawNodeList()
 
     g->setTextColor(0x07FF); // cyan
     g->setCursor(4, 3);
-    // "+" only when even the warm tier is pinned at capacity — beyond that point
-    // the oldest identities really do fall off and the count stops being exact.
-    g->printf("%u%s nodes", (unsigned)total, total >= cap ? "+" : "");
+    // "+" only in the fallback mode, when even the warm tier is pinned at its
+    // capacity — the ledger's 24 h number is exact and needs no marker.
+    if (day)
+        g->printf("%u nodes/24h", (unsigned)total);
+    else
+        g->printf("%u%s nodes", (unsigned)total, total >= cap ? "+" : "");
 
     int bw = g->textWidth(bbuf);
     g->setTextColor(bcol);

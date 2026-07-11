@@ -906,6 +906,32 @@ struct SeenRec {
 constexpr int kSeenCap = 2048; // at most ~16 KB of LittleFS
 int g_seen24 = -1;             // nodes heard in the last 24 h (-1 = not computed yet)
 
+// Hearings observed by US: the engine quality-gates last_heard to 0 after every
+// reboot until a time source arrives, which froze the 24 h counter — but the raw
+// system clock survives resets, so we stamp packet senders ourselves and fold
+// them into the ledger on the next reconcile.
+struct SeenPend {
+    uint32_t num, t;
+};
+SeenPend g_seenPend[16];
+int g_seenPendN = 0;
+
+void seenNote(uint32_t num)
+{
+    uint32_t now = getTime(false);
+    if (!num || num == NODENUM_BROADCAST || now < kValidEpoch)
+        return;
+    for (int i = 0; i < g_seenPendN; i++)
+        if (g_seenPend[i].num == num) {
+            g_seenPend[i].t = now;
+            return;
+        }
+    if (g_seenPendN < (int)(sizeof(g_seenPend) / sizeof(g_seenPend[0])))
+        g_seenPend[g_seenPendN++] = {num, now};
+    else
+        g_seenPend[0] = {num, now}; // full: recycle; a reconcile drains us soon anyway
+}
+
 void seenReconcile()
 {
     uint32_t now = getTime(false);
@@ -914,15 +940,30 @@ void seenReconcile()
     int hotN = (int)nodeDB->getNumMeshNodes();
     if (hotN > 250)
         hotN = 250;
-    uint32_t hotId[250];
-    uint32_t hotLast[250];
-    bool inFile[250];
+    uint32_t hotId[266]; // 250 hot slots + up to 16 pending self-observations
+    uint32_t hotLast[266];
+    bool inFile[266];
     for (int i = 0; i < hotN; i++) {
         meshtastic_NodeInfoLite *n = nodeDB->getMeshNodeByIndex(i);
         hotId[i] = n ? n->num : 0;
         hotLast[i] = n ? n->last_heard : 0;
         inFile[i] = false;
     }
+    for (int i = 0; i < g_seenPendN; i++) { // our own stamps beat quality-gated zeros
+        int h = 0;
+        while (h < hotN && hotId[h] != g_seenPend[i].num)
+            h++;
+        if (h < hotN) {
+            if (g_seenPend[i].t > hotLast[h])
+                hotLast[h] = g_seenPend[i].t;
+        } else {
+            hotId[hotN] = g_seenPend[i].num;
+            hotLast[hotN] = g_seenPend[i].t;
+            inFile[hotN] = false;
+            hotN++;
+        }
+    }
+    g_seenPendN = 0;
     bool fresh = false;
     auto f = FSCom.open(kSeenPath, "r+");
     if (!f) {
@@ -1905,6 +1946,7 @@ void AdvUI::handleFromRadio(const meshtastic_FromRadio &fr)
     if (fr.which_payload_variant != meshtastic_FromRadio_packet_tag)
         return;
     const meshtastic_MeshPacket &p = fr.packet;
+    seenNote(p.from); // ledger sees every sender, whatever the engine stamps
     if (p.which_payload_variant != meshtastic_MeshPacket_decoded_tag)
         return;
 
@@ -4586,10 +4628,11 @@ void AdvUI::handleKey(char ch)
 
     if (mode == MODE_NODE) {
         if (esc || bksp) {
-            if (histDepth > 0) { // first ESC leaves the archive, not the chat
-                histExit();
+            if (histDepth > 0 && !(histSeam && chatScroll == 0)) {
+                histExit(); // deep in history: the first ESC jumps back to the latest
                 return;
             }
+            histExit(); // at the latest already: drop the loaded window and exit the chat
             if (g_msgsDirty) { // flush read-state now — a reset right after would lose it
                 saveMsgs();
                 g_msgsDirty = false;
@@ -4619,8 +4662,8 @@ void AdvUI::handleKey(char ch)
                 chatScroll = lastDrawScroll - 1;   // and keep moving one line newer
             } else if (chatScroll > 0)
                 chatScroll--; // back toward the newest
-        } else if (histDepth > 0) { // any action key returns to the live view first
-            histExit();
+        } else if (histDepth > 0 && !(histSeam && chatScroll == 0)) {
+            histExit(); // deep in history: an action key returns to the live view first
         } else if (right || left) { // pick a message: RIGHT = react, LEFT = reply
             if (matchedFromNewest(0) >= 0) {
                 reactSel = 0;

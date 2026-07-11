@@ -214,10 +214,11 @@ reminds you).
 - **Phone app:** the stock Bluetooth API is untouched, so the official Meshtastic app pairs
   with the Cardputer like with any node — a passkey screen pops up (waking the display) with
   the PIN to type on the phone. WiFi turns Bluetooth off, as in stock.
-- The header counts every node identity the device remembers — the 200-entry hot DB (full
-  data) **plus** the warm tier of up to 150 evicted identities the engine keeps for PKI, so
-  on a big mesh it reads honestly past 200 (up to 350, then `+`). The list itself shows the
-  hot entries; in companion mode it mirrors the 64 most recently heard nodes while the
-  header counts the linked node's whole DB from the sync stream.
+- The header counts **nodes heard in the last 24 hours** — a flash-backed ledger of every
+  node identity ever met, so the number reflects the living mesh and never saturates at the
+  storage caps (until the clock syncs it falls back to the stored-identity count). The list
+  itself shows the 200 most current nodes with full data; in companion mode it mirrors the
+  64 most recently heard while the header counts the linked node's whole DB from the sync
+  stream.
 - Other nodes' battery levels aren't stored by this build's compact node DB — only our own
   battery (header/footer) and, in companion mode, the linked node's.

@@ -84,7 +84,8 @@ struct Msg {
     uint8_t err;     // routing error code when status == MSG_FAILED
     uint8_t ch;      // channel index for broadcasts (to == 0xFFFFFFFF)
     bool read;
-    char text[160];
+    char text[236]; // fits the 233-byte wire maximum (DATA_PAYLOAD_LEN) + NUL;
+                    // 160 used to cut long Cyrillic messages mid-word
 };
 
 // Short names for meshtastic_Routing_Error, shown next to a failed message.
@@ -525,8 +526,35 @@ void markReadChannel(int chIdx)
 
 // Persist the message ring (with delivery status + read flags) to flash, so a
 // reboot keeps the conversation. Written debounced from runOnce.
-constexpr uint32_t kMsgMagic = 0x41565333;   // "AVS3" — count-based, independent of kMaxMsgs
-constexpr uint32_t kMsgMagicV2 = 0x41565332; // "AVS2" — legacy fixed-32 ring, migrated on load
+constexpr uint32_t kMsgMagic = 0x41565334;   // "AVS4" — count-based, independent of kMaxMsgs
+constexpr uint32_t kMsgMagicV3 = 0x41565333; // "AVS3" — the 160-byte-text Msg layout, migrated on load
+
+// The pre-v0.4.8 Msg layout (text[160]); V3 files and V1 archives hold these.
+struct MsgV3 {
+    uint32_t from;
+    uint32_t to;
+    uint32_t rxTime;
+    uint32_t id;
+    uint8_t status;
+    uint8_t err;
+    uint8_t ch;
+    bool read;
+    char text[160];
+};
+
+void msgFromV3(Msg &out, const MsgV3 &in)
+{
+    out.from = in.from;
+    out.to = in.to;
+    out.rxTime = in.rxTime;
+    out.id = in.id;
+    out.status = in.status;
+    out.err = in.err;
+    out.ch = in.ch;
+    out.read = in.read;
+    memcpy(out.text, in.text, sizeof(in.text));
+    out.text[sizeof(in.text)] = 0;
+}
 const char *kMsgPath = "/advui_msgs.bin";
 
 // The message ring is a circular buffer; iterate it oldest-first (matches the
@@ -565,7 +593,7 @@ void saveMsgs()
 // AVS3: the current count-based format. Messages/reactions were written
 // oldest-first; keep the newest kMaxMsgs / kMaxReacts if an older, bigger save
 // ever holds more than this build's ring.
-static bool loadMsgsV3(File &f)
+static bool loadMsgsV4(File &f, bool v3)
 {
     int32_t cnt = 0, off = 0, so = 0;
     uint8_t ru = 0, rc = 0;
@@ -577,17 +605,29 @@ static bool loadMsgsV3(File &f)
     f.read(&ru, 1);
     f.read(&rc, 1);
 
+    // Same count-based format either way; a V3 file just holds the smaller
+    // pre-v0.4.8 records, widened as they're read.
+    size_t msz = v3 ? sizeof(MsgV3) : sizeof(Msg);
     int mskip = cnt > kMaxMsgs ? cnt - kMaxMsgs : 0;
     for (int i = 0; i < mskip; i++) { // discard the oldest overflow
-        Msg t;
+        MsgV3 t;
         uint32_t r;
-        if (f.read((uint8_t *)&t, sizeof(Msg)) != (int)sizeof(Msg))
+        if (f.read((uint8_t *)&t, msz) != (int)msz)
             return false;
         f.read((uint8_t *)&r, 4);
     }
     int mkeep = cnt - mskip;
     for (int i = 0; i < mkeep; i++) {
-        if (f.read((uint8_t *)&g_msgs[i], sizeof(Msg)) != (int)sizeof(Msg))
+        bool ok;
+        if (v3) {
+            MsgV3 t;
+            ok = f.read((uint8_t *)&t, sizeof(t)) == (int)sizeof(t);
+            if (ok)
+                msgFromV3(g_msgs[i], t);
+        } else {
+            ok = f.read((uint8_t *)&g_msgs[i], sizeof(Msg)) == (int)sizeof(Msg);
+        }
+        if (!ok)
             return false;
         if (f.read((uint8_t *)&g_msgReply[i], 4) != 4)
             g_msgReply[i] = 0;
@@ -613,64 +653,6 @@ static bool loadMsgsV3(File &f)
     return true;
 }
 
-// AVS2: the legacy fixed 32-slot layout — read the old arrays and linearise the
-// old circular ring into the current one so a firmware update keeps history.
-static void loadMsgsV2(File &f)
-{
-    constexpr int OLD = 32; // old kMaxMsgs and kMaxReacts were both 32
-    int32_t cnt = 0, nxt = 0;
-    f.read((uint8_t *)&cnt, 4);
-    f.read((uint8_t *)&nxt, 4);
-    f.read((uint8_t *)&g_favChannels, sizeof(g_favChannels));
-    // one-time migration temps: on the heap (plenty free at boot), freed below —
-    // no permanent bss for a path that runs at most once per device
-    Msg *om = (Msg *)malloc(OLD * sizeof(Msg));
-    Reaction *orr = (Reaction *)malloc(OLD * sizeof(Reaction));
-    uint32_t *ore = (uint32_t *)malloc(OLD * sizeof(uint32_t));
-    if (!om || !orr || !ore) {
-        free(om);
-        free(orr);
-        free(ore);
-        return;
-    }
-    size_t n = f.read((uint8_t *)om, OLD * sizeof(Msg));
-    int32_t off = 0;
-    f.read((uint8_t *)&off, 4);
-    uint8_t ru = 0, rc = 0, rn = 0;
-    f.read(&ru, 1);
-    f.read(&rc, 1);
-    f.read(&rn, 1);
-    size_t rb = f.read((uint8_t *)orr, OLD * sizeof(Reaction));
-    size_t reb = f.read((uint8_t *)ore, OLD * sizeof(uint32_t));
-    int32_t so = 0;
-    size_t sob = f.read((uint8_t *)&so, 4);
-    if (n != OLD * sizeof(Msg) || cnt < 0 || cnt > OLD || nxt < 0 || nxt >= OLD) {
-        free(om);
-        free(orr);
-        free(ore);
-        return;
-    }
-    for (int i = 0; i < cnt; i++) {
-        int idx = ringIdx(i, cnt, nxt, OLD);
-        g_msgs[i] = om[idx];
-        g_msgReply[i] = (reb == OLD * sizeof(uint32_t)) ? ore[idx] : 0;
-    }
-    g_msgCount = cnt;
-    if (rb == OLD * sizeof(Reaction) && rc <= OLD && rn < OLD) {
-        for (int i = 0; i < rc; i++)
-            g_reacts[i] = orr[ringIdx(i, rc, rn, OLD)];
-        g_reactCount = rc;
-        g_reactNext = rc % kMaxReacts;
-    }
-    g_utcOffsetMin = off;
-    g_ruMode = ru != 0;
-    if (sob == sizeof(so) && (so == 0 || (so >= 15 && so <= 3600)))
-        g_screenOffSec = so;
-    free(om);
-    free(orr);
-    free(ore);
-}
-
 void loadMsgs()
 {
     auto f = FSCom.open(kMsgPath, FILE_O_READ);
@@ -679,9 +661,9 @@ void loadMsgs()
     uint32_t magic = 0;
     f.read((uint8_t *)&magic, sizeof(magic));
     if (magic == kMsgMagic)
-        loadMsgsV3(f);
-    else if (magic == kMsgMagicV2)
-        loadMsgsV2(f);
+        loadMsgsV4(f, false);
+    else if (magic == kMsgMagicV3)
+        loadMsgsV4(f, true); // pre-v0.4.8 records widen on the way in
     f.close();
 
     uint32_t me = myNodeNum();
@@ -707,12 +689,13 @@ void loadMsgs()
 // Internal flash shares no bus with the LoRa cap, so paging can't stall RX.
 const char *kHistPath = "/advui_hist.bin";
 const char *kHistTmp = "/advui_hist.tmp";
-constexpr uint32_t kHistMagic = 0x31485641; // "AVH1"
+constexpr uint32_t kHistMagic = 0x32485641;   // "AVH2"
+constexpr uint32_t kHistMagicV1 = 0x31485641; // "AVH1" — pre-v0.4.8 records, migrated in place
 struct HistRec {
     Msg m;
     uint32_t rid;
 };
-constexpr int kHistRec = (int)sizeof(HistRec); // 184: Msg is 180 with no tail padding
+constexpr int kHistRec = (int)sizeof(HistRec); // Msg (256, no tail padding) + reply id
 constexpr int kHistCap = 256;
 constexpr int kHistSlack = 64;
 constexpr int kHistWin = 8;   // staged slice size — RAM is precious on this board,
@@ -740,6 +723,8 @@ bool histStagingReady()
     return true;
 }
 
+void histMigrateV1(); // widen pre-v0.4.8 archive records once
+
 int histTotal()
 {
     if (g_histTotal >= 0)
@@ -748,14 +733,49 @@ int histTotal()
     auto f = FSCom.open(kHistPath, FILE_O_READ);
     if (f) {
         uint32_t magic = 0;
-        bool ok = f.read((uint8_t *)&magic, 4) == 4 && magic == kHistMagic;
+        bool got = f.read((uint8_t *)&magic, 4) == 4;
+        bool ok = got && magic == kHistMagic;
+        bool v1 = got && magic == kHistMagicV1;
         if (ok)
             g_histTotal = (int)((f.size() - 4) / kHistRec);
         f.close();
-        if (!ok)
+        if (v1)
+            histMigrateV1(); // sets g_histTotal itself
+        else if (!ok)
             FSCom.remove(kHistPath); // unknown leftovers: start clean
     }
     return g_histTotal;
+}
+
+// One-shot: rewrite an AVH1 archive (MsgV3-sized records) into the current layout.
+void histMigrateV1()
+{
+    auto in = FSCom.open(kHistPath, FILE_O_READ);
+    if (!in)
+        return;
+    auto out = FSCom.open(kHistTmp, FILE_O_WRITE);
+    if (!out) {
+        in.close();
+        return;
+    }
+    out.write((const uint8_t *)&kHistMagic, 4);
+    in.seek(4);
+    MsgV3 om;
+    uint32_t rid;
+    int kept = 0;
+    while (in.read((uint8_t *)&om, sizeof(om)) == (int)sizeof(om) && in.read((uint8_t *)&rid, 4) == 4 &&
+           kept < kHistCap) {
+        HistRec rec;
+        msgFromV3(rec.m, om);
+        rec.rid = rid;
+        out.write((const uint8_t *)&rec, sizeof(rec));
+        kept++;
+    }
+    in.close();
+    out.close();
+    FSCom.remove(kHistPath);
+    renameFile(kHistTmp, kHistPath);
+    g_histTotal = kept;
 }
 
 bool histMatch(const Msg &m, bool isChan, uint8_t ch, uint32_t node)
@@ -1975,7 +1995,7 @@ void AdvUI::handleFromRadio(const meshtastic_FromRadio &fr)
     if (p.decoded.portnum != meshtastic_PortNum_TEXT_MESSAGE_APP)
         return;
 
-    char text[160];
+    char text[236]; // sized like Msg.text: the full wire payload fits
     size_t n = p.decoded.payload.size;
     if (n > sizeof(text) - 1)
         n = sizeof(text) - 1;
@@ -2826,6 +2846,12 @@ void AdvUI::drawNode()
     };
     SrcRef srcs[kMaxMsgs + kHistWin];
     int mc = 0;
+    int liveMc = 0; // live matches in the ring (whether rendered or not): scrollbar math
+    for (int i = 0; i < g_msgCount; i++)
+        if (isChan ? (g_msgs[i].to == NODENUM_BROADCAST && g_msgs[i].ch == selectedChannel)
+                   : ((g_msgs[i].from == selectedNum || g_msgs[i].to == selectedNum) &&
+                      g_msgs[i].to != NODENUM_BROADCAST))
+            liveMc++;
     bool hasFailed = false; // any failed outgoing DM here -> offer ENTER resend
     for (int i = 0; i < histCount; i++)
         srcs[mc++] = {&g_arch[i], g_archReply[i], (int16_t)-1};
@@ -2903,7 +2929,7 @@ void AdvUI::drawNode()
             msgTimePrefix(m.rxTime, tzOff, tpre, sizeof(tpre)); // "HH:MM " before the arrow
             uint8_t tlen = (uint8_t)strlen(tpre);
             uint8_t nlen = 0;
-            char full[200];
+            char full[260]; // time prefix + sender + a full-size message text
             if (isChan && !out) { // channels have many senders — show who wrote it
                 char sn[8];
                 shortNameOf(m.from, sn, sizeof(sn));
@@ -3121,14 +3147,31 @@ void AdvUI::drawNode()
             }
             y += lh;
         }
-        // scrollbar on the right edge when the thread overflows the view
-        if (maxScroll > 0) {
+        // scrollbar on the right edge when the thread overflows the view. With the
+        // window in the archive it spans the WHOLE timeline (archive + live) at
+        // message granularity — window slides no longer pulse the thumb size.
+        if (maxScroll > 0 || histDepth > 0) {
             int trackY = fy0, trackH = maxLines * lh;
             g->drawFastVLine(238, trackY, trackH, 0x2104); // dark track
-            int thumbH = trackH * maxLines / dlCount;
-            if (thumbH < 6)
-                thumbH = 6;
-            int thumbY = trackY + (trackH - thumbH) * startL / maxScroll;
+            int thumbY, thumbH;
+            int totalMsgs = (histAvail > 0 ? histAvail : 0) + liveMc;
+            if (histDepth > 0 && totalMsgs > 0 && mc > 0) {
+                int before = histAvail - histDepth; // messages above the rendered window
+                float visFrac = dlCount > maxLines ? (float)maxLines / dlCount : 1.0f;
+                float posFrac = maxScroll > 0 ? (float)startL / maxScroll : 0.0f;
+                float winTop = before + posFrac * mc * (1.0f - visFrac);
+                thumbH = (int)(trackH * (mc * visFrac) / totalMsgs);
+                if (thumbH < 6)
+                    thumbH = 6;
+                thumbY = trackY + (int)(trackH * winTop / totalMsgs);
+                if (thumbY + thumbH > trackY + trackH)
+                    thumbY = trackY + trackH - thumbH;
+            } else {
+                thumbH = trackH * maxLines / dlCount;
+                if (thumbH < 6)
+                    thumbH = 6;
+                thumbY = trackY + (trackH - thumbH) * startL / (maxScroll > 0 ? maxScroll : 1);
+            }
             g->drawFastVLine(238, thumbY, thumbH, 0x07FF); // cyan thumb
             g->drawFastVLine(239, thumbY, thumbH, 0x07FF);
         }
@@ -3178,7 +3221,7 @@ void AdvUI::drawNode()
         const char *hint;
         char histHint[36];
         if (histDepth > 0) { // the window reaches into the flash archive
-            snprintf(histHint, sizeof(histHint), "history %d/%d  ESC latest", histDepth, histAvail);
+            snprintf(histHint, sizeof(histHint), "history %d/%d  dn newer  ESC", histDepth, histAvail);
             hint = histHint;
         } else if (reactStrip) {
             hint = "</> pick  ENTER send  ESC";
@@ -4637,11 +4680,7 @@ void AdvUI::handleKey(char ch)
 
     if (mode == MODE_NODE) {
         if (esc || bksp) {
-            if (histDepth > 0 && !(histSeam && chatScroll == 0)) {
-                histExit(); // deep in history: the first ESC jumps back to the latest
-                return;
-            }
-            histExit(); // at the latest already: drop the loaded window and exit the chat
+            histExit(); // one press leaves the chat from anywhere, history included
             if (g_msgsDirty) { // flush read-state now — a reset right after would lose it
                 saveMsgs();
                 g_msgsDirty = false;
@@ -5010,10 +5049,14 @@ int32_t AdvUI::runOnce()
             shotLive = true;
         else if (sc == 'K')
             shotPendingKey = true;
-        else if (sc == 'G') { // ghost DM with supplementary-plane emoji (render test)
+        else if (sc == 'G') { // ghost DM: SMP emoji + a 191-byte Cyrillic text (render/width tests)
             addMsg(0x000BEEF1, myNodeNum(), 0, 0, true, "SMP: \U0001F480\U0001F923\U0001F970 sel: ❤️ ok", 777,
                    MSG_IN);
             addReaction(777, 0x000BEEF1, "\U0001F480");
+            addMsg(0x000BEEF1, myNodeNum(), 0, 0, true,
+                   "Погода огонь, как и пробки на каде. Кому с юга на север гоу по ЗСД. От зуздальского уже час до "
+                   "мурино стоим.",
+                   778, MSG_IN);
             uiDirty = true;
         } else if (sc == 'H') { // 48 numbered ghost DMs: overflows the ring into the archive
             char t[40];

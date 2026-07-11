@@ -89,11 +89,18 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           cp /tmp/fw.bin "meshtastic-adv-${GITHUB_REF_NAME}.factory.bin"
+          # One-file merged image (firmware + partition table + Unicode font) for
+          # M5Burner and the Launcher catalog, which greps releases for a stable
+          # asset name; flash it at 0x0.
+          pip install esptool >/dev/null
+          python -m esptool --chip esp32s3 merge_bin -o meshtastic-adv-cardputer-adv-merged.bin \
+            --flash_mode keep --flash_size keep \
+            0x0 /tmp/fw.bin 0x340000 docs/unifont.bin
           if gh release view "${GITHUB_REF_NAME}" >/dev/null 2>&1; then
-            gh release upload "${GITHUB_REF_NAME}" "meshtastic-adv-${GITHUB_REF_NAME}.factory.bin" docs/unifont.bin --clobber
+            gh release upload "${GITHUB_REF_NAME}" "meshtastic-adv-${GITHUB_REF_NAME}.factory.bin" docs/unifont.bin meshtastic-adv-cardputer-adv-merged.bin --clobber
           else
             gh release create "${GITHUB_REF_NAME}" \
               --title "Meshtastic ADV ${GITHUB_REF_NAME}" \
               --generate-notes \
-              "meshtastic-adv-${GITHUB_REF_NAME}.factory.bin" docs/unifont.bin
+              "meshtastic-adv-${GITHUB_REF_NAME}.factory.bin" docs/unifont.bin meshtastic-adv-cardputer-adv-merged.bin
           fi

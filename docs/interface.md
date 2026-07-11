@@ -126,8 +126,8 @@ the middle, the compose bar sits at the bottom.
   and so does backspace while erasing text); opening a thread auto-jumps to the first unread.
 - **Scrolling past the top pages into the flash archive**: messages evicted from the live
   window aren't gone — the newest 256 land in an archive on internal flash, and ↑ at the top
-  of the thread walks back through them 16 at a time (the footer shows `history N-M/K`;
-  ↓ at a page bottom moves toward newer, **ESC** returns to the live view). Deleting a chat
+  of the thread walks back through them 16 at a time (the footer shows `history N/K`;
+  ↓ keeps walking back toward newer; **ESC** leaves the chat as usual). Deleting a chat
   wipes its archive too.
 - **Type** and hit **Enter** to send. **Fn+L** toggles the Cyrillic transliteration layer
   (the `RU`/`EN` badge on the compose bar; the choice persists). It's phonetic:

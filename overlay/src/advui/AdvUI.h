@@ -2,8 +2,8 @@
 
 #include "AdvDisplay.h"
 #include "AdvKeyboard.h"
-#include "InternalAPI.h"
 #include "concurrency/OSThread.h"
+#include "mesh/PhoneAPI.h"
 #include <cstddef>
 #include <cstdint>
 
@@ -25,6 +25,9 @@ class AdvUI : public concurrency::OSThread
 {
   public:
     AdvUI();
+    /// Entry point for AdvRxModule: a decoded mesh packet (wrapped as FromRadio),
+    /// delivered on the main thread. Replaces the old PhoneAPI queue drain.
+    void onMeshPacket(const meshtastic_FromRadio &fr);
 
   protected:
     int32_t runOnce() override;
@@ -98,7 +101,6 @@ class AdvUI : public concurrency::OSThread
     void screenSleep(); // cut the display power rail (auto-off)
     void screenWake();  // rail up + full panel re-init
 
-    InternalAPI api;
     AdvDisplay display;
     AdvKeyboard kb;
     lgfx::LGFX_Sprite canvas{&display}; // off-screen frame buffer
@@ -190,7 +192,6 @@ class AdvUI : public concurrency::OSThread
     bool announced = false; // sent our early boot NodeInfo announce yet
     bool regionPrompted = false; // opened the first-boot region picker yet
     uint32_t bootMs = 0;
-    uint8_t fromRadioBuf[MAX_TO_FROM_RADIO_SIZE]; // sized by PhoneAPI.h
 };
 
 void advuiSetup();

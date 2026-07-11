@@ -7,6 +7,7 @@
 #include "PowerStatus.h"
 #include "configuration.h"
 #include "mesh/Channels.h"
+#include "mesh/MeshModule.h"
 #include "mesh/MeshService.h"
 #include "mesh/NodeDB.h"
 #include "mesh/Router.h"
@@ -148,6 +149,10 @@ void histAppend(const Msg &m, uint32_t replyId); // eviction victims go to the f
 void addMsg(uint32_t from, uint32_t to, uint8_t ch, uint32_t rxTime, bool unread, const char *text, uint32_t id,
            uint8_t status, uint32_t replyId = 0)
 {
+    if (id) // a loopback copy of a message we already hold (e.g. our own send
+        for (int i = 0; i < g_msgCount; i++)
+            if (g_msgs[i].id == id)
+                return;
     if (rxTime < kValidEpoch) {
         // The engine quality-gates rx_time, so it hands us 0 even when the system
         // clock is actually fine (it survives soft resets). Prefer the live clock;
@@ -1890,8 +1895,6 @@ void AdvUI::initHardware()
 #endif
 
     loadRadioCfg();
-    if (!g_radioCompanion)
-        api.begin(); // companion doesn't subscribe to the local engine's phone stream
     kb.begin();
     LOG_INFO("advui: keyboard ready");
 
@@ -1941,6 +1944,12 @@ void AdvUI::drawSplash()
 
 // Picks incoming text messages out of the FromRadio stream and files them in the
 // ring. Everything else (config, node DB, telemetry, ...) is ignored here.
+void AdvUI::onMeshPacket(const meshtastic_FromRadio &fr)
+{
+    handleFromRadio(fr);
+    uiDirty = true; // a handled packet is one of the events a frame is worth drawing for
+}
+
 void AdvUI::handleFromRadio(const meshtastic_FromRadio &fr)
 {
     if (fr.which_payload_variant != meshtastic_FromRadio_packet_tag)
@@ -2084,7 +2093,7 @@ static uint32_t sendTextPacket(uint32_t to, const char *text, int chIdx = 0, uin
     }
 
     uint32_t id = p->id;
-    service->sendToMesh(p, RX_SRC_LOCAL, false);
+    service->sendToMesh(p, RX_SRC_LOCAL, true); // ccToPhone: a connected phone mirrors our sends
     return id;
 }
 
@@ -5017,11 +5026,6 @@ int32_t AdvUI::runOnce()
     }
 #endif
 
-    while (!g_radioCompanion && api.available() && api.getFromRadio(fromRadioBuf) > 0) {
-        handleFromRadio(api.lastFromRadio()); // pick out incoming text messages (local radio mode)
-        uiDirty = true;
-    }
-
     if (g_radioCompanion) { // companion: mesh packets arrive from the BLE pump's ring
         uint8_t pbuf[512];
         uint16_t plen;
@@ -5254,11 +5258,50 @@ int32_t AdvUI::runOnce()
     return splashDone ? 200 : 80; // 5 Hz normally; snappier while the splash is up
 }
 
+// Local-mode receive path. The UI used to subscribe as a PhoneAPI client, but
+// the engine keeps ONE destructive to-phone queue shared by every client — our
+// 200 ms polling starved a real phone of live packets and admin responses
+// (initial config is per-client and worked, which made it look like a hang).
+// A module gets an independent copy of every packet and consumes nothing:
+// ProcessMessage::CONTINUE leaves the phone path untouched. loopbackOk also
+// hands us phone-SENT messages, so they finally show on the device screen
+// (the id dedupe in addMsg keeps our own sends from double-adding).
+class AdvRxModule : public MeshModule
+{
+  public:
+    explicit AdvRxModule(AdvUI *owner) : MeshModule("advrx"), ui(owner) { loopbackOk = true; }
+
+  protected:
+    bool wantPacket(const meshtastic_MeshPacket *p) override
+    {
+        if (g_radioCompanion) // companion feeds the UI over BLE; the local engine is idle
+            return false;
+        if (p->which_payload_variant != meshtastic_MeshPacket_decoded_tag)
+            return false;
+        return p->decoded.portnum == meshtastic_PortNum_TEXT_MESSAGE_APP ||
+               (p->decoded.portnum == meshtastic_PortNum_ROUTING_APP && p->decoded.request_id);
+    }
+
+    ProcessMessage handleReceived(const meshtastic_MeshPacket &mp) override
+    {
+        // Same thread as runOnce (the main loop), so calling straight into the
+        // UI pipeline is safe — this is exactly what the queue drain used to do.
+        meshtastic_FromRadio fr = meshtastic_FromRadio_init_zero;
+        fr.which_payload_variant = meshtastic_FromRadio_packet_tag;
+        fr.packet = mp;
+        ui->onMeshPacket(fr);
+        return ProcessMessage::CONTINUE; // the phone still gets its own copy
+    }
+
+    AdvUI *ui;
+};
+
 // Created once from an injected call in main.cpp (after setupModules); the
 // OSThread base then self-schedules, so no main-loop edits are needed.
 void advuiSetup()
 {
     static AdvUI advUI;
+    static AdvRxModule advRx(&advUI); // registers with the module list built in setupModules()
 }
 
 } // namespace advui

@@ -1,5 +1,6 @@
 #include "AdvUI.h"
 #include "AdvBle.h"
+#include "AdvVersion.h"
 #include "AdvFont.h"
 #include "BluetoothStatus.h"
 #include "CyrillicFont.h"
@@ -1957,6 +1958,14 @@ void AdvUI::drawSplash()
     const char *t3 = "Cardputer";
     g->setCursor((240 - g->textWidth(t3)) / 2, 112);
     g->print(t3);
+
+    // Which build is this? Saves everyone the "which version are you on"
+    // round-trip — ours from the release tag, plus the engine underneath.
+    g->setTextColor(0x630C);
+    char vline[48];
+    snprintf(vline, sizeof(vline), "%s  ·  mesh %s", ADVUI_VERSION, optstr(APP_VERSION_SHORT));
+    g->setCursor((240 - g->textWidth(vline)) / 2, 126);
+    g->print(vline);
 
     if (haveCanvas)
         canvas.pushSprite(0, 0);

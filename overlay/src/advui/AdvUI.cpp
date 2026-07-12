@@ -3066,8 +3066,29 @@ void AdvUI::drawNode()
         // chatScroll counts lines scrolled up from the bottom (0 = pinned to newest).
         int maxScroll = dlCount > maxLines ? dlCount - maxLines : 0;
         bool jumpedNow = false;
-        if (chatAnchorMsgIdx >= 0) { // first render after opening: jump to the first unread
-            if (anchorLine >= 0 && anchorLine <= maxScroll)
+        if (chatAnchorMsgIdx >= 0) { // first render after opening
+            // A short thread with only a handful of unread is effectively all on
+            // screen on open (even a wrapped 2-3-message channel is a few lines over
+            // the fold). Jumping to the first unread at the top would then strand the
+            // newest line just below the visible window, so it never gets "seen" and
+            // the channel stays unread until you scroll. Instead: pin to the newest
+            // and mark the whole thread read now. A genuine backlog (more unread than
+            // a screenful) still jumps to the first unread and clears as you read down.
+            int unread = 0;
+            for (int j = 0; j < g_msgCount; j++) {
+                const Msg &m = g_msgs[j];
+                bool match = isChan ? (m.to == NODENUM_BROADCAST && m.ch == selectedChannel)
+                                    : (m.from == selectedNum && m.to != NODENUM_BROADCAST);
+                if (match && !m.read)
+                    unread++;
+            }
+            if (unread > 0 && unread <= maxLines) { // not a backlog: read it all on open
+                chatScroll = 0;
+                if (isChan)
+                    markReadChannel(selectedChannel);
+                else
+                    markReadFrom(selectedNum);
+            } else if (anchorLine >= 0 && anchorLine <= maxScroll)
                 chatScroll = maxScroll - anchorLine;
             else if (anchorDropped)
                 chatScroll = maxScroll; // unread starts beyond the ring: as far back as we can show

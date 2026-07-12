@@ -18,6 +18,10 @@
 #include "graphics/emotes.h" // UTF-8 -> bitmap emoji table (forced in via EmotesData.cpp)
 #include "main.h" // audioThread (I2S beep)
 #include "modules/NodeInfoModule.h"
+#if HAS_WIFI
+#include "mesh/wifi/WiFiAPClient.h" // getWifiDisconnectReason()
+#include <WiFi.h>                    // live WiFi.status()/localIP()/RSSI() for the settings page
+#endif
 #ifdef HAS_NEOPIXEL
 #include "esp32-hal-rgb-led.h" // rgbLedWrite(): stateless RMT driver for the onboard RGB LED
 #include <Esp.h>
@@ -3619,6 +3623,53 @@ void AdvUI::drawNetPage()
         g->setCursor(236 - g->textWidth(v), y + 1);
         g->print(v);
     }
+
+#if HAS_WIFI
+    // Live connection status (WiFi page only): the rows above show what's configured,
+    // this shows what the radio is actually doing right now — so a wrong network or a
+    // 5 GHz SSID reads as "AP not found" on the device instead of just silently not
+    // connecting (which is exactly how it used to fail with no on-device feedback).
+    if (netPage == 0 && config.network.wifi_enabled) {
+        int sy = top + 3 * rowH + 8; // just below the 3 WiFi fields
+        g->drawFastHLine(0, sy - 6, 240, 0x39C7);
+        g->setFont(&lgfx::fonts::FreeSansBold9pt7b);
+        g->setTextSize(1);
+        g->setTextColor(0xFFFF);
+        g->setCursor(6, sy);
+        g->print("Status");
+
+        char st[24];
+        uint16_t col;
+        int ws = WiFi.status();
+        uint8_t rsn = getWifiDisconnectReason();
+        if (ws == WL_CONNECTED) {
+            col = 0x07E0; // green
+            strcpy(st, "connected");
+        } else if (ws == WL_NO_SSID_AVAIL || rsn == 201) { // 201 = NO_AP_FOUND
+            col = 0xF800;                                  // red
+            strcpy(st, "AP not found");
+        } else if (ws == WL_CONNECT_FAILED || rsn == 15 || rsn == 2) { // bad password / auth
+            col = 0xF800;
+            strcpy(st, "auth failed");
+        } else {
+            col = 0xFFE0; // yellow
+            strcpy(st, "connecting...");
+        }
+        fitWidth(g, st, 150);
+        g->setTextColor(col);
+        g->setCursor(236 - g->textWidth(st), sy);
+        g->print(st);
+
+        if (ws == WL_CONNECTED) { // second line: IP + signal once the link is up
+            char ln[40];
+            snprintf(ln, sizeof(ln), "%s  %ddBm", WiFi.localIP().toString().c_str(), (int)WiFi.RSSI());
+            g->setFont(&lgfx::fonts::Font0);
+            g->setTextColor(0x9CD3);
+            g->setCursor(6, sy + 16);
+            g->print(ln);
+        }
+    }
+#endif
 
     drawFooter(g, netDirty ? "ENTER edit   ESC save+reboot" : "ENTER edit   ESC back");
 

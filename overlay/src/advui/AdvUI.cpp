@@ -2026,8 +2026,17 @@ void AdvUI::handleFromRadio(const meshtastic_FromRadio &fr)
     }
 
     bool unread = p.from != me && (p.to == me || p.to == NODENUM_BROADCAST); // DM to us, or a channel broadcast
+    // Our own broadcasts are delivered back to us locally (loopbackOk), and that echo
+    // runs SYNCHRONOUSLY inside sendTextPacket() — before sendChannel() tags the message
+    // MSG_SENT. Storing the echo as MSG_IN would then win the id dedupe in addMsg() and
+    // the "sent" check would never draw. So stamp our own echoed sends with their real
+    // outgoing status: a channel broadcast is MSG_SENT (no ack); a DM loopback, should one
+    // ever occur, stays MSG_SENDING until its routing ACK flips it via ackMsg().
+    uint8_t status = MSG_IN;
+    if (p.from == me)
+        status = (p.to == NODENUM_BROADCAST) ? MSG_SENT : MSG_SENDING;
     // keep the id (reactions/replies reference it) and the reply link (draws the quote)
-    addMsg(p.from, p.to, p.channel, p.rx_time, unread, text, p.id, MSG_IN, p.decoded.reply_id);
+    addMsg(p.from, p.to, p.channel, p.rx_time, unread, text, p.id, status, p.decoded.reply_id);
 
     if (unread) {
         bool fav = (p.to == NODENUM_BROADCAST) ? chanFav(p.channel) : (!g_radioCompanion && nodeDB && nodeDB->isFavorite(p.from));

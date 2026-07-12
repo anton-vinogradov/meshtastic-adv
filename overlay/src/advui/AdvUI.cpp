@@ -126,13 +126,13 @@ const char *errName(uint8_t e)
 constexpr int kMaxMsgs = 32; // shared across all conversations; DMs are protected by the
                              // channel-first eviction (addMsg), not by size, so this stays small
                              // to keep the heap margin — a connected phone + BLE runs it thin
-constexpr int kNumSettings = 17; // the flat item table: Name..Channel, Role..Rebroadcast, UTC, WiFi, MQTT, Screen, Radio, Font, Clock
+constexpr int kNumSettings = 18; // the flat item table: Name..Channel, Role..Rebroadcast, UTC, WiFi, MQTT, Screen, Radio, Font, Clock, GPS
 
 // The Settings menu is two-level: the top lists sections (plus WiFi/MQTT/Radio
 // as direct entries); a section lists indices into the flat item table.
 const uint8_t kSecNode[] = {0, 1};                    // Name, Short
 const uint8_t kSecLora[] = {2, 3, 4, 5, 6, 7, 8, 9};  // Region..Rebroadcast
-const uint8_t kSecDevice[] = {10, 16, 13, 15};        // UTC, Clock, Screen, Font (read-only)
+const uint8_t kSecDevice[] = {10, 16, 13, 17, 15};    // UTC, Clock, Screen, GPS, Font (read-only)
 constexpr int kTopCount = 6;                          // Node, LoRa, WiFi, MQTT, Device, Radio
 Msg g_msgs[kMaxMsgs];
 int g_msgCount = 0;         // populated slots (grows to kMaxMsgs)
@@ -1196,6 +1196,7 @@ const EnumOpt kPowerOpts[] = {{"max (region)", 0}, {"2 dBm", 2},   {"5 dBm", 5},
                               {"14 dBm", 14},      {"17 dBm", 17}, {"20 dBm", 20}, {"22 dBm", 22}};
 const EnumOpt kRebroadOpts[] = {{"All", 0},        {"All skip decode", 1}, {"Local only", 2},
                                 {"Known only", 3}, {"Core ports only", 5}, {"None", 4}};
+const EnumOpt kGpsOpts[] = {{"On", 1}, {"Off", 0}}; // config.position.gps_mode ENABLED / DISABLED
 constexpr int kRegionCount = sizeof(kRegionOpts) / sizeof(kRegionOpts[0]);
 constexpr int kPresetCount = sizeof(kPresetOpts) / sizeof(kPresetOpts[0]);
 constexpr int kUtcCount = sizeof(kUtcOpts) / sizeof(kUtcOpts[0]);
@@ -1205,6 +1206,7 @@ constexpr int kRoleCount = sizeof(kRoleOpts2) / sizeof(kRoleOpts2[0]);
 constexpr int kHopCount = sizeof(kHopOpts) / sizeof(kHopOpts[0]);
 constexpr int kPowerCount = sizeof(kPowerOpts) / sizeof(kPowerOpts[0]);
 constexpr int kRebroadCount = sizeof(kRebroadOpts) / sizeof(kRebroadOpts[0]);
+constexpr int kGpsCount = sizeof(kGpsOpts) / sizeof(kGpsOpts[0]);
 
 // The settings list-pickers, keyed by pickTarget.
 struct PickList {
@@ -1233,6 +1235,7 @@ PickList pickListFor(int target)
     case 6: return {kHopOpts, kHopCount, "Hop limit"};
     case 7: return {kPowerOpts, kPowerCount, "TX power"};
     case 8: return {kRebroadOpts, kRebroadCount, "Rebroadcast"};
+    case 9: return {kGpsOpts, kGpsCount, "GPS"};
     default: return {kRadioOpts, kRadioCount, "Radio"};
     }
 }
@@ -3425,7 +3428,7 @@ void AdvUI::drawSettings()
     const char *labels[kNumSettings] = {"Name", "Short",       "Region", "Preset", "Frequency",
                                         "Channel", "Role",     "Hops",   "Power",  "Rebroadcast",
                                         "UTC",     "WiFi",     "MQTT",   "Screen", "Radio",
-                                        "Font",    "Clock"};
+                                        "Font",    "Clock",    "GPS"};
     char vals[kNumSettings][24];
     if (g_radioCompanion) { // rows 0-5 show (and remote-admin edit) the linked node
         meshtastic_NodeInfoLite *me = g_linkMyNode ? nodeByNum(g_linkMyNode) : nullptr;
@@ -3501,6 +3504,7 @@ void AdvUI::drawSettings()
         } else
             strcpy(vals[16], "not set");
     }
+    strcpy(vals[17], config.position.gps_mode == meshtastic_Config_PositionConfig_GpsMode_ENABLED ? "on" : "off");
 
     // What the current level shows: top = sections + direct entries (with a
     // representative value as the preview), sub = the section's flat items.
@@ -4424,6 +4428,12 @@ void AdvUI::openSetting(int item)
         pickSel = g_radioCompanion ? 1 : 0;
         pickScroll = 0;
         mode = MODE_PICKLIST;
+    } else if (item == 17) { // GPS on/off (local device position config)
+        pickTarget = 9;
+        pickSel = optIndex(kGpsOpts, kGpsCount,
+                           config.position.gps_mode == meshtastic_Config_PositionConfig_GpsMode_ENABLED ? 1 : 0);
+        pickScroll = 0;
+        mode = MODE_PICKLIST;
     } else if (item == 11 || item == 12) { // WiFi / MQTT sub-page
         netPage = item == 11 ? 0 : 1;
         netSel = 0;
@@ -4684,6 +4694,15 @@ void AdvUI::handleKey(char ch)
                 } else {
                     mode = MODE_SETTINGS;
                 }
+            } else if (pickTarget == 9) { // GPS on/off: persist + reboot so the GPS thread re-reads it
+                config.position.gps_mode = kGpsOpts[pickSel].value
+                                               ? meshtastic_Config_PositionConfig_GpsMode_ENABLED
+                                               : meshtastic_Config_PositionConfig_GpsMode_DISABLED;
+                config.has_position = true;
+                if (nodeDB)
+                    nodeDB->saveToDisk(SEGMENT_CONFIG);
+                rebootAtMsec = millis() + 1500;
+                mode = MODE_REBOOT;
             } else {
                 // Region/Preset/Role/Hops/Power/Rebroadcast: radio config, needs a
                 // reboot (ours, or the linked node's via remote admin).

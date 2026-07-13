@@ -3082,13 +3082,18 @@ void AdvUI::drawNode()
                 if (match && !m.read)
                     unread++;
             }
-            if (unread > 0 && unread <= maxLines) { // not a backlog: read it all on open
-                chatScroll = 0;
+            if (unread > 0 && unread <= maxLines) { // not a backlog: mark the whole thread read
+                // on open — including any wrapped tail below the fold — so the badge clears
+                // without a keypress. The scroll is left to the normal jump-to-first-unread
+                // below, so opening doesn't yank the view down to the last message.
                 if (isChan)
                     markReadChannel(selectedChannel);
                 else
                     markReadFrom(selectedNum);
-            } else if (anchorLine >= 0 && anchorLine <= maxScroll)
+                uiDirty = true; // the header/badge already drew as "unread" this frame — force
+                                // one more frame so it clears now, not on the next stray packet
+            }
+            if (anchorLine >= 0 && anchorLine <= maxScroll)
                 chatScroll = maxScroll - anchorLine;
             else if (anchorDropped)
                 chatScroll = maxScroll; // unread starts beyond the ring: as far back as we can show
@@ -3665,27 +3670,37 @@ void AdvUI::drawNetPage()
 
         char st[24];
         uint16_t col;
-        int ws = WiFi.status();
-        uint8_t rsn = getWifiDisconnectReason();
-        if (ws == WL_CONNECTED) {
-            col = 0x07E0; // green
-            strcpy(st, "connected");
-        } else if (ws == WL_NO_SSID_AVAIL || rsn == 201) { // 201 = NO_AP_FOUND
-            col = 0xF800;                                  // red
-            strcpy(st, "AP not found");
-        } else if (ws == WL_CONNECT_FAILED || rsn == 15 || rsn == 2) { // bad password / auth
-            col = 0xF800;
-            strcpy(st, "auth failed");
-        } else {
+        bool connected = false;
+        if (netDirty) {
+            // Edits on this page aren't live until ESC saves + reboots — the radio
+            // still runs the old config, so a WiFi.status() readout here would be
+            // misleading (it reads "connecting" while nothing is actually happening).
             col = 0xFFE0; // yellow
-            strcpy(st, "connecting...");
+            strcpy(st, "ESC to apply");
+        } else {
+            int ws = WiFi.status();
+            uint8_t rsn = getWifiDisconnectReason();
+            if (ws == WL_CONNECTED) {
+                col = 0x07E0; // green
+                strcpy(st, "connected");
+                connected = true;
+            } else if (ws == WL_NO_SSID_AVAIL || rsn == 201) { // 201 = NO_AP_FOUND
+                col = 0xF800;                                  // red
+                strcpy(st, "AP not found");
+            } else if (ws == WL_CONNECT_FAILED || rsn == 15 || rsn == 2) { // bad password / auth
+                col = 0xF800;
+                strcpy(st, "auth failed");
+            } else {
+                col = 0xFFE0; // yellow
+                strcpy(st, "connecting...");
+            }
         }
         fitWidth(g, st, 150);
         g->setTextColor(col);
         g->setCursor(236 - g->textWidth(st), sy);
         g->print(st);
 
-        if (ws == WL_CONNECTED) { // second line: IP + signal once the link is up
+        if (connected) { // second line: IP + signal once the link is up
             char ln[40];
             snprintf(ln, sizeof(ln), "%s  %ddBm", WiFi.localIP().toString().c_str(), (int)WiFi.RSSI());
             g->setFont(&lgfx::fonts::Font0);

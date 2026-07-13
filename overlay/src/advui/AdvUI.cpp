@@ -1923,11 +1923,21 @@ void AdvUI::screenSleep()
 {
     screenOn = false;
     digitalWrite(38, LOW);
-    LOG_INFO("advui: screen sleep");
+    // With the panel rail down the CPU at 240 MHz is the biggest remaining
+    // draw. Idle in the pocket runs fine at 80: on the S3 the APB bus stays at
+    // 80 MHz regardless, so LoRa SPI, I2C and BLE timing are untouched — only
+    // the core slows. On USB we're charging anyway, and full speed keeps the
+    // dev/serial tooling snappy.
+    if (!HWCDC::isPlugged()) {
+        setCpuFrequencyMhz(80);
+        LOG_INFO("advui: screen sleep, cpu 80 MHz");
+    } else
+        LOG_INFO("advui: screen sleep (on USB, cpu stays 240)");
 }
 
 void AdvUI::screenWake()
 {
+    setCpuFrequencyMhz(240); // full speed first — the panel re-init is timing-heavy
     digitalWrite(38, HIGH);
     delay(20); // let the rail settle before talking to the panel
     display.init();

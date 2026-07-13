@@ -42,6 +42,11 @@ extern volatile uint32_t g_linkRxPkts; // FromRadio packets drained so far
 extern volatile uint32_t g_linkMyNode; // my_info.my_node_num from the config stream (0 = not seen)
 extern char g_linkErr[28];             // short reason when g_linkState == BLE_FAILED
 
+// Screen-off power trim: stretch the peripheral advertising interval to ~1 s
+// (a dark device in a pocket doesn't need 100 ms discoverability); false
+// restores the stack defaults. No-op while BLE is down or a phone is connected.
+void bleAdvSlow(bool slow);
+
 void bleConnectAsync(const char *addr, uint8_t addrType); // one-shot task: connect + discover + start config
 void bleDisconnect();
 void bleSubmitPin(uint32_t pin); // answer the pairing passkey prompt

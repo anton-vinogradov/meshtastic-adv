@@ -1930,6 +1930,7 @@ void AdvUI::screenSleep()
     // dev/serial tooling snappy.
     if (!HWCDC::isPlugged()) {
         setCpuFrequencyMhz(80);
+        bleAdvSlow(true); // a pocket device doesn't need 100 ms discoverability
         LOG_INFO("advui: screen sleep, cpu 80 MHz");
     } else
         LOG_INFO("advui: screen sleep (on USB, cpu stays 240)");
@@ -1938,6 +1939,7 @@ void AdvUI::screenSleep()
 void AdvUI::screenWake()
 {
     setCpuFrequencyMhz(240); // full speed first — the panel re-init is timing-heavy
+    bleAdvSlow(false);
     digitalWrite(38, HIGH);
     delay(20); // let the rail settle before talking to the panel
     display.init();

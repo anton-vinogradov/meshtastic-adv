@@ -3627,11 +3627,16 @@ void AdvUI::drawSettings()
     int listCount;
     if (setSection < 0) {
         static const char *topNames[kTopCount] = {"Node", "LoRa", "WiFi", "MQTT", "Device", "Radio"};
-        static const uint8_t topPreview[kTopCount] = {0, 3, 11, 12, 10, 14};
+        // Sections show a ">" marker, not a value: previewing ONE of many
+        // sub-items ("LoRa: MediumFast") read as if that WAS the setting and
+        // sent people hunting in the wrong place. Direct entries (WiFi, MQTT,
+        // Radio) are single-valued, so their previews stay.
+        static const uint8_t topPreview[kTopCount] = {0, 0, 11, 12, 0, 14};
+        static const bool topIsSection[kTopCount] = {true, true, false, false, true, false};
         listCount = kTopCount;
         for (int i = 0; i < kTopCount; i++) {
             rowLabel[i] = topNames[i];
-            rowVal[i] = vals[topPreview[i]];
+            rowVal[i] = topIsSection[i] ? ">" : vals[topPreview[i]];
         }
     } else {
         const uint8_t *items = setSection == 0 ? kSecNode : setSection == 1 ? kSecLora : kSecDevice;

@@ -22,6 +22,11 @@ class AdvKeyboard : public TCA8418KeyboardBase
     void begin();           // init the TCA8418 over the keyboard I2C bus (GPIO 8/9)
     void trigger() override; // poll the FIFO; queues chars, read via hasEvent()/dequeueEvent()
 
+    // The controller answered on the bus during begin(). False on non-ADV hardware
+    // (the classic Cardputer has a GPIO matrix, no TCA8418) — the UI shows a
+    // wrong-device notice instead of a silently dead keyboard.
+    bool present() const { return found; }
+
     // The , ; . / keys double as arrows. In navigation they emit arrow codes; while
     // typing set this false so they emit their literal symbols (so '.' etc. work).
     void setNavKeys(bool on) { navKeys = on; }
@@ -35,6 +40,7 @@ class AdvKeyboard : public TCA8418KeyboardBase
     void released() override;
 
   private:
+    bool found = false;
     void updateModifierFlag(uint8_t key);
     bool isModifierKey(uint8_t key);
 

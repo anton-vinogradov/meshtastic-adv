@@ -119,6 +119,19 @@ AdvKeyboard::AdvKeyboard() : TCA8418KeyboardBase(kRows, kCols) {}
 void AdvKeyboard::begin()
 {
     Wire.begin(I2C_SDA, I2C_SCL); // keyboard bus (idempotent if the engine already did it)
+    // Probe before init: is a TCA8418 answering at all? Retry a few times — a
+    // launcher-style soft start can leave the controller mid-transaction, and
+    // one clean address cycle settles it.
+    for (int i = 0; i < 3 && !found; i++) {
+        Wire.beginTransmission(0x34);
+        found = Wire.endTransmission() == 0;
+        if (!found)
+            delay(50);
+    }
+    if (!found) {
+        LOG_ERROR("advui: no TCA8418 on the keyboard bus — classic Cardputer? This build is ADV-only");
+        return; // leave the FIFO/interrupt config untouched: there's nobody to talk to
+    }
     TCA8418KeyboardBase::begin(i2cRead, i2cWrite, 0x34);
 }
 

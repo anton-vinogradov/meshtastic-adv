@@ -61,6 +61,7 @@ class AdvUI : public concurrency::OSThread
 
     void initHardware();
     void drawSplash();
+    void drawKbMissing(); // wrong-device notice (no TCA8418 on the bus)
     void drawNodeList();
     void drawPicker();
     void drawNode();
@@ -182,6 +183,7 @@ class AdvUI : public concurrency::OSThread
     Mode btPinReturn = MODE_CHATS; // where the phone-pairing PIN screen returns
 
     bool inited = false;
+    bool kbMissing = false; // no TCA8418 found: show the wrong-device notice
     bool screenOn = true;        // display rail up; false = auto-off engaged
     uint32_t lastActivityMs = 0; // last key press, for the auto-off timer
     bool uiDirty = true;         // something changed since the last frame -> redraw

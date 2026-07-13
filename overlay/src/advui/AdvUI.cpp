@@ -126,13 +126,13 @@ const char *errName(uint8_t e)
 constexpr int kMaxMsgs = 32; // shared across all conversations; DMs are protected by the
                              // channel-first eviction (addMsg), not by size, so this stays small
                              // to keep the heap margin — a connected phone + BLE runs it thin
-constexpr int kNumSettings = 18; // the flat item table: Name..Channel, Role..Rebroadcast, UTC, WiFi, MQTT, Screen, Radio, Font, Clock, GPS
+constexpr int kNumSettings = 19; // the flat item table: Name..Channel, Role..Rebroadcast, UTC, WiFi, MQTT, Screen, Radio, Font, Clock, GPS, Sort
 
 // The Settings menu is two-level: the top lists sections (plus WiFi/MQTT/Radio
 // as direct entries); a section lists indices into the flat item table.
 const uint8_t kSecNode[] = {0, 1};                    // Name, Short
 const uint8_t kSecLora[] = {2, 3, 4, 5, 6, 7, 8, 9};  // Region..Rebroadcast
-const uint8_t kSecDevice[] = {10, 16, 13, 17, 15};    // UTC, Clock, Screen, GPS, Font (read-only)
+const uint8_t kSecDevice[] = {10, 16, 18, 13, 17, 15}; // UTC, Clock, Sort, Screen, GPS, Font (read-only)
 constexpr int kTopCount = 6;                          // Node, LoRa, WiFi, MQTT, Device, Radio
 Msg g_msgs[kMaxMsgs];
 int g_msgCount = 0;         // populated slots (grows to kMaxMsgs)
@@ -315,6 +315,12 @@ bool chanFav(int i) { return g_favChannels & (1u << i); }
 
 // User-set UTC offset (minutes) for message timestamps; the device has no GPS/tz.
 int32_t g_utcOffsetMin = 0;
+
+// Node-list sort mode (kSortOpts value), persisted in its own one-byte file so
+// the message-file header stays format-frozen. Load/save live further down,
+// after the option table that bounds the value.
+uint8_t g_nodeSort = 0;
+const char *kUiCfgPath = "/advui_ui.bin";
 int32_t g_screenOffSec = 300; // screen auto-off timeout; 0 = never
 
 // Transliterated Cyrillic input layer (Fn+L); persisted with the messages so the
@@ -1065,15 +1071,40 @@ bool nodeLess(uint16_t a, uint16_t b)
 {
     const meshtastic_NodeInfoLite *na = nodeDB->getMeshNodeByIndex(a);
     const meshtastic_NodeInfoLite *nb = nodeDB->getMeshNodeByIndex(b);
-    auto bucket = [](const meshtastic_NodeInfoLite *n) { return hasUnreadFrom(n->num) ? 0 : isFav(n) ? 1 : 2; };
-    int ba = bucket(na), bb = bucket(nb);
-    if (ba != bb)
-        return ba < bb;
+    bool ua = hasUnreadFrom(na->num), ub = hasUnreadFrom(nb->num);
+    if (ua != ub) // unread pinned on top in every mode — it's what the list is for
+        return ua;
     int ha = na->has_hops_away ? na->hops_away : 255;
     int hb = nb->has_hops_away ? nb->hops_away : 255;
-    if (ha != hb)
-        return ha < hb;
-    return na->last_heard > nb->last_heard;
+    switch (g_nodeSort) {
+    case 1: // freshest first: who's alive on the mesh right now
+        if (na->last_heard != nb->last_heard)
+            return na->last_heard > nb->last_heard;
+        break;
+    case 2: { // alphabetical, by the same name the row shows
+        int c = strcasecmp(nodeName(na), nodeName(nb));
+        if (c != 0)
+            return c < 0;
+        break;
+    }
+    case 3: // nearest first, unknown distance last
+        if (ha != hb)
+            return ha < hb;
+        if (na->last_heard != nb->last_heard)
+            return na->last_heard > nb->last_heard;
+        break;
+    default: { // smart: favourites, then nearest, then freshest
+        bool fa = isFav(na), fb = isFav(nb);
+        if (fa != fb)
+            return fa;
+        if (ha != hb)
+            return ha < hb;
+        if (na->last_heard != nb->last_heard)
+            return na->last_heard > nb->last_heard;
+        break;
+    }
+    }
+    return na->num < nb->num; // stable total order either way
 }
 
 // Trim s in place until it fits within budget px in the current font.
@@ -1188,6 +1219,30 @@ const EnumOpt kUtcOpts[] = {
 // Radio backend: local Cap LoRa, or another node's radio over BLE (companion).
 const EnumOpt kRadioOpts[] = {{"Onboard (Cap LoRa)", 0}, {"Companion via BLE", 1}};
 const EnumOpt kScreenOpts[] = {{"15 s", 15}, {"30 s", 30}, {"1 min", 60}, {"5 min", 300}, {"never", 0}};
+// Node-list order (community ask): smart mixes favourites/hops/freshness, the
+// rest are single-criterion. Unread stays pinned on top in every mode.
+const EnumOpt kSortOpts[] = {{"Smart", 0}, {"Last heard", 1}, {"Name", 2}, {"Hops", 3}};
+constexpr int kSortCount = (int)(sizeof(kSortOpts) / sizeof(kSortOpts[0]));
+
+void saveUiCfg()
+{
+    auto f = FSCom.open(kUiCfgPath, FILE_O_WRITE);
+    if (!f)
+        return;
+    f.write(&g_nodeSort, 1);
+    f.close();
+}
+
+void loadUiCfg()
+{
+    auto f = FSCom.open(kUiCfgPath, FILE_O_READ);
+    if (!f)
+        return;
+    uint8_t v = 0;
+    if (f.read(&v, 1) == 1 && v < kSortCount)
+        g_nodeSort = v;
+    f.close();
+}
 const EnumOpt kRoleOpts2[] = {{"Client", 0},      {"Client Mute", 1}, {"Client Hidden", 8},
                               {"Router", 2},      {"Router Late", 11}, {"Repeater", 4},
                               {"Tracker", 5},     {"Sensor", 6},       {"TAK", 7}};
@@ -1230,6 +1285,7 @@ PickList pickListFor(int target)
     case 0: return {kRegionOpts, kRegionCount, "Region"};
     case 1: return {kPresetOpts, kPresetCount, "Preset"};
     case 2: return {kUtcOpts, kUtcCount, "UTC offset"};
+    case 10: return {kSortOpts, kSortCount, "Node sort"};
     case 4: return {kScreenOpts, kScreenCount, "Screen off"};
     case 5: return {kRoleOpts2, kRoleCount, "Role"};
     case 6: return {kHopOpts, kHopCount, "Hop limit"};
@@ -1923,8 +1979,11 @@ void AdvUI::initHardware()
 #endif
 
     loadRadioCfg();
+    loadUiCfg();
     kb.begin();
-    LOG_INFO("advui: keyboard ready");
+    kbMissing = !kb.present(); // classic Cardputer / dead controller -> notice screen
+    if (!kbMissing)
+        LOG_INFO("advui: keyboard ready");
 
     sdFontInit(); // flash font partition (or /unifont.bin on SD) unlocks full-BMP text
     loadMsgs(); // restore the saved conversation from flash
@@ -1937,6 +1996,34 @@ void AdvUI::initHardware()
     }
     bootMs = millis();
     drawSplash(); // branded splash instead of black while the mesh comes up
+}
+
+// No TCA8418 answered on the keyboard bus: almost certainly this firmware was
+// flashed onto a classic Cardputer (GPIO-matrix keyboard) instead of the ADV.
+// Say so plainly — the engine still runs, so the phone app keeps working.
+void AdvUI::drawKbMissing()
+{
+    lgfx::LGFXBase *g = haveCanvas ? static_cast<lgfx::LGFXBase *>(&canvas) : static_cast<lgfx::LGFXBase *>(&display);
+    g->fillScreen(0x0000);
+    g->setFont(&lgfx::fonts::Font0);
+    g->setTextSize(1);
+    g->setTextColor(0xF800);
+    const char *t1 = "KEYBOARD NOT FOUND";
+    g->setCursor((240 - g->textWidth(t1)) / 2, 24);
+    g->print(t1);
+    g->setTextColor(0xFFFF);
+    const char *t2 = "This build is for the Cardputer ADV";
+    g->setCursor((240 - g->textWidth(t2)) / 2, 52);
+    g->print(t2);
+    g->setTextColor(0x8410);
+    const char *t3 = "The classic Cardputer isn't supported";
+    g->setCursor((240 - g->textWidth(t3)) / 2, 68);
+    g->print(t3);
+    const char *t4 = "Mesh engine is up: the phone app works";
+    g->setCursor((240 - g->textWidth(t4)) / 2, 96);
+    g->print(t4);
+    if (haveCanvas)
+        canvas.pushSprite(0, 0);
 }
 
 void AdvUI::drawSplash()
@@ -3454,7 +3541,7 @@ void AdvUI::drawSettings()
     const char *labels[kNumSettings] = {"Name", "Short",       "Region", "Preset", "Frequency",
                                         "Channel", "Role",     "Hops",   "Power",  "Rebroadcast",
                                         "UTC",     "WiFi",     "MQTT",   "Screen", "Radio",
-                                        "Font",    "Clock",    "GPS"};
+                                        "Font",    "Clock",    "GPS",    "Sort"};
     char vals[kNumSettings][24];
     if (g_radioCompanion) { // rows 0-5 show (and remote-admin edit) the linked node
         meshtastic_NodeInfoLite *me = g_linkMyNode ? nodeByNum(g_linkMyNode) : nullptr;
@@ -3531,6 +3618,7 @@ void AdvUI::drawSettings()
             strcpy(vals[16], "not set");
     }
     strcpy(vals[17], config.position.gps_mode == meshtastic_Config_PositionConfig_GpsMode_ENABLED ? "on" : "off");
+    strcpy(vals[18], kSortOpts[g_nodeSort < kSortCount ? g_nodeSort : 0].name);
 
     // What the current level shows: top = sections + direct entries (with a
     // representative value as the preview), sub = the section's flat items.
@@ -3842,7 +3930,10 @@ void AdvUI::drawBtPin()
 
     char pin[16] = "";
     if (bluetoothStatus->getConnectionState() == meshtastic::BluetoothStatus::ConnectionState::PAIRING)
-        snprintf(pin, sizeof(pin), "%s", bluetoothStatus->getPasskey().c_str());
+        // The engine stores the passkey via std::to_string, which drops leading
+        // zeros (its own screen re-pads with %06u; the status string doesn't).
+        // A "1234" shown for passkey 001234 makes the phone reject the pairing.
+        snprintf(pin, sizeof(pin), "%06u", (unsigned)strtoul(bluetoothStatus->getPasskey().c_str(), nullptr, 10));
     g->setFont(&lgfx::fonts::FreeSansBold9pt7b);
     g->setTextSize(2);
     g->setTextColor(0xFFFF);
@@ -4448,6 +4539,11 @@ void AdvUI::openSetting(int item)
         pickSel = optIndex(kUtcOpts, kUtcCount, g_utcOffsetMin);
         pickScroll = 0;
         mode = MODE_PICKLIST;
+    } else if (item == 18) { // node-list sort -> mode picker
+        pickTarget = 10;
+        pickSel = optIndex(kSortOpts, kSortCount, (int)g_nodeSort);
+        pickScroll = 0;
+        mode = MODE_PICKLIST;
     } else if (item == 16) { // manual clock -> HH:MM entry (applied in applyName)
         editTarget = 4;
         nameBuf[0] = 0;
@@ -4704,7 +4800,11 @@ void AdvUI::handleKey(char ch)
             if (pickSel < cnt - 1)
                 pickSel++;
         } else if (enter) {
-            if (pickTarget == 4) { // screen auto-off: applied live, persisted with msgs
+            if (pickTarget == 10) { // node-list sort: applied live, own tiny file
+                g_nodeSort = (uint8_t)kSortOpts[pickSel].value;
+                saveUiCfg();
+                mode = MODE_SETTINGS;
+            } else if (pickTarget == 4) { // screen auto-off: applied live, persisted with msgs
                 g_screenOffSec = kScreenOpts[pickSel].value;
                 g_msgsDirty = true;
                 mode = MODE_SETTINGS;
@@ -5380,6 +5480,8 @@ int32_t AdvUI::runOnce()
 
     if (!splashDone)
         drawSplash();
+    else if (kbMissing)
+        drawKbMissing(); // wrong device: a clear notice beats a dead keyboard
     else if (mode == MODE_PICKER)
         drawPicker();
     else if (mode == MODE_NODE || mode == MODE_COMPOSE)

@@ -60,7 +60,12 @@ The easiest way is the **[web installer](https://anton-vinogradov.github.io/mesh
 3. Click **Install**. If the device isn't listed, hold **G0/BOOT** while connecting, then release.
 4. After flashing, long-press **ESC** → set your **Region** and **UTC**.
 
-Prefer the CLI? Grab `firmware.factory.bin` from the [latest release](https://github.com/anton-vinogradov/meshtastic-adv/releases) and flash at offset `0x0` with esptool; add `unifont.bin` at `0x340000` for the full-Unicode font (or drop it on the SD card root instead).
+**No computer?** Two on-device paths:
+
+- **M5Launcher catalog** — in the launcher's online-install (OTA) menu, find **Meshtastic ADV** and install from there: the catalog entry is a complete merged image and the launcher places everything correctly. Same firmware is in **M5Burner** (Cardputer category).
+- **M5Launcher from SD card** — use `meshtastic-adv-cardputer-adv-merged.bin` from the [latest release](https://github.com/anton-vinogradov/meshtastic-adv/releases) and flash it as a **full firmware** (written to address `0x0`, replacing the launcher) — *not* as an app/OTA install. An app-slot install runs this firmware on the launcher's partition layout, which ends in restarts and a dead keyboard. Don't use `factory.bin` here: it lacks the Unicode font.
+
+Prefer the CLI? Grab `firmware.factory.bin` from the [latest release](https://github.com/anton-vinogradov/meshtastic-adv/releases) and flash at offset `0x0` with esptool; add `unifont.bin` at `0x340000` for the full-Unicode font (or drop it on the SD card root instead) — or just take `meshtastic-adv-cardputer-adv-merged.bin`, which is both in one file.
 
 ## How to drive it
 

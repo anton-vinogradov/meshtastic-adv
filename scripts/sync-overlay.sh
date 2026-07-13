@@ -44,14 +44,27 @@ if [ -f "$MC" ] && ! grep -q 'advui-inject' "$MC"; then
   echo "injected advui hooks into main.cpp"
 fi
 
-# SerialConsole.cpp: in the ADVUI_SCREENSHOT dev build the remote-debug driver
-# owns serial input (keys/screenshots); the stock console polls-and-drains the
-# same port whenever USB is plugged and would eat those bytes. Dead code in
-# release builds (the flag is never set there).
+# SerialConsole.cpp, two independent injections:
+#  1. in the ADVUI_SCREENSHOT dev build the remote-debug driver owns serial
+#     input (keys/screenshots); the stock console polls-and-drains the same
+#     port whenever USB is plugged and would eat those bytes. Dead code in
+#     release builds (the flag is never set there).
+#  2. the boot-time zero TX timeout (main.cpp injection above) makes USB-CDC
+#     writes droppable: under pressure HWCDC::write() returns short, and a
+#     PhoneAPI frame cut mid-body corrupts the whole stream for the client
+#     ("Wire format was corrupt" in the python lib). While an API client is
+#     on the line it IS draining the port, so blocking writes are cheap —
+#     switch to them on the first ToRadio protobuf, and fall back to the
+#     non-blocking boot behavior once the client goes away.
 SC="$FW/src/SerialConsole.cpp"
-if [ -f "$SC" ] && ! grep -q 'advui-inject' "$SC"; then
+if [ -f "$SC" ] && ! grep -q 'the screenshot build reads serial itself' "$SC"; then
   perl -0pi -e 's{(int32_t SerialConsole::runOnce\(\)\n\{\n)}{$1#ifdef ADVUI_SCREENSHOT\n    return 250; // advui-inject: the screenshot build reads serial itself\n#endif\n}' "$SC"
-  echo "injected advui hook into SerialConsole.cpp"
+  echo "injected advui screenshot hook into SerialConsole.cpp"
+fi
+if [ -f "$SC" ] && ! grep -q 'advui-inject-txto' "$SC"; then
+  perl -0pi -e 's{(usingProtobufs = true;\n        canWrite = true;\n)}{$1#ifdef IS_USB_SERIAL\n        // advui-inject-txto: an API client is draining the CDC, so blocking\n        // writes are cheap and keep PhoneAPI frames whole; with the boot-time\n        // zero timeout a frame cut short by a full TX ring corrupts the stream.\n        Port.setTxTimeoutMs(50);\n#endif\n}' "$SC"
+  perl -0pi -e 's{(\n    int32_t delay = runOncePart\(\);)}{\n#ifdef IS_USB_SERIAL\n    if (!checkIsConnected())\n        Port.setTxTimeoutMs(0); // advui-inject-txto: client gone -> non-blocking boot behavior\n#endif$1}' "$SC"
+  echo "injected advui tx-timeout hooks into SerialConsole.cpp"
 fi
 
 echo "overlay synced into $FW"

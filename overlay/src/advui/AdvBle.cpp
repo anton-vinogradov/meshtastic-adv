@@ -370,6 +370,31 @@ void connectTask(void *)
 
 } // namespace
 
+void bleAdvSlow(bool slow)
+{
+    static bool slowed = false;
+    if (slow == slowed)
+        return; // idempotent: don't churn advertising on every wake
+    if (!BLEDevice::getInitialized())
+        return; // BLE is off (e.g. WiFi mode): nothing to trim
+    BLEServer *srv = BLEDevice::getServer();
+    if (slow && srv && srv->getConnectedCount() > 0)
+        return; // a phone is on the line: advertising isn't the draw right now
+    BLEAdvertising *adv = BLEDevice::getAdvertising();
+    if (!adv)
+        return;
+    bool was = adv->isAdvertising();
+    if (was)
+        adv->stop();
+    // Units of 0.625 ms: ~1.0-1.2 s asleep, 0 = the stack's fast defaults.
+    adv->setMinInterval(slow ? 1600 : 0);
+    adv->setMaxInterval(slow ? 1920 : 0);
+    if (was)
+        adv->start(0);
+    slowed = slow;
+    LOG_INFO("advui: ble advertising %s", slow ? "slowed for sleep" : "restored");
+}
+
 void bleCompanionInit()
 {
     if (g_bleInited)

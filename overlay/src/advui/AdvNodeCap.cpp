@@ -9,7 +9,14 @@
 // NodeInfoLite vector costs is exactly the DRAM the BLE central + SMP pairing
 // need. 32 slots still fit our own entry plus any favourites, so switching
 // back to onboard LoRa keeps them (the rest of the mesh is re-learned off the
-// air). Local mode keeps the stock flash-size tiering.
+// air).
+//
+// Local mode does NOT follow the stock flash-size tiering: this board has 16 MB
+// flash but no PSRAM, so DRAM — not flash — is the ceiling. The stock 250-node
+// tier is a ~40 KB NodeInfoLite vector, and that is exactly what tips a
+// WiFi+HTTPS build into out-of-memory reboots on a busy mesh. Cap the hot store
+// at 150 (matches WARM_NODE_COUNT, so each evicted node keeps exactly one warm
+// slot and DMs to it still decrypt); the tail lives in the flash warm tier.
 //
 // Runs from NodeDB's constructor — after fsInit(), long before the UI loads
 // its radio config — so it reads /advui_radio.bin (AVR1) directly.
@@ -35,7 +42,7 @@ int advui_max_num_nodes()
         cached = 32;
     } else {
         uint32_t flashMb = ESP.getFlashChipSize() / (1024 * 1024);
-        cached = flashMb >= 15 ? 250 : flashMb >= 7 ? 200 : 100;
+        cached = flashMb >= 7 ? 150 : 100;
     }
     return cached;
 }

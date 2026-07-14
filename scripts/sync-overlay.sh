@@ -67,4 +67,41 @@ if [ -f "$SC" ] && ! grep -q 'advui-inject-txto' "$SC"; then
   echo "injected advui tx-timeout hooks into SerialConsole.cpp"
 fi
 
+# WebServer.cpp + ContentHandler.cpp: drop the HTTPS/TLS server, keep HTTP:80.
+# The self-signed RSA-2048 cert plus mbedTLS session state costs tens of KB of
+# heap on this no-PSRAM board — the stock code already logs "skipping HTTPS
+# processing" under memory pressure, and every local tool talks to :80 anyway.
+# Nulling secureServer leans on the stock `if (secureServer)` guards around
+# loop()/start(); the handler-registration block (unguarded upstream) is wrapped
+# to match, and the cert generator is short-circuited so a clean install never
+# spends the RSA-keygen heap spike on a tight heap.
+WS="$FW/src/mesh/http/WebServer.cpp"
+if [ -f "$WS" ] && ! grep -q 'advui-inject-nohttps' "$WS"; then
+  perl -0pi -e 's{secureServer = new HTTPSServer\(cert, 443, MAX_HTTPS_CONNECTIONS\);}{secureServer = nullptr; // advui-inject-nohttps: HTTPS off, keep HTTP:80 -> frees tens of KB heap}' "$WS"
+  perl -0pi -e 's{(void createSSLCert\(\)\n\{\n)}{$1    return; // advui-inject-nohttps: HTTPS disabled, skip the RSA-2048 self-signed cert gen\n}' "$WS"
+  echo "injected advui no-HTTPS hooks into WebServer.cpp"
+fi
+CH="$FW/src/mesh/http/ContentHandler.cpp"
+if [ -f "$CH" ] && ! grep -q 'advui-inject-nohttps' "$CH"; then
+  # @-delimited: the replacement carries C++ braces, which would unbalance s{}{}.
+  perl -0pi -e 's@(    secureServer->registerNode\(nodeAPIv1ToRadioOptions\);)@    if (secureServer) { // advui-inject-nohttps: HTTPS server is not created\n$1@' "$CH"
+  perl -0pi -e 's@(    secureServer->registerNode\(nodeRoot\); // This has to be last\n)@$1    } // advui-inject-nohttps\n@' "$CH"
+  echo "injected advui no-HTTPS guard into ContentHandler.cpp"
+fi
+
+# NodeDB.cpp: saveNodeDatabaseToDisk() stages the four satellite maps into
+# on-disk vectors with reserve() calls that each want a contiguous multi-KB
+# block. On this no-PSRAM board under a busy mesh the heap can be ground low
+# enough that std::bad_alloc escapes to std::terminate and reboots the node
+# mid-operation — which, when it lands during a PhoneAPI config dump (a save is
+# triggered by every incoming NodeInfo), is exactly what stops the dump from
+# ever reaching config_complete_id. Wrap the staging in a bad_alloc catch that
+# defers the save (returns true, not false — false would send saveToDisk() down
+# its retry/fsFormat path). Applied as a patch: it spans two hunks.
+ND="$FW/src/mesh/NodeDB.cpp"
+if [ -f "$ND" ] && ! grep -q 'advui-inject-oomsave' "$ND"; then
+  git -C "$FW" apply "$ROOT/overlay/patches/nodedb-oom-save.patch"
+  echo "injected advui oom-save patch into NodeDB.cpp"
+fi
+
 echo "overlay synced into $FW"

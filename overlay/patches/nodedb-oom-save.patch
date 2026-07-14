@@ -1,0 +1,42 @@
+diff --git a/src/mesh/NodeDB.cpp b/src/mesh/NodeDB.cpp
+index 3e877a57c..9a6398d8f 100644
+--- a/src/mesh/NodeDB.cpp
++++ b/src/mesh/NodeDB.cpp
+@@ -2779,6 +2779,15 @@ bool NodeDB::saveNodeDatabaseToDisk()
+     // Project the maps into the on-disk vectors just before encoding; cleared
+     // again on the way out so we don't carry duplicate state.
+     concurrency::LockGuard guard(&satelliteMutex);
++    // advui-inject-oomsave: the four reserve() calls below each want a
++    // contiguous multi-KB block (~200 entries per map); on a heap ground down
++    // to a few KB the resulting std::bad_alloc was escaping to std::terminate
++    // and rebooting the node mid-operation. Defer the save instead - the next
++    // cadence retries with whatever the heap looks like then. Returning true,
++    // not false: false sends saveToDisk() down its retry/format path.
++#if defined(__cpp_exceptions) || defined(__EXCEPTIONS)
++    try {
++#endif
+ #if !MESHTASTIC_EXCLUDE_POSITIONDB
+     nodeDatabase.positions.clear();
+     nodeDatabase.positions.reserve(nodePositions.size());
+@@ -2834,6 +2843,21 @@ bool NodeDB::saveNodeDatabaseToDisk()
+ #else
+     nodeDatabase.status.clear();
+ #endif
++#if defined(__cpp_exceptions) || defined(__EXCEPTIONS)
++    } catch (const std::bad_alloc &) {
++        // advui-inject-oomsave: heap too tight to stage the satellite data.
++        nodeDatabase.positions.clear();
++        nodeDatabase.positions.shrink_to_fit();
++        nodeDatabase.telemetry.clear();
++        nodeDatabase.telemetry.shrink_to_fit();
++        nodeDatabase.environment.clear();
++        nodeDatabase.environment.shrink_to_fit();
++        nodeDatabase.status.clear();
++        nodeDatabase.status.shrink_to_fit();
++        LOG_WARN("NodeDB save deferred: heap too low to stage satellite data");
++        return true;
++    }
++#endif
+ 
+     size_t nodeDatabaseSize;
+     pb_get_encoded_size(&nodeDatabaseSize, meshtastic_NodeDatabase_fields, &nodeDatabase);

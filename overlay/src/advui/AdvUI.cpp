@@ -458,6 +458,14 @@ void drawBtGlyph(lgfx::LGFXBase *g, int x, int y, uint16_t color)
     g->drawLine(x + 6, y + 6, x, y + 2, color);
 }
 
+// Charging bolt: two wedges, the classic lightning zigzag. 5x9 to sit level with
+// the header text.
+void drawBoltGlyph(lgfx::LGFXBase *g, int x, int y, uint16_t color)
+{
+    g->fillTriangle(x + 4, y, x, y + 5, x + 3, y + 5, color);
+    g->fillTriangle(x + 1, y + 9, x + 4, y + 4, x + 1, y + 4, color);
+}
+
 uint16_t linkColor()
 {
     switch (g_linkState) {
@@ -1499,19 +1507,44 @@ void drawFooter(lgfx::LGFXBase *g, const char *hint, uint16_t color = 0x630c)
     g->print(hint);
 }
 
-// Own battery as short text + colour ("87%", "64%+" charging, "USB" when none).
+// Own battery as short text + colour ("87%", "USB" when there is no battery).
+// Charging is the bolt drawn beside it, not a "+" glued to the number: at this
+// size a lone plus reads as part of the percentage.
 void batteryText(char *out, size_t cap, uint16_t &col)
 {
     if (powerStatus && powerStatus->getHasBattery()) {
         int pct = powerStatus->getBatteryChargePercent();
         if (pct > 100)
             pct = 100;
-        snprintf(out, cap, "%d%%%s", pct, powerStatus->getIsCharging() ? "+" : "");
+        snprintf(out, cap, "%d%%", pct);
         col = pct > 50 ? 0x07E0 : (pct > 20 ? 0xFFE0 : 0xF800);
     } else {
         snprintf(out, cap, "USB");
         col = 0x9CD3;
     }
+}
+
+bool batteryCharging()
+{
+    return powerStatus && powerStatus->getHasBattery() && powerStatus->getIsCharging();
+}
+
+// Battery percentage right-aligned on `right`, with the charging bolt to its
+// left. Returns the width the whole block took, so the caller can park the
+// unread badge clear of it.
+int drawBattery(lgfx::LGFXBase *g, int right, int y)
+{
+    char buf[10];
+    uint16_t col;
+    batteryText(buf, sizeof(buf), col);
+    int tw = g->textWidth(buf);
+    g->setTextColor(col);
+    g->setCursor(right - tw, y);
+    g->print(buf);
+    if (!batteryCharging())
+        return tw;
+    drawBoltGlyph(g, right - tw - 7, y - 1, 0xFFE0); // amber bolt: on the charger
+    return tw + 7;
 }
 
 // Delivery-status glyph for an outgoing message, drawn at the right of its line.
@@ -2622,18 +2655,12 @@ void AdvUI::drawChats()
 
     g->setFont(&lgfx::fonts::Font0);
     g->setTextSize(1);
-    char bbuf[10];
-    uint16_t bcol;
-    batteryText(bbuf, sizeof(bbuf), bcol);
     g->setTextColor(0x07FF);
     g->setCursor(4, 3);
     g->print("Chats");
     if (g_radioCompanion)
         drawBtGlyph(g, 40, 2, linkColor()); // companion link state at a glance
-    int bw = g->textWidth(bbuf);
-    g->setTextColor(bcol);
-    g->setCursor(238 - bw, 3);
-    g->print(bbuf);
+    int bw = drawBattery(g, 238, 3);
     int uc = unreadCount();
     if (uc > 0) {
         char ub[12];
@@ -2802,10 +2829,6 @@ void AdvUI::drawNodeList()
     g->setFont(&lgfx::fonts::Font0); // header stays on the compact bitmap font
     g->setTextSize(1);
 
-    char bbuf[10];
-    uint16_t bcol;
-    batteryText(bbuf, sizeof(bbuf), bcol);
-
     g->setTextColor(0x07FF); // cyan
     g->setCursor(4, 3);
     // "+" only in the fallback mode, when even the warm tier is pinned at its
@@ -2815,10 +2838,7 @@ void AdvUI::drawNodeList()
     else
         g->printf("%u%s nodes", (unsigned)total, total >= cap ? "+" : "");
 
-    int bw = g->textWidth(bbuf);
-    g->setTextColor(bcol);
-    g->setCursor(238 - bw, 3);
-    g->print(bbuf);
+    int bw = drawBattery(g, 238, 3);
 
     int uc = unreadCount();
     if (uc > 0) {

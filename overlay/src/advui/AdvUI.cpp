@@ -458,12 +458,15 @@ void drawBtGlyph(lgfx::LGFXBase *g, int x, int y, uint16_t color)
     g->drawLine(x + 6, y + 6, x, y + 2, color);
 }
 
-// Charging bolt: two wedges, the classic lightning zigzag. 5x9 to sit level with
-// the header text.
+// Charging bolt, drawn scanline by scanline so the zigzag is exact at this size:
+// the upper stroke falls to the left, the waist juts back out, the lower stroke
+// falls again to the point. 5x7, sitting level with the header text.
 void drawBoltGlyph(lgfx::LGFXBase *g, int x, int y, uint16_t color)
 {
-    g->fillTriangle(x + 4, y, x, y + 5, x + 3, y + 5, color);
-    g->fillTriangle(x + 1, y + 9, x + 4, y + 4, x + 1, y + 4, color);
+    static const uint8_t kRows[][2] = {// {first pixel, width} per row
+                                       {3, 2}, {2, 2}, {1, 2}, {0, 5}, {2, 2}, {1, 2}, {0, 2}};
+    for (size_t i = 0; i < sizeof(kRows) / sizeof(kRows[0]); i++)
+        g->drawFastHLine(x + kRows[i][0], y + (int)i, kRows[i][1], color);
 }
 
 uint16_t linkColor()
@@ -1137,23 +1140,38 @@ int sigLevel(const meshtastic_NodeInfoLite *n)
     return 1;
 }
 
+// Two-letter role code: one per distinct role (the old 3-letter tags collapsed
+// every client and every router variant together, hiding mute/hidden/base and
+// router/late). Two chars leaves a column free for the unmessageable marker.
 const char *roleTag(const meshtastic_NodeInfoLite *n)
 {
     switch (n->role) {
+    case meshtastic_Config_DeviceConfig_Role_CLIENT_MUTE:
+        return "CM";
+    case meshtastic_Config_DeviceConfig_Role_CLIENT_HIDDEN:
+        return "CH";
+    case meshtastic_Config_DeviceConfig_Role_CLIENT_BASE:
+        return "CB";
     case meshtastic_Config_DeviceConfig_Role_ROUTER:
+        return "RE";
     case meshtastic_Config_DeviceConfig_Role_ROUTER_CLIENT:
+        return "RC";
     case meshtastic_Config_DeviceConfig_Role_ROUTER_LATE:
-        return "RTR";
+        return "RL";
     case meshtastic_Config_DeviceConfig_Role_REPEATER:
-        return "RPT";
+        return "RO";
     case meshtastic_Config_DeviceConfig_Role_TRACKER:
-        return "TRK";
+        return "TR";
+    case meshtastic_Config_DeviceConfig_Role_TAK_TRACKER:
+        return "TT";
     case meshtastic_Config_DeviceConfig_Role_SENSOR:
-        return "SEN";
+        return "SE";
     case meshtastic_Config_DeviceConfig_Role_TAK:
-        return "TAK";
+        return "TK";
+    case meshtastic_Config_DeviceConfig_Role_LOST_AND_FOUND:
+        return "LF";
     default:
-        return "CLI";
+        return "CL";
     }
 }
 
@@ -1468,8 +1486,17 @@ void drawNodeRow(lgfx::LGFXBase *g, const meshtastic_NodeInfoLite *n, int y, boo
     g->setCursor(xAgeR - (int)strlen(abuf) * cw, metaY);
     g->print(abuf);
 
+    // Role code, with a red "x" in the column the two-letter tag freed when the
+    // node can't be messaged (unmessagable) — you can't DM it, so the list says so.
+    int roleX = xRole;
+    if (nodeInfoLiteIsUnmessagable(n)) {
+        g->setTextColor(0xF800); // red
+        g->setCursor(roleX, metaY);
+        g->print("x");
+        roleX += cw;
+    }
     g->setTextColor(0x8410); // gray
-    g->setCursor(xRole, metaY);
+    g->setCursor(roleX, metaY);
     g->print(roleTag(n));
 
     // envelope marker for a node with unread messages, before the name
@@ -1524,9 +1551,18 @@ void batteryText(char *out, size_t cap, uint16_t &col)
     }
 }
 
+// This board has no charge-detect hardware — only a voltage divider on
+// BATTERY_PIN. The engine infers charging from the pack voltage crossing a
+// threshold (Power.cpp: getBattVoltage() > chargingVolt), which only trips once
+// the battery is nearly full: plug the cable in at 60% and the stock flag stays
+// false. A live USB host is the honest "power is coming in" signal, so take
+// either. (A dumb charger enumerates no host, and there falls back to the
+// voltage rule — the best this hardware allows.)
 bool batteryCharging()
 {
-    return powerStatus && powerStatus->getHasBattery() && powerStatus->getIsCharging();
+    if (!powerStatus || !powerStatus->getHasBattery())
+        return false;
+    return powerStatus->getIsCharging() || HWCDC::isPlugged();
 }
 
 // Battery percentage right-aligned on `right`, with the charging bolt to its
@@ -3513,6 +3549,16 @@ bool AdvUI::applyName()
         if (hh < 0 || hh > 23 || mm < 0 || mm > 59)
             return false; // unparsable: back to Settings, row still shows "not set"
         int64_t utc = (int64_t)buildDateEpoch() + hh * 3600 + mm * 60 - (int64_t)g_utcOffsetMin * 60;
+#ifdef BUILD_EPOCH
+        // perhapsSetRTC() silently refuses any time before the firmware build moment
+        // (BUILD_EPOCH) — even with forceUpdate, the check runs first. buildDateEpoch()
+        // is midnight of the build DATE, so a local HH:MM in the small hours maps to a
+        // UTC instant before that moment and is rejected: the reported "00:10 won't
+        // stick, 12:10 does". Roll the date forward whole days until the instant is at
+        // or after the build epoch — same HH:MM, nearest date the RTC will accept.
+        while (utc < (int64_t)BUILD_EPOCH)
+            utc += 86400;
+#endif
         struct timeval tv = {(time_t)utc, 0};
         perhapsSetRTC(RTCQualityDevice, &tv, true); // Device quality: phone/mesh still outrank it
         return false;

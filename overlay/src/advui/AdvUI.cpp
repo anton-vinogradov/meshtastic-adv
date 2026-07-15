@@ -3614,6 +3614,12 @@ void AdvUI::drawSettings()
                             : setSection == 1 ? " / LoRa"
                             : setSection == 2 ? " / Device"
                                               : "");
+    if (setSection < 0) { // app version, right-aligned on the header of the top menu
+        const char *ver = ADVUI_VERSION;
+        g->setTextColor(0x8410); // gray
+        g->setCursor(236 - (int)strlen(ver) * 6, 3);
+        g->print(ver);
+    }
     g->drawFastHLine(0, 13, 240, 0x39C7);
 
     const char *labels[kNumSettings] = {"Name", "Short",       "Region", "Preset", "Frequency",

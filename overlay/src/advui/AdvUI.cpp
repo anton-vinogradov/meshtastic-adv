@@ -1250,12 +1250,21 @@ const EnumOpt kScreenOpts[] = {{"15 s", 15}, {"30 s", 30}, {"1 min", 60}, {"5 mi
 const EnumOpt kSortOpts[] = {{"Smart", 0}, {"Last heard", 1}, {"Name", 2}, {"Hops", 3}};
 constexpr int kSortCount = (int)(sizeof(kSortOpts) / sizeof(kSortOpts[0]));
 
+// Last percentage read while NOT charging. Shown in place of the live reading
+// whenever USB is in — this board has no fuel gauge, so under charge the
+// terminal voltage sits near full and the OCV table reads ~100% no matter the
+// real charge (the "100% on USB, 58% on battery" surprise). Persisted so a
+// boot on USB shows the last honest figure instead of a fresh lie. -1 = unknown.
+int g_battRest = -1;
+
 void saveUiCfg()
 {
     auto f = FSCom.open(kUiCfgPath, FILE_O_WRITE);
     if (!f)
         return;
     f.write(&g_nodeSort, 1);
+    int8_t b = (int8_t)g_battRest; // -1 when never sampled off-charge
+    f.write((uint8_t *)&b, 1);
     f.close();
 }
 
@@ -1267,6 +1276,9 @@ void loadUiCfg()
     uint8_t v = 0;
     if (f.read(&v, 1) == 1 && v < kSortCount)
         g_nodeSort = v;
+    int8_t b = -1;
+    if (f.read((uint8_t *)&b, 1) == 1 && b >= 0 && b <= 100)
+        g_battRest = b;
     f.close();
 }
 const EnumOpt kRoleOpts2[] = {{"Client", 0},      {"Client Mute", 1}, {"Client Hidden", 8},
@@ -1537,12 +1549,18 @@ void drawFooter(lgfx::LGFXBase *g, const char *hint, uint16_t color = 0x630c)
 // Own battery as short text + colour ("87%", "USB" when there is no battery).
 // Charging is the bolt drawn beside it, not a "+" glued to the number: at this
 // size a lone plus reads as part of the percentage.
+bool batteryCharging();
+
 void batteryText(char *out, size_t cap, uint16_t &col)
 {
     if (powerStatus && powerStatus->getHasBattery()) {
         int pct = powerStatus->getBatteryChargePercent();
         if (pct > 100)
             pct = 100;
+        // Under charge the voltage-derived % is meaningless (see g_battRest); show
+        // the last honest off-charge figure instead so it doesn't jump to a fake full.
+        if (batteryCharging() && g_battRest >= 0)
+            pct = g_battRest;
         snprintf(out, cap, "%d%%", pct);
         col = pct > 50 ? 0x07E0 : (pct > 20 ? 0xFFE0 : 0xF800);
     } else {
@@ -1552,17 +1570,20 @@ void batteryText(char *out, size_t cap, uint16_t &col)
 }
 
 // This board has no charge-detect hardware — only a voltage divider on
-// BATTERY_PIN. The engine infers charging from the pack voltage crossing a
-// threshold (Power.cpp: getBattVoltage() > chargingVolt), which only trips once
-// the battery is nearly full: plug the cable in at 60% and the stock flag stays
-// false. A live USB host is the honest "power is coming in" signal, so take
-// either. (A dumb charger enumerates no host, and there falls back to the
-// voltage rule — the best this hardware allows.)
+// BATTERY_PIN. Three imperfect signals, OR'ed:
+//  - the stock flag is `getBattVoltage() > chargingVolt` where chargingVolt =
+//    (OCV[0]+10) = exactly 4200; a dumb charger that parks the rail AT 4.200 V
+//    (field-observed) misses the strict '>' forever;
+//  - HWCDC::isPlugged() sees only a USB HOST — true for a computer, false for
+//    wall chargers and data-less cables;
+//  - so also accept a reading a hair under that threshold (>= 4195): only a
+//    charger holds the terminal that high; a full cell resting tops out at
+//    OCV[0] = 4190 and sags from there under any load.
 bool batteryCharging()
 {
     if (!powerStatus || !powerStatus->getHasBattery())
         return false;
-    return powerStatus->getIsCharging() || HWCDC::isPlugged();
+    return powerStatus->getIsCharging() || HWCDC::isPlugged() || powerStatus->getBatteryVoltageMv() >= 4195;
 }
 
 // Battery percentage right-aligned on `right`, with the charging bolt to its
@@ -5301,6 +5322,20 @@ int32_t AdvUI::runOnce()
             loggedMin = mn;
             LOG_WARN("advui: heap new low free=%u min=%u largest=%u", (unsigned)ESP.getFreeHeap(), (unsigned)mn,
                      (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_8BIT));
+        }
+    }
+
+    { // Sample the honest (off-charge) battery % every 30 s and persist it when it
+      // moves, so the header can show a real figure while USB hides the true charge.
+        static uint32_t lastBattMs = 0;
+        if (powerStatus && powerStatus->getHasBattery() && !batteryCharging() &&
+            (!lastBattMs || millis() - lastBattMs > 30000)) {
+            lastBattMs = millis();
+            int p = powerStatus->getBatteryChargePercent();
+            if (p >= 0 && p <= 100 && p != g_battRest) {
+                g_battRest = p;
+                saveUiCfg();
+            }
         }
     }
 

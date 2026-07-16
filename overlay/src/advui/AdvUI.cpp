@@ -1586,11 +1586,31 @@ bool batteryCharging()
     return powerStatus->getIsCharging() || HWCDC::isPlugged() || powerStatus->getBatteryVoltageMv() >= 4195;
 }
 
-// Battery percentage right-aligned on `right`, with the charging bolt to its
-// left. Returns the width the whole block took, so the caller can park the
-// unread badge clear of it.
+// Battery block right-aligned on `right`; returns the width it took so the
+// caller can park the unread badge clear of it.
+//
+// While charging the percentage is withheld: the only sensor is terminal
+// voltage, and under charge current it reads OCV + polarization — the number
+// pegs near 100% from the first minute (field-tested at ~20% real charge).
+// The one honest statement charging voltage CAN make is "done": once the
+// terminal holds float level (>= 4250, full-charge sits at ~4260-4280 here),
+// show 100% beside the bolt. On battery the voltage reading is honest, so the
+// percentage returns.
 int drawBattery(lgfx::LGFXBase *g, int right, int y)
 {
+    if (batteryCharging()) {
+        bool full = powerStatus && powerStatus->getBatteryVoltageMv() >= 4250;
+        int tw = 0;
+        if (full) {
+            g->setTextColor(0x07E0); // green: genuinely done
+            tw = g->textWidth("100%");
+            g->setCursor(right - tw, y);
+            g->print("100%");
+            tw += 7; // bolt joins to the left
+        }
+        drawBoltGlyph(g, right - (full ? tw : 5), y - 1, 0xFFE0);
+        return full ? tw : 5;
+    }
     char buf[10];
     uint16_t col;
     batteryText(buf, sizeof(buf), col);
@@ -1598,10 +1618,7 @@ int drawBattery(lgfx::LGFXBase *g, int right, int y)
     g->setTextColor(col);
     g->setCursor(right - tw, y);
     g->print(buf);
-    if (!batteryCharging())
-        return tw;
-    drawBoltGlyph(g, right - tw - 7, y - 1, 0xFFE0); // amber bolt: on the charger
-    return tw + 7;
+    return tw;
 }
 
 // Delivery-status glyph for an outgoing message, drawn at the right of its line.

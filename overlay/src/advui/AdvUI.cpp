@@ -1589,27 +1589,18 @@ bool batteryCharging()
 // Battery block right-aligned on `right`; returns the width it took so the
 // caller can park the unread badge clear of it.
 //
-// While charging the percentage is withheld: the only sensor is terminal
-// voltage, and under charge current it reads OCV + polarization — the number
-// pegs near 100% from the first minute (field-tested at ~20% real charge).
-// The one honest statement charging voltage CAN make is "done": once the
-// terminal holds float level (>= 4250, full-charge sits at ~4260-4280 here),
-// show 100% beside the bolt. On battery the voltage reading is honest, so the
-// percentage returns.
+// While charging: the bolt alone, never a number. The only sensor is terminal
+// voltage, and under charge it tracks the charger rail, not the cell — a
+// half-full pack read 4253 while a genuinely full one floats anywhere in
+// 4233-4281 (both field-measured), so no threshold separates "charging" from
+// "done"; a "100% at float" badge shipped briefly and lied at ~50% real.
+// On battery the reading is honest (0.05 V sag at ~200 mA, multimeter-verified),
+// so the percentage returns.
 int drawBattery(lgfx::LGFXBase *g, int right, int y)
 {
     if (batteryCharging()) {
-        bool full = powerStatus && powerStatus->getBatteryVoltageMv() >= 4250;
-        int tw = 0;
-        if (full) {
-            g->setTextColor(0x07E0); // green: genuinely done
-            tw = g->textWidth("100%");
-            g->setCursor(right - tw, y);
-            g->print("100%");
-            tw += 7; // bolt joins to the left
-        }
-        drawBoltGlyph(g, right - (full ? tw : 5), y - 1, 0xFFE0);
-        return full ? tw : 5;
+        drawBoltGlyph(g, right - 5, y - 1, 0xFFE0);
+        return 5;
     }
     char buf[10];
     uint16_t col;

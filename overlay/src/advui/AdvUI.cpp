@@ -11,6 +11,7 @@
 #include "mesh/MeshModule.h"
 #include "mesh/MeshService.h"
 #include "mesh/NodeDB.h"
+#include "mesh/RadioLibInterface.h" // operating frequency for the Settings row
 #include "mesh/Router.h"
 #include "mesh/generated/meshtastic/admin.pb.h"
 #include "mesh/mesh-pb-constants.h"
@@ -3677,6 +3678,11 @@ void AdvUI::drawSettings()
         snprintf(vals[3], sizeof(vals[3]), "%s", config.lora.use_preset ? presetName(config.lora.modem_preset) : "custom");
         if (config.lora.override_frequency > 0)
             snprintf(vals[4], sizeof(vals[4]), "%.3f", (double)config.lora.override_frequency);
+        else if (RadioLibInterface::instance && RadioLibInterface::instance->getFreq() > 0)
+            // No override: show the OPERATING frequency (region + preset + slot).
+            // "auto" here made a slot-20 user doubt their setting was applied and
+            // reach for a manual override they didn't need.
+            snprintf(vals[4], sizeof(vals[4]), "%.3f", (double)RadioLibInterface::instance->getFreq());
         else
             strcpy(vals[4], "auto");
         snprintf(vals[5], sizeof(vals[5]), "%s", channels.getName(0));
@@ -5486,6 +5492,46 @@ int32_t AdvUI::runOnce()
     if (splashDone && !announced && nodeInfoModule) {
         nodeInfoModule->sendOurNodeInfo(NODENUM_BROADCAST, false);
         announced = true;
+    }
+
+    // Nameless-node healing. On a busy mesh the periodic NodeInfo broadcast
+    // drowns in collisions, so entries sit as bare "!hex" indefinitely (field
+    // report; also took five broadcast attempts to name one of our own nodes).
+    // A directed exchange is unicast and reliable: send our info with
+    // want_response and the reply carries their name. One node per pass, a
+    // pass every 10 min, each node asked at most once per 6 h — negligible
+    // airtime even on a congested channel.
+    if (splashDone && !g_radioCompanion && nodeInfoModule && nodeDB) {
+        static uint32_t nextAskMs = 60 * 1000UL; // let the boot-time chatter settle first
+        static uint32_t asked[16], askedAtMs[16];
+        static uint8_t askSlot = 0;
+        if ((int32_t)(millis() - nextAskMs) >= 0) {
+            nextAskMs = millis() + 10 * 60 * 1000UL;
+            uint32_t me = myNodeNum();
+            for (int i = 0; i < (int)nodeDB->getNumMeshNodes(); i++) {
+                meshtastic_NodeInfoLite *n = nodeDB->getMeshNodeByIndex(i);
+                if (!n || n->num == me || n->short_name[0] || n->long_name[0])
+                    continue;
+                if (sinceLastSeen(n) > 2 * 60 * 60)
+                    continue; // not around: don't spend airtime on it
+                bool fresh = false;
+                for (int k = 0; k < 16; k++)
+                    if (asked[k] == n->num && millis() - askedAtMs[k] < 6 * 60 * 60 * 1000UL)
+                        fresh = true;
+                if (fresh)
+                    continue;
+                asked[askSlot & 15] = n->num;
+                askedAtMs[askSlot & 15] = millis();
+                askSlot++;
+                // shorterTimeout=true: allocReply() otherwise throttles our
+                // NodeInfo to ~10 min, so a recent periodic broadcast would
+                // swallow this directed ask — the exact failure it's healing.
+                // The 60 s floor still can't be tripped: we pace asks 10 min apart.
+                nodeInfoModule->sendOurNodeInfo(n->num, true, 0, true);
+                LOG_INFO("advui: asked !%08x for its name", (unsigned)n->num);
+                break;
+            }
+        }
     }
 
     // First-boot onboarding: a fresh install has no LoRa region, so the radio can't

@@ -1630,6 +1630,52 @@ void drawMsgStatus(lgfx::LGFXBase *g, int x, int y, uint8_t status)
     }
 }
 
+// The manual clock's date problem: HH:MM entry needs a date, and the build date
+// (below) can be days behind the wall calendar. Setting RTC into the past then
+// stamps every node/message with old dates, and the moment a real time source
+// syncs, the whole node list ages by the build's age at once (field report:
+// "все ноды разом стали 4 дня назад" — exactly the firmware's age). So remember
+// the last honestly-known DAY in flash (written at most once a day, spares the
+// flash) and base manual entry on it: right after the first real sync in the
+// device's life, the manual date is correct to within a day.
+const char *kEpochPath = "/advui_epoch.bin";
+
+void epochNote()
+{
+    uint32_t now = getTime(false);
+    if (now < kValidEpoch)
+        return;
+    static uint32_t savedDay = 0;
+    if (!savedDay) { // first call this boot: don't rewrite a same-day record
+        auto f = FSCom.open(kEpochPath, FILE_O_READ);
+        if (f) {
+            uint32_t v = 0;
+            f.read((uint8_t *)&v, sizeof(v));
+            f.close();
+            savedDay = v / 86400;
+        }
+    }
+    if (now / 86400 == savedDay)
+        return;
+    auto f = FSCom.open(kEpochPath, FILE_O_WRITE);
+    if (f) {
+        f.write((uint8_t *)&now, sizeof(now));
+        f.close();
+        savedDay = now / 86400;
+    }
+}
+
+uint32_t savedDateEpoch()
+{
+    auto f = FSCom.open(kEpochPath, FILE_O_READ);
+    if (!f)
+        return 0;
+    uint32_t v = 0;
+    f.read((uint8_t *)&v, sizeof(v));
+    f.close();
+    return v >= kValidEpoch ? (v / 86400) * 86400 : 0; // midnight of the last known day
+}
+
 // Compact "HH:MM " prefix for a message's epoch time (local), or "" when the clock
 // wasn't set when the message was stamped (avoids showing bogus 00:xx times).
 // Midnight UTC of the firmware build date. The manual clock (Settings > Device >
@@ -2235,11 +2281,11 @@ void AdvUI::handleFromRadio(const meshtastic_FromRadio &fr)
     // runs SYNCHRONOUSLY inside sendTextPacket() — before sendChannel() tags the message
     // MSG_SENT. Storing the echo as MSG_IN would then win the id dedupe in addMsg() and
     // the "sent" check would never draw. So stamp our own echoed sends with their real
-    // outgoing status: a channel broadcast is MSG_SENT (no ack); a DM loopback, should one
-    // ever occur, stays MSG_SENDING until its routing ACK flips it via ackMsg().
+    // outgoing status: MSG_SENDING until the engine's routing result (implicit ack for
+    // broadcasts, end-to-end ACK for DMs) flips it via ackMsg().
     uint8_t status = MSG_IN;
     if (p.from == me)
-        status = (p.to == NODENUM_BROADCAST) ? MSG_SENT : MSG_SENDING;
+        status = MSG_SENDING;
     // keep the id (reactions/replies reference it) and the reply link (draws the quote)
     addMsg(p.from, p.to, p.channel, p.rx_time, unread, text, p.id, status, p.decoded.reply_id);
 
@@ -2323,7 +2369,14 @@ static uint32_t sendTextPacket(uint32_t to, const char *text, int chIdx = 0, uin
 
     if (to == NODENUM_BROADCAST) {
         p->channel = chIdx;
-        p->want_ack = false; // broadcasts aren't acked
+        // want_ack on a broadcast is what the phone app does: the engine then
+        // tracks it with implicit acks (a heard rebroadcast confirms, silence
+        // retransmits up to 3x, then NAKs "max retransmission") and reports the
+        // result back with our request id — ackMsg() turns that into the green
+        // check / red x. Without it the engine never says anything and the
+        // message sits at the terminal cyan "sent" forever (field report: the
+        // app showed delivery state, the device could not).
+        p->want_ack = true;
     } else {
         p->want_ack = true;
         // A DM to a key-capable node must be PKI-encrypted (stock forces this); without
@@ -3578,7 +3631,12 @@ bool AdvUI::applyName()
         }
         if (hh < 0 || hh > 23 || mm < 0 || mm > 59)
             return false; // unparsable: back to Settings, row still shows "not set"
-        int64_t utc = (int64_t)buildDateEpoch() + hh * 3600 + mm * 60 - (int64_t)g_utcOffsetMin * 60;
+        // Date base: the last honestly-known day if we ever had one (survives
+        // reboots via flash), else the build date — see epochNote().
+        uint32_t base = savedDateEpoch();
+        if (base < buildDateEpoch())
+            base = buildDateEpoch();
+        int64_t utc = (int64_t)base + hh * 3600 + mm * 60 - (int64_t)g_utcOffsetMin * 60;
 #ifdef BUILD_EPOCH
         // perhapsSetRTC() silently refuses any time before the firmware build moment
         // (BUILD_EPOCH) — even with forceUpdate, the check runs first. buildDateEpoch()
@@ -5350,6 +5408,14 @@ int32_t AdvUI::runOnce()
                 g_battRest = p;
                 saveUiCfg();
             }
+        }
+    }
+
+    { // Remember the last honestly-known day (manual-clock date base), once a minute.
+        static uint32_t lastEpochNoteMs = 0;
+        if (millis() - lastEpochNoteMs > 60 * 1000UL) {
+            lastEpochNoteMs = millis();
+            epochNote();
         }
     }
 

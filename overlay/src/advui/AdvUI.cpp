@@ -12,6 +12,7 @@
 #include "mesh/MeshService.h"
 #include "mesh/NodeDB.h"
 #include "mesh/RadioLibInterface.h" // operating frequency for the Settings row
+#include "mqtt/MQTT.h"              // broker link state for the MQTT page header
 #include "mesh/Router.h"
 #include "mesh/generated/meshtastic/admin.pb.h"
 #include "mesh/mesh-pb-constants.h"
@@ -1474,6 +1475,13 @@ void drawNodeRow(lgfx::LGFXBase *g, const meshtastic_NodeInfoLite *n, int y, boo
     char abuf[6];
     uint16_t acol;
     if (!n->last_heard) {
+        strcpy(abuf, "?");
+        acol = 0x630C;
+    } else if (getTime(false) < kValidEpoch || (uint32_t)getTime(false) < n->last_heard) {
+        // No valid clock (or it's behind the stored stamp): sinceLastSeen() clamps
+        // the negative delta to 0 and every flash-loaded node would lie "now".
+        // Field report: GPS on with no fix showed the whole list as "now" while
+        // Clock honestly said "not set". A dim "?" is the honest answer.
         strcpy(abuf, "?");
         acol = 0x630C;
     } else {
@@ -3871,6 +3879,26 @@ void AdvUI::drawNetPage()
     g->setTextColor(0x07FF);
     g->setCursor(4, 3);
     g->print(netPage == 0 ? "WiFi" : "MQTT");
+    if (netPage == 1) {
+        // Live connection state in the header: a user staring at correct-looking
+        // settings can't otherwise tell "connected" from "still trying" (field
+        // question). isConnectedDirectly() is the broker link itself.
+        const char *st;
+        uint16_t sc;
+        if (!moduleConfig.mqtt.enabled) {
+            st = "off";
+            sc = 0x8410;
+        } else if (mqtt && mqtt->isConnectedDirectly()) {
+            st = "connected";
+            sc = 0x07E0;
+        } else {
+            st = "connecting...";
+            sc = 0xFFE0;
+        }
+        g->setTextColor(sc);
+        g->setCursor(238 - (int)strlen(st) * 6, 3);
+        g->print(st);
+    }
     g->drawFastHLine(0, 13, 240, 0x39C7);
 
     const NetField *f = netFields(netPage);

@@ -156,7 +156,12 @@ class AdvUI : public concurrency::OSThread
     uint8_t msgLen = 0;
     char pendingLat = 0;      // last Latin letter that may still start a digraph (sh/ya/...)
 
-    char nameBuf[25] = {0};   // node-name editor buffer (MODE_SETNAME)
+    // Shared text-editor buffer (MODE_SETNAME). Sized for the LONGEST field it
+    // ever edits, not for node names: the WiFi/MQTT pages reuse this editor and
+    // editMax() allows up to 63 chars there (wifi_psk[65], mqtt address[64]).
+    // At 25 bytes a long password overran the struct and was silently truncated
+    // to 24 chars on save — the saved credential then never matched.
+    char nameBuf[65] = {0};
     uint8_t nameLen = 0;
     int editTarget = 0;       // MODE_SETNAME target: 0 long name, 1 short, 2 frequency, 3 channel
     Mode nameReturn = MODE_SETTINGS; // where the name editor returns on save/cancel

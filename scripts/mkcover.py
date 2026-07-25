@@ -38,7 +38,7 @@ import random
 import os
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 S = os.path.join(ROOT, "docs", "img")
-W, H = 1200, 800
+W, H = 1000, 1000  # square: the store card centre-crops, so leave it nothing to cut
 BG = (10, 13, 34)
 BG2 = (16, 20, 52)
 TEAL = (44, 216, 202)
@@ -87,20 +87,27 @@ def text_w(s, scale):
 
 def place(shot, x, y, scale, border):
     img = Image.open(os.path.join(S, "shots", shot + ".png"))
-    img = img.resize((img.width * scale, img.height * scale), Image.NEAREST)
+    img = img.resize((int(img.width * scale), int(img.height * scale)), Image.NEAREST)
     d.rectangle([x + 12, y + 12, x + img.width + 12, y + img.height + 12], fill=DROP)
     d.rectangle([x - 4, y - 4, x + img.width + 3, y + img.height + 3], fill=border)
     im.paste(img, (x, y))
 
-# титул: MESHTASTIC (teal) + ADV (orange), затем подзаголовок
-t1 = "MESHTASTIC"
-px_text(t1, 48, 42, TEAL, 5, shadow=DROP)
-px_text("ADV", 48 + text_w(t1, 5) + 34, 26, ORANGE, 8, shadow=DROP)
-px_text("KEYBOARD-FIRST MESH CLIENT FOR CARDPUTER", 50, 108, WHITE, 2)
+# Title centred: the store crops the card towards the middle, so nothing
+# load-bearing may sit near an edge.
+t1, t2 = "MESHTASTIC", "ADV"
+tw = text_w(t1, 4) + 28 + text_w(t2, 7)
+tx = (W - tw) // 2
+px_text(t1, tx, 70, TEAL, 4, shadow=DROP)
+px_text(t2, tx + text_w(t1, 4) + 28, 56, ORANGE, 7, shadow=DROP)
+sub = "KEYBOARD-FIRST MESH CLIENT"
+px_text(sub, (W - text_w(sub, 2)) // 2, 132, WHITE, 2)
 
-# экраны: чат — герой, нодлист целиком картинкой-в-картинке поверх угла
-place("chat", 28, 195, 4, TEAL)         # 960x540 -> до (988, 735)
-place("nodes", 712, 510, 2, ORANGE)     # 480x270 -> до (1170, 765), поверх угла героя
+# Chat is the hero, node list picture-in-picture over its corner; both kept
+# well inside the crop-safe middle.
+# Two screens stacked: chat on top, node list below — both fully inside a
+# square canvas, so a centre-crop card can't cut either one.
+place("chat", 80, 180, 3.5, TEAL)       # 840x472 -> (920, 652)
+place("nodes", 330, 560, 2.5, ORANGE)   # 600x338 -> (930, 898)
 
 out = os.path.join(S, "m5burner-cover.png")
 im.save(out)

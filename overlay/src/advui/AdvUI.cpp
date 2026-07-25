@@ -4815,6 +4815,8 @@ void AdvUI::handleKey(char ch)
 
     if (mode == MODE_SETNAME) {
         unsigned maxLen = editMax(editTarget);
+        if (maxLen > sizeof(nameBuf) - 1) // never write past the shared editor buffer
+            maxLen = sizeof(nameBuf) - 1;
         bool numeric = (editTarget == 2 || editTarget == 4); // frequency: digits + '.'; clock: digits + ':'
         if (esc) {
             mode = nameReturn;

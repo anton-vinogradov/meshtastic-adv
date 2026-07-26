@@ -3361,6 +3361,17 @@ void AdvUI::drawNode()
         if (chatScroll < 0)
             chatScroll = 0;
         chatAtTop = (chatScroll >= maxScroll); // "up" past this point pages into the archive
+
+        // Scrolled to the newest end: the whole thread has been seen, so mark it
+        // read wholesale. Per-line marking below only clears what actually landed
+        // on screen, and a message whose wrapped tail sits just past the last
+        // drawn line stays unread forever — the reported "read all 32, 2 remain".
+        if (chatScroll == 0) {
+            if (isChan)
+                markReadChannel(selectedChannel);
+            else
+                markReadFrom(selectedNum);
+        }
         if (reactSel >= 0 && selFirst >= 0) { // keep the react-selected message in view
             int vis0 = maxScroll - chatScroll;
             if (selFirst < vis0)

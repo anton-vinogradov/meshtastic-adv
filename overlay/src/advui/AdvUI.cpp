@@ -1352,10 +1352,14 @@ struct NetField {
     bool isBool;
 };
 const NetField kWifiFields[] = {{"WiFi on (turns BT off)", true}, {"Network name", false}, {"Password", false}};
-const NetField kMqttFields[] = {{"MQTT on", true},   {"Server", false},     {"Username", false},
-                                {"Password", false}, {"Root topic", false}, {"Encryption", true},
-                                {"TLS", true}};
-int netFieldCount(int page) { return page == 0 ? 3 : 7; }
+// Uplink/downlink live on the CHANNEL, not the module — but MQTT is dead without
+// them (the engine's thread shuts itself down for good unless some channel opts
+// in), and the stock menu that carried these toggles is compiled out here. So
+// they belong on this page: without them MQTT simply cannot be set up on-device.
+const NetField kMqttFields[] = {{"MQTT on", true},        {"Server", false},      {"Username", false},
+                                {"Password", false},      {"Root topic", false},  {"Encryption", true},
+                                {"TLS", true},            {"Uplink (send)", true}, {"Downlink (receive)", true}};
+int netFieldCount(int page) { return page == 0 ? 3 : 9; }
 const NetField *netFields(int page) { return page == 0 ? kWifiFields : kMqttFields; }
 
 bool netGetBool(int page, int i)
@@ -1366,7 +1370,11 @@ bool netGetBool(int page, int i)
         return moduleConfig.mqtt.enabled;
     if (i == 5)
         return moduleConfig.mqtt.encryption_enabled;
-    return moduleConfig.mqtt.tls_enabled;
+    if (i == 6)
+        return moduleConfig.mqtt.tls_enabled;
+    // 7/8: primary channel's MQTT opt-in
+    meshtastic_Channel ch = channels.getByIndex(0);
+    return i == 7 ? ch.settings.uplink_enabled : ch.settings.downlink_enabled;
 }
 void netSetBool(int page, int i, bool v)
 {
@@ -1376,8 +1384,19 @@ void netSetBool(int page, int i, bool v)
         moduleConfig.mqtt.enabled = v;
     else if (i == 5)
         moduleConfig.mqtt.encryption_enabled = v;
-    else
+    else if (i == 6)
         moduleConfig.mqtt.tls_enabled = v;
+    else { // channel flags: written through the channel API, not moduleConfig
+        meshtastic_Channel ch = channels.getByIndex(0);
+        if (i == 7)
+            ch.settings.uplink_enabled = v;
+        else
+            ch.settings.downlink_enabled = v;
+        channels.setChannel(ch);
+        channels.onConfigChanged();
+        if (nodeDB)
+            nodeDB->saveToDisk(SEGMENT_CHANNELS);
+    }
 }
 const char *netGetText(int page, int i)
 {
@@ -3902,6 +3921,15 @@ void AdvUI::drawNetPage()
         } else if (mqtt && mqtt->isConnectedDirectly()) {
             st = "connected";
             sc = 0x07E0;
+        } else if (!channels.anyMqttEnabled()) {
+            // The engine parks the MQTT thread for good unless a channel opts in
+            // (uplink or downlink), so "connecting..." here was a lie: nothing was
+            // ever dialled. Say what's actually missing — the toggles are below.
+            st = "no channel";
+            sc = 0xF800;
+        } else if (moduleConfig.mqtt.proxy_to_client_enabled) {
+            st = "via phone"; // proxied: a direct socket is never opened by design
+            sc = 0x07FF;
         } else {
             st = "connecting...";
             sc = 0xFFE0;
@@ -5854,6 +5882,16 @@ class AdvRxModule : public MeshModule
 // OSThread base then self-schedules, so no main-loop edits are needed.
 void advuiSetup()
 {
+    // Park the SD card's chip-select before the radio touches the bus. The slot
+    // shares SPI with the SX1262 (SD CS 12, LoRa CS 5, same host), and a card
+    // whose CS floats can hold MISO down — the radio then reads garbage and the
+    // node wedges or reboots. Field reports of "keyboard dead, device restarts
+    // by itself" cleared up by removing the card; this makes removing it
+    // unnecessary. Runs from the setupModules() injection: after SPI.begin(),
+    // still before initLoRa().
+    pinMode(12, OUTPUT);
+    digitalWrite(12, HIGH);
+
     static AdvUI advUI;
     static AdvRxModule advRx(&advUI); // registers with the module list built in setupModules()
 }

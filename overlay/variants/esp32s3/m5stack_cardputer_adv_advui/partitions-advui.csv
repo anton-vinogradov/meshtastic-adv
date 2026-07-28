@@ -3,10 +3,18 @@
 # (see docs/manifest.json), and AdvFont memory-maps it. Every other partition
 # keeps its stock offset/size, so updating over an existing install preserves
 # the filesystem (prefs, message history).
+#
+# The subtype is spiffs (0x82) rather than a private 0x40 purely so third-party
+# installers can see it: M5Launcher's parsers only carry data partitions whose
+# subtype is one of FAT/SPIFFS/LittleFS, so a private subtype made the font
+# invisible to them and their installs silently shipped without it. Nothing
+# mounts this as a filesystem — LittleFS mounts by the "spiffs" LABEL, and
+# AdvFont finds this one by its own label with SUBTYPE_ANY. Size trimmed to the
+# blob's actual need (0x230000 = 2293760 >= 2264068 bytes of AUF2 unifont.bin).
 # Name,   Type, SubType, Offset,  Size, Flags
 nvs,      data, nvs,     0x9000,  0x5000,
 otadata,  data, ota,     0xe000,  0x2000,
 app0,     app,  ota_0,   0x10000, 0x330000,
-font,     data, 0x40,    0x340000,0x330000,
+font,     data, spiffs,  0x340000,0x230000,
 spiffs,   data, spiffs,  0x670000,0x180000,
 coredump, data, coredump,0x7F0000,0x10000,

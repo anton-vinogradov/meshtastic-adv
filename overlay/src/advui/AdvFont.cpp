@@ -27,6 +27,7 @@ constexpr size_t kFontSizeV2 = 4 + (65536UL + (kSmpEnd - kSmpBase + 1)) * 33;
 
 File g_font;
 bool g_ready = false;
+bool g_sdOffered = false; // no flash partition: the SD path is available on request
 bool g_v2 = false;              // blob has the supplementary emoji records
 const uint8_t *g_map = nullptr; // memory-mapped "font" flash partition (fast path)
 char g_state[24] = "off";       // what Settings shows: flash / sd / off / error tag
@@ -113,8 +114,21 @@ void sdFontInit()
         }
     }
 
-    // Fallback: /unifont.bin on the SD card (Launcher installs, bare esptool
-    // flashes — anyone whose flashing path didn't write the partition).
+    // No partition (M5Launcher installs into its own flash layout, bare esptool
+    // flashes, ...). The card CAN carry the font, but mounting it costs ~32 KB
+    // of heap — FATFS work area, SPI buffers, the open file — and on this
+    // no-PSRAM board that is most of what's left: WiFi's web server and MQTT
+    // then fail to allocate, so the device loses networking to gain glyphs.
+    // That trade is the user's to make, not ours: stop here and let Settings >
+    // Device > Font turn it on deliberately.
+    g_sdOffered = true;
+}
+
+// Mount the card and stream glyphs from it — only ever from the Font setting.
+void sdFontLoadFromSd()
+{
+    if (g_ready)
+        return;
     concurrency::LockGuard guard(spiLock);
     if (!SD.begin(kSdCs, SPI, kSdHz)) {
         LOG_INFO("advui: no SD card, unicode font off");
@@ -147,6 +161,25 @@ void sdFontInit()
 const char *sdFontState()
 {
     return g_state;
+}
+
+bool sdFontOffered()
+{
+    return g_sdOffered && !g_ready;
+}
+
+void sdFontUnload()
+{
+    if (!g_ready)
+        return;
+    concurrency::LockGuard guard(spiLock);
+    if (g_font)
+        g_font.close();
+    free(g_cache);
+    g_cache = nullptr;
+    SD.end();
+    g_ready = false;
+    snprintf(g_state, sizeof(g_state), "off");
 }
 
 bool sdFontReady()

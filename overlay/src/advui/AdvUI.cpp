@@ -1260,6 +1260,10 @@ const EnumOpt kScreenOpts[] = {{"15 s", 15}, {"30 s", 30}, {"1 min", 60}, {"5 mi
 const EnumOpt kSortOpts[] = {{"Smart", 0}, {"Last heard", 1}, {"Name", 2}, {"Hops", 3}};
 const EnumOpt kNameOpts[] = {{"Long", 0}, {"Short", 1}};
 constexpr int kNameCount = 2;
+// Only offered when there's no font partition: loading from the card costs
+// ~32 KB of heap (see AdvFont.h), enough to cost this board its networking.
+const EnumOpt kFontOpts[] = {{"Off (saves RAM)", 0}, {"SD card (-32KB RAM)", 1}};
+constexpr int kFontCount = 2;
 constexpr int kSortCount = (int)(sizeof(kSortOpts) / sizeof(kSortOpts[0]));
 
 // Last percentage read while NOT charging. Shown in place of the live reading
@@ -1341,6 +1345,7 @@ PickList pickListFor(int target)
     case 2: return {kUtcOpts, kUtcCount, "UTC offset"};
     case 10: return {kSortOpts, kSortCount, "Node sort"};
     case 11: return {kNameOpts, kNameCount, "Node names"};
+    case 12: return {kFontOpts, kFontCount, "Unicode font"};
     case 4: return {kScreenOpts, kScreenCount, "Screen off"};
     case 5: return {kRoleOpts2, kRoleCount, "Role"};
     case 6: return {kHopOpts, kHopCount, "Hop limit"};
@@ -3837,7 +3842,13 @@ void AdvUI::drawSettings()
         snprintf(vals[14], sizeof(vals[14]), "BLE: %s", g_peerName[0] ? g_peerName : "(no node)");
     else
         strcpy(vals[14], "onboard");
-    snprintf(vals[15], sizeof(vals[15]), "%s", sdFontState()); // unicode font source (read-only)
+    // Font row: "flash" is the healthy install; "not installed" tells the
+    // M5Launcher crowd why their Cyrillic/emoji are boxes, and that row is
+    // clickable to load it off the card anyway.
+    if (sdFontOffered())
+        strcpy(vals[15], "not installed");
+    else
+        snprintf(vals[15], sizeof(vals[15]), "%s", sdFontState());
     {
         uint32_t now = getTime(false); // device clock: the row doubles as the RTC status
         if (now >= kValidEpoch) {
@@ -4314,6 +4325,24 @@ void AdvUI::drawPickList()
         g->setCursor(8, y + 1);
         g->print(opts[i].name);
         y += rowH;
+    }
+
+    if (pickTarget == 12) {
+        // The honest recommendation, shown exactly where the user is about to
+        // make the trade: the card works, but the proper install is better in
+        // every way (no RAM cost, no card needed, full Unicode incl. CJK).
+        g->setFont(&lgfx::fonts::Font0);
+        g->setTextSize(1);
+        g->setTextColor(0xFFE0); // amber
+        g->setCursor(6, y + 4);
+        g->print("No font partition: this install");
+        g->setCursor(6, y + 14);
+        g->print("came from M5Launcher. Reflash via");
+        g->setCursor(6, y + 24);
+        g->setTextColor(0x07E0); // green: the recommended path
+        g->print("M5Burner / web installer for full");
+        g->setCursor(6, y + 34);
+        g->print("Unicode without the RAM cost.");
     }
 
     drawFooter(g, "up/dn   ENTER select   ESC back");
@@ -4804,6 +4833,11 @@ void AdvUI::openSetting(int item)
         pickSel = optIndex(kUtcOpts, kUtcCount, g_utcOffsetMin);
         pickScroll = 0;
         mode = MODE_PICKLIST;
+    } else if (item == 15 && (sdFontOffered() || strcmp(sdFontState(), "sd") == 0)) {
+        pickTarget = 12; // unicode font source (only meaningful without the partition)
+        pickSel = strcmp(sdFontState(), "sd") == 0 ? 1 : 0;
+        pickScroll = 0;
+        mode = MODE_PICKLIST;
     } else if (item == 19) { // node-list name style -> picker
         pickTarget = 11;
         pickSel = g_nameShort ? 1 : 0;
@@ -5079,6 +5113,12 @@ void AdvUI::handleKey(char ch)
             } else if (pickTarget == 11) { // long vs short names: live, same tiny file
                 g_nameShort = (uint8_t)kNameOpts[pickSel].value;
                 saveUiCfg();
+                mode = MODE_SETTINGS;
+            } else if (pickTarget == 12) { // unicode font from the card: live, both ways
+                if (kFontOpts[pickSel].value)
+                    sdFontLoadFromSd();
+                else
+                    sdFontUnload();
                 mode = MODE_SETTINGS;
             } else if (pickTarget == 4) { // screen auto-off: applied live, persisted with msgs
                 g_screenOffSec = kScreenOpts[pickSel].value;

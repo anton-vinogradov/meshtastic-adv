@@ -48,8 +48,12 @@ namespace
 // LovyanGFX wrapper for the embedded Cyrillic font — used for message text.
 const lgfx::U8g2font cyrFont(u8g2_font_9x15_t_cyrillic);
 
+extern uint8_t g_nameShort;
+
 const char *nodeName(const meshtastic_NodeInfoLite *n)
 {
+    if (g_nameShort)
+        return n->short_name[0] ? n->short_name : n->long_name;
     return n->long_name[0] ? n->long_name : n->short_name;
 }
 
@@ -128,13 +132,13 @@ const char *errName(uint8_t e)
 constexpr int kMaxMsgs = 32; // shared across all conversations; DMs are protected by the
                              // channel-first eviction (addMsg), not by size, so this stays small
                              // to keep the heap margin — a connected phone + BLE runs it thin
-constexpr int kNumSettings = 19; // the flat item table: Name..Channel, Role..Rebroadcast, UTC, WiFi, MQTT, Screen, Radio, Font, Clock, GPS, Sort
+constexpr int kNumSettings = 20; // the flat item table: Name..Channel, Role..Rebroadcast, UTC, WiFi, MQTT, Screen, Radio, Font, Clock, GPS, Sort, Names
 
 // The Settings menu is two-level: the top lists sections (plus WiFi/MQTT/Radio
 // as direct entries); a section lists indices into the flat item table.
 const uint8_t kSecNode[] = {0, 1};                    // Name, Short
 const uint8_t kSecLora[] = {2, 3, 4, 5, 6, 7, 8, 9};  // Region..Rebroadcast
-const uint8_t kSecDevice[] = {10, 16, 18, 13, 17, 15}; // UTC, Clock, Sort, Screen, GPS, Font (read-only)
+const uint8_t kSecDevice[] = {10, 16, 18, 19, 13, 17, 15}; // UTC, Clock, Sort, Names, Screen, GPS, Font (read-only)
 constexpr int kTopCount = 6;                          // Node, LoRa, WiFi, MQTT, Device, Radio
 Msg g_msgs[kMaxMsgs];
 int g_msgCount = 0;         // populated slots (grows to kMaxMsgs)
@@ -322,6 +326,10 @@ int32_t g_utcOffsetMin = 0;
 // the message-file header stays format-frozen. Load/save live further down,
 // after the option table that bounds the value.
 uint8_t g_nodeSort = 0;
+// Node-list name style: 0 = long name (falls back to short), 1 = short name
+// (falls back to long). Long reads better on this 240px list, but users coming
+// from the phone app expect the short call-sign — so it's a choice, not a rule.
+uint8_t g_nameShort = 0;
 const char *kUiCfgPath = "/advui_ui.bin";
 int32_t g_screenOffSec = 300; // screen auto-off timeout; 0 = never
 
@@ -1250,6 +1258,8 @@ const EnumOpt kScreenOpts[] = {{"15 s", 15}, {"30 s", 30}, {"1 min", 60}, {"5 mi
 // Node-list order (community ask): smart mixes favourites/hops/freshness, the
 // rest are single-criterion. Unread stays pinned on top in every mode.
 const EnumOpt kSortOpts[] = {{"Smart", 0}, {"Last heard", 1}, {"Name", 2}, {"Hops", 3}};
+const EnumOpt kNameOpts[] = {{"Long", 0}, {"Short", 1}};
+constexpr int kNameCount = 2;
 constexpr int kSortCount = (int)(sizeof(kSortOpts) / sizeof(kSortOpts[0]));
 
 // Last percentage read while NOT charging. Shown in place of the live reading
@@ -1267,6 +1277,7 @@ void saveUiCfg()
     f.write(&g_nodeSort, 1);
     int8_t b = (int8_t)g_battRest; // -1 when never sampled off-charge
     f.write((uint8_t *)&b, 1);
+    f.write(&g_nameShort, 1);
     f.close();
 }
 
@@ -1281,6 +1292,9 @@ void loadUiCfg()
     int8_t b = -1;
     if (f.read((uint8_t *)&b, 1) == 1 && b >= 0 && b <= 100)
         g_battRest = b;
+    uint8_t ns = 0;
+    if (f.read(&ns, 1) == 1 && ns <= 1)
+        g_nameShort = ns;
     f.close();
 }
 const EnumOpt kRoleOpts2[] = {{"Client", 0},      {"Client Mute", 1}, {"Client Hidden", 8},
@@ -1326,6 +1340,7 @@ PickList pickListFor(int target)
     case 1: return {kPresetOpts, kPresetCount, "Preset"};
     case 2: return {kUtcOpts, kUtcCount, "UTC offset"};
     case 10: return {kSortOpts, kSortCount, "Node sort"};
+    case 11: return {kNameOpts, kNameCount, "Node names"};
     case 4: return {kScreenOpts, kScreenCount, "Screen off"};
     case 5: return {kRoleOpts2, kRoleCount, "Role"};
     case 6: return {kHopOpts, kHopCount, "Hop limit"};
@@ -3751,7 +3766,7 @@ void AdvUI::drawSettings()
     const char *labels[kNumSettings] = {"Name", "Short",       "Region", "Preset", "Frequency",
                                         "Channel", "Role",     "Hops",   "Power",  "Rebroadcast",
                                         "UTC",     "WiFi",     "MQTT",   "Screen", "Radio",
-                                        "Font",    "Clock",    "GPS",    "Sort"};
+                                        "Font",    "Clock",    "GPS",    "Sort",  "Names"};
     char vals[kNumSettings][24];
     if (g_radioCompanion) { // rows 0-5 show (and remote-admin edit) the linked node
         meshtastic_NodeInfoLite *me = g_linkMyNode ? nodeByNum(g_linkMyNode) : nullptr;
@@ -3834,6 +3849,7 @@ void AdvUI::drawSettings()
     }
     strcpy(vals[17], config.position.gps_mode == meshtastic_Config_PositionConfig_GpsMode_ENABLED ? "on" : "off");
     strcpy(vals[18], kSortOpts[g_nodeSort < kSortCount ? g_nodeSort : 0].name);
+    strcpy(vals[19], kNameOpts[g_nameShort ? 1 : 0].name);
 
     // What the current level shows: top = sections + direct entries (with a
     // representative value as the preview), sub = the section's flat items.
@@ -4788,6 +4804,11 @@ void AdvUI::openSetting(int item)
         pickSel = optIndex(kUtcOpts, kUtcCount, g_utcOffsetMin);
         pickScroll = 0;
         mode = MODE_PICKLIST;
+    } else if (item == 19) { // node-list name style -> picker
+        pickTarget = 11;
+        pickSel = g_nameShort ? 1 : 0;
+        pickScroll = 0;
+        mode = MODE_PICKLIST;
     } else if (item == 18) { // node-list sort -> mode picker
         pickTarget = 10;
         pickSel = optIndex(kSortOpts, kSortCount, (int)g_nodeSort);
@@ -5053,6 +5074,10 @@ void AdvUI::handleKey(char ch)
         } else if (enter) {
             if (pickTarget == 10) { // node-list sort: applied live, own tiny file
                 g_nodeSort = (uint8_t)kSortOpts[pickSel].value;
+                saveUiCfg();
+                mode = MODE_SETTINGS;
+            } else if (pickTarget == 11) { // long vs short names: live, same tiny file
+                g_nameShort = (uint8_t)kNameOpts[pickSel].value;
                 saveUiCfg();
                 mode = MODE_SETTINGS;
             } else if (pickTarget == 4) { // screen auto-off: applied live, persisted with msgs

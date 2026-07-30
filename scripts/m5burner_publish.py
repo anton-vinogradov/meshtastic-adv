@@ -26,6 +26,8 @@ def main():
     ap.add_argument("--password", required=True)
     ap.add_argument("--version", required=True, help="version string, no leading v")
     ap.add_argument("--bin", required=True, help="merged image to upload")
+    ap.add_argument("--description", help="file whose contents replace the listing text; "
+                                          "omit to keep whatever the account already has")
     args = ap.parse_args()
 
     s = requests.Session()
@@ -49,9 +51,18 @@ def main():
         return
     print(f"found: {fw.get('name')}")
 
+    # The listing text is the only thing a browsing user reads before deciding, and
+    # until now it lived solely in the M5Burner account — edited through their web UI,
+    # reviewed by nobody, and silently copied forward by this script on every release.
+    # Keeping it in the repo makes it reviewable like the rest of the product.
+    description = fw.get("description", "")
+    if args.description:
+        with open(args.description, encoding="utf-8") as f:
+            description = f.read().strip()
+
     data = {
         "name": fw.get("name", ""),
-        "description": fw.get("description", ""),
+        "description": description,
         "category": fw.get("category", ""),
         "author": fw.get("author", ""),
         "version": args.version,

@@ -28,6 +28,11 @@ def main():
     ap.add_argument("--bin", required=True, help="merged image to upload")
     ap.add_argument("--description", help="file whose contents replace the listing text; "
                                           "omit to keep whatever the account already has")
+    # Do not pass this without testing it first. The upload POST carries no fid, so the
+    # backend appears to locate the entry by name: sending a different one for v0.4.34
+    # returned 200 and did nothing at all — no version added, no rename, no new entry —
+    # and the release silently failed to reach M5Burner. Every earlier publish worked
+    # only because the name was copied forward untouched.
     ap.add_argument("--name", help="listing title; omit to keep the account's own")
     args = ap.parse_args()
 

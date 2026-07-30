@@ -28,6 +28,7 @@ def main():
     ap.add_argument("--bin", required=True, help="merged image to upload")
     ap.add_argument("--description", help="file whose contents replace the listing text; "
                                           "omit to keep whatever the account already has")
+    ap.add_argument("--name", help="listing title; omit to keep the account's own")
     args = ap.parse_args()
 
     s = requests.Session()
@@ -61,7 +62,7 @@ def main():
             description = f.read().strip()
 
     data = {
-        "name": fw.get("name", ""),
+        "name": args.name or fw.get("name", ""),
         "description": description,
         "category": fw.get("category", ""),
         "author": fw.get("author", ""),

@@ -124,4 +124,5 @@ jobs:
             --email "$M5B_EMAIL" --password "$M5B_PWD" \
             --version "${GITHUB_REF_NAME#v}" \
             --bin meshtastic-adv-cardputer-adv-merged.bin \
-            --description docs/m5burner-card.txt
+            --description docs/m5burner-card.txt \
+            --name "Meshtastic ADV — Cardputer keyboard client"

@@ -123,4 +123,5 @@ jobs:
           python scripts/m5burner_publish.py \
             --email "$M5B_EMAIL" --password "$M5B_PWD" \
             --version "${GITHUB_REF_NAME#v}" \
-            --bin meshtastic-adv-cardputer-adv-merged.bin
+            --bin meshtastic-adv-cardputer-adv-merged.bin \
+            --description docs/m5burner-card.txt

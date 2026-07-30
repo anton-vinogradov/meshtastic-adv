@@ -26,14 +26,6 @@ def main():
     ap.add_argument("--password", required=True)
     ap.add_argument("--version", required=True, help="version string, no leading v")
     ap.add_argument("--bin", required=True, help="merged image to upload")
-    ap.add_argument("--description", help="file whose contents replace the listing text; "
-                                          "omit to keep whatever the account already has")
-    # Do not pass this without testing it first. The upload POST carries no fid, so the
-    # backend appears to locate the entry by name: sending a different one for v0.4.34
-    # returned 200 and did nothing at all — no version added, no rename, no new entry —
-    # and the release silently failed to reach M5Burner. Every earlier publish worked
-    # only because the name was copied forward untouched.
-    ap.add_argument("--name", help="listing title; omit to keep the account's own")
     args = ap.parse_args()
 
     s = requests.Session()
@@ -57,18 +49,17 @@ def main():
         return
     print(f"found: {fw.get('name')}")
 
-    # The listing text is the only thing a browsing user reads before deciding, and
-    # until now it lived solely in the M5Burner account — edited through their web UI,
-    # reviewed by nobody, and silently copied forward by this script on every release.
-    # Keeping it in the repo makes it reviewable like the rest of the product.
-    description = fw.get("description", "")
-    if args.description:
-        with open(args.description, encoding="utf-8") as f:
-            description = f.read().strip()
-
+    # Name and description are echoed back unchanged, and that is the only thing that
+    # works. This endpoint takes no fid: it finds the entry by name, and the rest of the
+    # metadata it simply ignores for an entry that already exists. Both were measured on
+    # real releases — a changed name forked the listing into a second, invisible entry
+    # and cost v0.4.34 its publish; a changed description (v0.4.35) returned success,
+    # published the binary, and left the text exactly as it was.
+    # The listing copy lives in docs/m5burner-card.txt; it has to be pasted into the
+    # M5Burner account by hand, as does the title.
     data = {
-        "name": args.name or fw.get("name", ""),
-        "description": description,
+        "name": fw.get("name", ""),
+        "description": fw.get("description", ""),
         "category": fw.get("category", ""),
         "author": fw.get("author", ""),
         "version": args.version,

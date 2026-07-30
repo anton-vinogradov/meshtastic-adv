@@ -1,3 +1,11 @@
+Title: Meshtastic ADV — Cardputer keyboard client
+Everything below this line is the listing body.
+
+The M5Burner API ignores both fields when publishing a release — a changed title
+forks the listing into a second entry, a changed body is accepted and discarded —
+so this file is the reviewed copy, and it has to be pasted into the M5Burner
+account by hand after editing.
+---
 Keyboard-first Meshtastic client for the M5Stack Cardputer ADV — message the mesh right from the keyboard, no phone needed.
 
 • Works with or without a LoRa cap: pair over Bluetooth with any stock Meshtastic node and use its radio

@@ -1624,9 +1624,14 @@ void batteryText(char *out, size_t cap, uint16_t &col)
 //    (field-observed) misses the strict '>' forever;
 //  - HWCDC::isPlugged() sees only a USB HOST — true for a computer, false for
 //    wall chargers and data-less cables;
-//  - so also accept a reading a hair under that threshold (>= 4195): only a
-//    charger holds the terminal that high; a full cell resting tops out at
-//    OCV[0] = 4190 and sags from there under any load.
+//  - so also accept a reading a hair under that threshold (>= 4195).
+//
+// That last one is a hint, not a verdict. 4195 sits 5 mV above OCV[0] = 4190,
+// the table's own 100 % point, so a pack that simply finished charging trips it
+// with no cable in sight — reported from the field, reproduced here. Raising the
+// bar does not help: a charger floats anywhere in 4233-4281 and a half-full pack
+// under charge read 4253, so the two bands overlap and no threshold separates
+// them. Hence nothing that matters may hang on this answer — see drawBattery().
 bool batteryCharging()
 {
     if (!powerStatus || !powerStatus->getHasBattery())
@@ -1637,27 +1642,31 @@ bool batteryCharging()
 // Battery block right-aligned on `right`; returns the width it took so the
 // caller can park the unread badge clear of it.
 //
-// While charging: the bolt alone, never a number. The only sensor is terminal
-// voltage, and under charge it tracks the charger rail, not the cell — a
-// half-full pack read 4253 while a genuinely full one floats anywhere in
-// 4233-4281 (both field-measured), so no threshold separates "charging" from
-// "done"; a "100% at float" badge shipped briefly and lied at ~50% real.
-// On battery the reading is honest (0.05 V sag at ~200 mA, multimeter-verified),
-// so the percentage returns.
+// The number is always drawn; the bolt joins it when batteryCharging() fires.
+// Under charge the terminal voltage tracks the charger rail rather than the cell
+// — a half-full pack read 4253 while a genuinely full one floats in 4233-4281
+// (both field-measured) — so the live percentage is worthless there and
+// batteryText() substitutes the last off-charge figure instead. That substitution
+// is what makes a number safe to show at all times, and showing it at all times
+// is what keeps a misfired bolt cheap: the guess decides whether a small glyph
+// appears, never whether the user can see their charge level. The earlier
+// bolt-only header cost them the number every time a full pack tripped the
+// threshold on battery, which is most of the time right after a charge.
 int drawBattery(lgfx::LGFXBase *g, int right, int y)
 {
+    int bolt = 0;
     if (batteryCharging()) {
         drawBoltGlyph(g, right - 5, y - 1, 0xFFE0);
-        return 5;
+        bolt = 6; // 5 px glyph + 1 px gap
     }
     char buf[10];
     uint16_t col;
     batteryText(buf, sizeof(buf), col);
     int tw = g->textWidth(buf);
     g->setTextColor(col);
-    g->setCursor(right - tw, y);
+    g->setCursor(right - bolt - tw, y);
     g->print(buf);
-    return tw;
+    return tw + bolt;
 }
 
 // Delivery-status glyph for an outgoing message, drawn at the right of its line.
@@ -5534,11 +5543,15 @@ int32_t AdvUI::runOnce()
     { // Sample the honest (off-charge) battery % every 30 s and persist it when it
       // moves, so the header can show a real figure while USB hides the true charge.
         static uint32_t lastBattMs = 0;
-        if (powerStatus && powerStatus->getHasBattery() && !batteryCharging() &&
-            (!lastBattMs || millis() - lastBattMs > 30000)) {
+        if (powerStatus && powerStatus->getHasBattery() && (!lastBattMs || millis() - lastBattMs > 30000)) {
             lastBattMs = millis();
             int p = powerStatus->getBatteryChargePercent();
-            if (p >= 0 && p <= 100 && p != g_battRest) {
+            // With the bolt up the live figure cannot be trusted upwards — under charge
+            // it reads the charger rail. Downwards it can: nothing on a charger makes the
+            // resting figure fall, so a drop means we are running off the pack. That lets
+            // a bolt misfired by a freshly-charged pack thaw the number on its own.
+            bool trustworthy = !batteryCharging() || (g_battRest >= 0 && p < g_battRest);
+            if (trustworthy && p >= 0 && p <= 100 && p != g_battRest) {
                 g_battRest = p;
                 saveUiCfg();
             }

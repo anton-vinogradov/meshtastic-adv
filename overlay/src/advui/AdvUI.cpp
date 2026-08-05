@@ -100,8 +100,17 @@ struct Msg {
 };
 
 // Short names for meshtastic_Routing_Error, shown next to a failed message.
-const char *errName(uint8_t e)
+//
+// A broadcast is a special case worth its own word. Nobody owes it a reply, so the
+// only confirmation available is an implicit one: the radio listens for a neighbour
+// repeating the packet onward. With no neighbour in range nothing repeats it, the
+// stack reports MAX_RETRANSMIT, and calling that "no ack" reads as "your message
+// never went out" — two users in a row reported it as a send failure when the
+// message had in fact been transmitted and simply had nobody to carry it further.
+const char *errName(uint8_t e, bool broadcast)
 {
+    if (broadcast && e == 5)
+        return "no relay";
     switch (e) {
     case 1:
         return "no route";
@@ -139,7 +148,7 @@ constexpr int kNumSettings = 20; // the flat item table: Name..Channel, Role..Re
 const uint8_t kSecNode[] = {0, 1};                    // Name, Short
 const uint8_t kSecLora[] = {2, 3, 4, 5, 6, 7, 8, 9};  // Region..Rebroadcast
 const uint8_t kSecDevice[] = {10, 16, 18, 19, 13, 17, 15}; // UTC, Clock, Sort, Names, Screen, GPS, Font (read-only)
-constexpr int kTopCount = 6;                          // Node, LoRa, WiFi, MQTT, Device, Radio
+constexpr int kTopCount = 7;                          // Node, LoRa, WiFi, MQTT, Device, Radio, About
 Msg g_msgs[kMaxMsgs];
 int g_msgCount = 0;         // populated slots (grows to kMaxMsgs)
 bool g_msgsDirty = false;   // ring changed since the last flash save
@@ -3491,10 +3500,13 @@ void AdvUI::drawNode()
             printLineEmotes(g, cx, y, d.text + d.timeLen + d.nameLen, d.color, 2); // inline emoji, nudged onto the text band
             if (d.last && d.out) {
                 if (d.status == MSG_FAILED) {
-                    g->setFont(&lgfx::fonts::Font0); // red error name at the right
+                    // Amber, not red, when a broadcast merely went unrepeated: on a mesh
+                    // with nobody in range that is the state of the network, not a fault.
+                    const bool unrelayed = isChan && d.err == 5;
+                    g->setFont(&lgfx::fonts::Font0); // error name at the right
                     g->setTextSize(1);
-                    g->setTextColor(0xF800);
-                    const char *en = errName(d.err);
+                    g->setTextColor(unrelayed ? 0xFD20 : 0xF800);
+                    const char *en = errName(d.err, isChan);
                     g->setCursor(238 - g->textWidth(en), y + 4);
                     g->print(en);
                 } else {
@@ -3755,6 +3767,60 @@ bool AdvUI::applyName()
     return false;
 }
 
+// Who made this, what it is built on, and where to go with a question. The font
+// credit is not decoration: GNU Unifont ships under the OFL / GPL font exception,
+// and this firmware carries 2.2 MB of it.
+void AdvUI::drawAbout(lgfx::LGFXBase *g)
+{
+    g->setFont(&lgfx::fonts::Font0);
+    g->setTextSize(1);
+
+    int y = 20;
+    g->setTextColor(0xFFE0); // yellow
+    g->setCursor(4, y);
+    g->print("Meshtastic ADV");
+    g->setTextColor(0x9CD3);
+    g->setCursor(236 - (int)strlen(ADVUI_VERSION) * 6, y);
+    g->print(ADVUI_VERSION);
+
+    y += 12;
+    g->setTextColor(0x8410); // gray
+    g->setCursor(4, y);
+    g->print("Keyboard-first client, Cardputer ADV");
+
+    struct Row {
+        const char *k, *v;
+    };
+    char engine[24];
+    snprintf(engine, sizeof(engine), "Meshtastic %s", optstr(APP_VERSION_SHORT));
+    const Row rows[] = {
+        {"Engine",  engine            },
+        {"Author",  "anton-vinogradov"},
+        {"Licence", "GPL-3.0"         },
+    };
+    y += 15;
+    for (const Row &r : rows) {
+        g->setTextColor(0x8410);
+        g->setCursor(4, y);
+        g->print(r.k);
+        g->setTextColor(0xFFFF);
+        g->setCursor(58, y);
+        g->print(r.v);
+        y += 11;
+    }
+
+    y += 4;
+    g->setTextColor(0x07FF); // cyan: the address is the point of the screen
+    g->setCursor(4, y);
+    g->print("github.com/anton-vinogradov/");
+    g->setCursor(4, y + 10);
+    g->print("meshtastic-adv");
+
+    g->setTextColor(0x4208); // dim: a credit, not a message for the user
+    g->setCursor(4, 122);
+    g->print("Font: GNU Unifont (OFL / GPL+FE)");
+}
+
 void AdvUI::drawSettings()
 {
     lgfx::LGFXBase *g = haveCanvas ? static_cast<lgfx::LGFXBase *>(&canvas) : static_cast<lgfx::LGFXBase *>(&display);
@@ -3768,6 +3834,7 @@ void AdvUI::drawSettings()
     g->printf("Settings%s", setSection == 0   ? " / Node"
                             : setSection == 1 ? " / LoRa"
                             : setSection == 2 ? " / Device"
+                            : setSection == 3 ? " / About"
                                               : "");
     if (setSection < 0) { // app version, right-aligned on the header of the top menu
         const char *ver = ADVUI_VERSION;
@@ -3776,6 +3843,14 @@ void AdvUI::drawSettings()
         g->print(ver);
     }
     g->drawFastHLine(0, 13, 240, 0x39C7);
+
+    if (setSection == 3) { // About is a page, not a list of editable rows
+        drawAbout(g);
+        drawFooter(g, "ESC back");
+        if (haveCanvas)
+            canvas.pushSprite(0, 0);
+        return;
+    }
 
     const char *labels[kNumSettings] = {"Name", "Short",       "Region", "Preset", "Frequency",
                                         "Channel", "Role",     "Hops",   "Power",  "Rebroadcast",
@@ -3877,13 +3952,13 @@ void AdvUI::drawSettings()
     const char *rowVal[kNumSettings];
     int listCount;
     if (setSection < 0) {
-        static const char *topNames[kTopCount] = {"Node", "LoRa", "WiFi", "MQTT", "Device", "Radio"};
+        static const char *topNames[kTopCount] = {"Node", "LoRa", "WiFi", "MQTT", "Device", "Radio", "About"};
         // Sections show a ">" marker, not a value: previewing ONE of many
         // sub-items ("LoRa: MediumFast") read as if that WAS the setting and
         // sent people hunting in the wrong place. Direct entries (WiFi, MQTT,
         // Radio) are single-valued, so their previews stay.
-        static const uint8_t topPreview[kTopCount] = {0, 0, 11, 12, 0, 14};
-        static const bool topIsSection[kTopCount] = {true, true, false, false, true, false};
+        static const uint8_t topPreview[kTopCount] = {0, 0, 11, 12, 0, 14, 0};
+        static const bool topIsSection[kTopCount] = {true, true, false, false, true, false, true};
         listCount = kTopCount;
         for (int i = 0; i < kTopCount; i++) {
             rowLabel[i] = topNames[i];
@@ -4958,10 +5033,11 @@ void AdvUI::handleKey(char ch)
         int listCount = setSection < 0    ? kTopCount
                         : setSection == 0 ? (int)sizeof(kSecNode)
                         : setSection == 1 ? (int)sizeof(kSecLora)
+                        : setSection == 3 ? 0 // About has no rows to move between
                                           : (int)sizeof(kSecDevice);
         if (esc) {
             if (setSection >= 0) { // back to the top level, cursor on the section's row
-                setSel = setSection == 0 ? 0 : setSection == 1 ? 1 : 4;
+                setSel = setSection == 0 ? 0 : setSection == 1 ? 1 : setSection == 3 ? 6 : 4;
                 setSection = -1;
                 setScroll = 0;
             } else {
@@ -4984,6 +5060,11 @@ void AdvUI::handleKey(char ch)
                     break;
                 case 4: // Device
                     setSection = 2;
+                    setSel = 0;
+                    setScroll = 0;
+                    break;
+                case 6: // About
+                    setSection = 3;
                     setSel = 0;
                     setScroll = 0;
                     break;

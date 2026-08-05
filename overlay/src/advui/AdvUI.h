@@ -65,6 +65,7 @@ class AdvUI : public concurrency::OSThread
     void drawNodeList();
     void drawPicker();
     void drawNode();
+    void drawAbout(lgfx::LGFXBase *g);
     void drawSettings();
     void openSetting(int item); // dispatch a settings item (flat index) to its editor/picker
     void drawSetName();

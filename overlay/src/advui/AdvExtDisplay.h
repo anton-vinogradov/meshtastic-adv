@@ -26,10 +26,6 @@
 namespace advui
 {
 
-// 320 wide from a 240-wide canvas: fills the panel edge to edge and leaves a
-// 30 px band above and below the scaled image, which stays black.
-constexpr float kExtZoom = 320.0f / 240.0f;
-
 class AdvExtDisplay : public lgfx::LGFX_Device
 {
     lgfx::Panel_ILI9341 _panel;

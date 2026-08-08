@@ -150,6 +150,7 @@ constexpr int kNumSettings = 21; // the flat item table: Name..Channel, Role..Re
 const uint8_t kSecNode[] = {0, 1};                    // Name, Short
 const uint8_t kSecLora[] = {2, 3, 4, 5, 6, 7, 8, 9};  // Region..Rebroadcast
 const uint8_t kSecDevice[] = {10, 16, 18, 19, 13, 20, 17, 15}; // UTC, Clock, Sort, Names, Screen, 2nd screen, GPS, Font (read-only)
+
 constexpr int kTopCount = 7;                          // Node, LoRa, WiFi, MQTT, Device, Radio, About
 Msg g_msgs[kMaxMsgs];
 int g_msgCount = 0;         // populated slots (grows to kMaxMsgs)
@@ -344,7 +345,10 @@ uint8_t g_nameShort = 0;
 // Mirror to an external ILI9341 on the EXT header. Off by default and, when off,
 // costs exactly nothing: the driver object is never constructed and pushFrame()
 // returns after the built-in push. Only meaningful in companion mode — see extInit().
-uint8_t g_extScreen = 0;
+// 0 = no second panel; otherwise the LovyanGFX rotation it is mounted at. Which one
+// is the builder's business, not ours: the M5PORKCHOP_DualScreen harness wants 7, and
+// the first panel built against this firmware came out mirrored with exactly that.
+uint8_t g_extRot = 0;
 AdvExtDisplay *g_ext = nullptr;
 const char *kUiCfgPath = "/advui_ui.bin";
 int32_t g_screenOffSec = 300; // screen auto-off timeout; 0 = never
@@ -1275,8 +1279,13 @@ const EnumOpt kScreenOpts[] = {{"15 s", 15}, {"30 s", 30}, {"1 min", 60}, {"5 mi
 // rest are single-criterion. Unread stays pinned on top in every mode.
 const EnumOpt kSortOpts[] = {{"Smart", 0}, {"Last heard", 1}, {"Name", 2}, {"Hops", 3}};
 const EnumOpt kNameOpts[] = {{"Long", 0}, {"Short", 1}};
-const EnumOpt kExtOpts[] = {{"Off", 0}, {"On", 1}};
-constexpr int kExtCount = 2;
+// One row, not two: nobody wants to switch a panel on and then go hunting for which
+// way up it is. The value is the LovyanGFX rotation, with 0 standing for "no panel" —
+// rotation 0 is portrait, which is never offered, so it is free to mean off. Only
+// landscape orientations are listed: 1 and 3 are the two ways round, 5 and 7 the same
+// mirrored. Portrait would squeeze a 240x135 frame into a stripe down the middle.
+const EnumOpt kExtOpts[] = {{"Off", 0}, {"Normal", 3}, {"Flip", 1}, {"Mirror", 7}, {"Mirror flip", 5}};
+constexpr int kExtCount = 5;
 constexpr int kNameCount = 2;
 // Only offered when there's no font partition: loading from the card costs
 // ~32 KB of heap (see AdvFont.h), enough to cost this board its networking.
@@ -1300,7 +1309,9 @@ void saveUiCfg()
     int8_t b = (int8_t)g_battRest; // -1 when never sampled off-charge
     f.write((uint8_t *)&b, 1);
     f.write(&g_nameShort, 1);
-    f.write(&g_extScreen, 1);
+    uint8_t on = g_extRot ? 1 : 0; // v0.5.0 wrote the pair; keep the shape, derive both
+    f.write(&on, 1);
+    f.write(&g_extRot, 1);
     f.close();
 }
 
@@ -1318,9 +1329,11 @@ void loadUiCfg()
     uint8_t ns = 0;
     if (f.read(&ns, 1) == 1 && ns <= 1)
         g_nameShort = ns;
-    uint8_t es = 0;
-    if (f.read(&es, 1) == 1 && es <= 1)
-        g_extScreen = es;
+    uint8_t es = 0, er = 0;
+    const bool haveOn = f.read(&es, 1) == 1;
+    const bool haveRot = f.read(&er, 1) == 1;
+    if (haveOn && es) // a v0.5.0 file says on; take its orientation when the menu still offers it
+        g_extRot = (haveRot && (er == 1 || er == 3 || er == 5 || er == 7)) ? er : 3;
     f.close();
 }
 const EnumOpt kRoleOpts2[] = {{"Client", 0},      {"Client Mute", 1}, {"Client Hidden", 8},
@@ -1367,7 +1380,7 @@ PickList pickListFor(int target)
     case 2: return {kUtcOpts, kUtcCount, "UTC offset"};
     case 10: return {kSortOpts, kSortCount, "Node sort"};
     case 11: return {kNameOpts, kNameCount, "Node names"};
-    case 13: return {kExtOpts, kExtCount, "2nd screen"};
+    case 13: return {kExtOpts, kExtCount, "2nd screen"};  // off, or how it is mounted
     case 12: return {kFontOpts, kFontCount, "Unicode font"};
     case 4: return {kScreenOpts, kScreenCount, "Screen off"};
     case 5: return {kRoleOpts2, kRoleCount, "Role"};
@@ -3782,24 +3795,25 @@ bool AdvUI::applyName()
     return false;
 }
 
+
 // Brings up the external panel. Guarded twice on purpose: the pins it drives are
 // CS 5, RST 3 and DC 6, which are the SX1262's NSS, RST and BUSY. Touching them with
 // a cap fitted would fight the radio for its chip select, so this refuses to run
 // outside companion mode even if the stored flag says otherwise.
 void AdvUI::extInit()
 {
-    if (g_ext || !g_extScreen || !g_radioCompanion)
+    if (g_ext || !g_extRot || !g_radioCompanion)
         return;
     g_ext = new (std::nothrow) AdvExtDisplay();
     if (!g_ext) {
         LOG_WARN("advui: no memory for the second screen");
-        g_extScreen = 0;
+        g_extRot = 0;
         return;
     }
     {
         concurrency::LockGuard guard(spiLock); // the SD card is on this bus too
         g_ext->init();
-        g_ext->setRotation(7); // 240x320 panel driven as 320x240 landscape
+        g_ext->setRotation(g_extRot); // however the builder mounted it
         g_ext->fillScreen(0);
     }
     canvas.setPivot(120, 67); // centre of our frame, the anchor pushFrame() scales about
@@ -3830,8 +3844,14 @@ void AdvUI::pushFrame()
     canvas.pushSprite(0, 0);
     if (!g_ext)
         return;
+    // Fit rather than a fixed factor: rotation changes which way round the panel is,
+    // and a 90-degree mount turns 320x240 into 240x320. Scale to whichever axis runs
+    // out first and centre it; the remainder stays black.
+    const float zx = (float)g_ext->width() / 240.0f;
+    const float zy = (float)g_ext->height() / 135.0f;
+    const float z = zx < zy ? zx : zy;
     concurrency::LockGuard guard(spiLock);
-    canvas.pushRotateZoom(g_ext, 160, 120, 0.0f, kExtZoom, kExtZoom);
+    canvas.pushRotateZoom(g_ext, g_ext->width() / 2.0f, g_ext->height() / 2.0f, 0.0f, z, z);
 }
 
 // Who made this, what it is built on, and where to go with a question. The font
@@ -4015,7 +4035,7 @@ void AdvUI::drawSettings()
     strcpy(vals[19], kNameOpts[g_nameShort ? 1 : 0].name);
     // Says why it is unavailable rather than silently showing "Off": these pins belong
     // to the radio, so the answer depends on which radio mode the node is running.
-    strcpy(vals[20], !g_radioCompanion ? "companion only" : (g_extScreen ? "On" : "Off"));
+    strcpy(vals[20], !g_radioCompanion ? "companion only" : optName(kExtOpts, kExtCount, (int)g_extRot));
 
     // What the current level shows: top = sections + direct entries (with a
     // representative value as the preview), sub = the section's flat items.
@@ -4999,7 +5019,7 @@ void AdvUI::openSetting(int item)
         if (!g_radioCompanion)
             return;
         pickTarget = 13;
-        pickSel = g_extScreen ? 1 : 0;
+        pickSel = optIndex(kExtOpts, kExtCount, (int)g_extRot);
         pickScroll = 0;
         mode = MODE_PICKLIST;
     } else if (item == 19) { // node-list name style -> picker
@@ -5284,13 +5304,18 @@ void AdvUI::handleKey(char ch)
                 g_nameShort = (uint8_t)kNameOpts[pickSel].value;
                 saveUiCfg();
                 mode = MODE_SETTINGS;
-            } else if (pickTarget == 13) { // second screen: brought up or torn down live
-                g_extScreen = (uint8_t)kExtOpts[pickSel].value;
+            } else if (pickTarget == 13) { // second screen: off, or mounted this way round
+                g_extRot = (uint8_t)kExtOpts[pickSel].value;
                 saveUiCfg();
-                if (g_extScreen)
-                    extInit();
-                else
+                if (!g_extRot) {
                     extStop();
+                } else if (g_ext) { // already up: just turn the picture round
+                    concurrency::LockGuard guard(spiLock);
+                    g_ext->setRotation(g_extRot);
+                    g_ext->fillScreen(0); // the letterbox bands move with it
+                } else {
+                    extInit();
+                }
                 mode = MODE_SETTINGS;
             } else if (pickTarget == 12) { // unicode font from the card: live, both ways
                 if (kFontOpts[pickSel].value)

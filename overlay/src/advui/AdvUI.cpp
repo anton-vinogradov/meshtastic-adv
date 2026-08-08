@@ -149,7 +149,8 @@ constexpr int kNumSettings = 22; // the flat item table: Name..Channel, Role..Re
 // as direct entries); a section lists indices into the flat item table.
 const uint8_t kSecNode[] = {0, 1};                    // Name, Short
 const uint8_t kSecLora[] = {2, 3, 4, 5, 6, 7, 8, 9};  // Region..Rebroadcast
-const uint8_t kSecDevice[] = {10, 16, 18, 19, 13, 20, 21, 17, 15}; // UTC, Clock, Sort, Names, Screen, 2nd screen, GPS, Font (read-only)
+const uint8_t kSecDevice[] = {10, 16, 18, 19, 13, 20, 21, 17, 15}; // UTC, Clock, Sort, Names, Screen, 2nd screen, 2nd rotate, GPS, Font (read-only)
+
 constexpr int kTopCount = 7;                          // Node, LoRa, WiFi, MQTT, Device, Radio, About
 Msg g_msgs[kMaxMsgs];
 int g_msgCount = 0;         // populated slots (grows to kMaxMsgs)
@@ -3801,6 +3802,21 @@ bool AdvUI::applyName()
     return false;
 }
 
+// The Device section is the only one whose contents vary, so its rows are built in one
+// place: the renderer and the key handler must agree on what row 5 is, or Enter opens
+// the wrong setting. Rotation only means anything once a panel is switched on, and it
+// is noise on every device that has none.
+int deviceItems(uint8_t *out)
+{
+    int n = 0;
+    for (uint8_t it : kSecDevice) {
+        if (it == 21 && !(g_radioCompanion && g_extScreen))
+            continue;
+        out[n++] = it;
+    }
+    return n;
+}
+
 // Brings up the external panel. Guarded twice on purpose: the pins it drives are
 // CS 5, RST 3 and DC 6, which are the SX1262's NSS, RST and BUSY. Touching them with
 // a cap fitted would fight the radio for its chip select, so this refuses to run
@@ -4062,8 +4078,10 @@ void AdvUI::drawSettings()
             rowVal[i] = topIsSection[i] ? ">" : vals[topPreview[i]];
         }
     } else {
-        const uint8_t *items = setSection == 0 ? kSecNode : setSection == 1 ? kSecLora : kSecDevice;
-        listCount = setSection == 0 ? (int)sizeof(kSecNode) : setSection == 1 ? (int)sizeof(kSecLora) : (int)sizeof(kSecDevice);
+        uint8_t dev[sizeof(kSecDevice)];
+        const int devCount = deviceItems(dev);
+        const uint8_t *items = setSection == 0 ? kSecNode : setSection == 1 ? kSecLora : dev;
+        listCount = setSection == 0 ? (int)sizeof(kSecNode) : setSection == 1 ? (int)sizeof(kSecLora) : devCount;
         for (int i = 0; i < listCount; i++) {
             rowLabel[i] = labels[items[i]];
             rowVal[i] = vals[items[i]];
@@ -5142,12 +5160,14 @@ void AdvUI::handleKey(char ch)
     }
 
     if (mode == MODE_SETTINGS) {
-        const uint8_t *items = setSection == 0 ? kSecNode : setSection == 1 ? kSecLora : kSecDevice;
+        uint8_t dev[sizeof(kSecDevice)];
+        const int devCount = deviceItems(dev);
+        const uint8_t *items = setSection == 0 ? kSecNode : setSection == 1 ? kSecLora : dev;
         int listCount = setSection < 0    ? kTopCount
                         : setSection == 0 ? (int)sizeof(kSecNode)
                         : setSection == 1 ? (int)sizeof(kSecLora)
                         : setSection == 3 ? 0 // About has no rows to move between
-                                          : (int)sizeof(kSecDevice);
+                                          : devCount;
         if (esc) {
             if (setSection >= 0) { // back to the top level, cursor on the section's row
                 setSel = setSection == 0 ? 0 : setSection == 1 ? 1 : setSection == 3 ? 6 : 4;
@@ -5333,6 +5353,10 @@ void AdvUI::handleKey(char ch)
                     extInit();
                 else
                     extStop();
+                // Turning it off removes the rotation row underneath it: put the cursor
+                // back on a row that still exists.
+                setSel = 0;
+                setScroll = 0;
                 mode = MODE_SETTINGS;
             } else if (pickTarget == 12) { // unicode font from the card: live, both ways
                 if (kFontOpts[pickSel].value)

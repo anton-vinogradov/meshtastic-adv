@@ -2,6 +2,8 @@
 #include "AdvBle.h"
 #include "AdvVersion.h"
 #include "AdvFont.h"
+#include "SPILock.h" // the external panel shares SPI2 with the SD card
+#include <new> // std::nothrow: the second-screen driver must fail soft, not abort
 #include "BluetoothStatus.h"
 #include "CyrillicFont.h"
 #include "FSCommon.h"
@@ -141,13 +143,13 @@ const char *errName(uint8_t e, bool broadcast)
 constexpr int kMaxMsgs = 32; // shared across all conversations; DMs are protected by the
                              // channel-first eviction (addMsg), not by size, so this stays small
                              // to keep the heap margin — a connected phone + BLE runs it thin
-constexpr int kNumSettings = 20; // the flat item table: Name..Channel, Role..Rebroadcast, UTC, WiFi, MQTT, Screen, Radio, Font, Clock, GPS, Sort, Names
+constexpr int kNumSettings = 21; // the flat item table: Name..Channel, Role..Rebroadcast, UTC, WiFi, MQTT, Screen, Radio, Font, Clock, GPS, Sort, Names, 2nd screen
 
 // The Settings menu is two-level: the top lists sections (plus WiFi/MQTT/Radio
 // as direct entries); a section lists indices into the flat item table.
 const uint8_t kSecNode[] = {0, 1};                    // Name, Short
 const uint8_t kSecLora[] = {2, 3, 4, 5, 6, 7, 8, 9};  // Region..Rebroadcast
-const uint8_t kSecDevice[] = {10, 16, 18, 19, 13, 17, 15}; // UTC, Clock, Sort, Names, Screen, GPS, Font (read-only)
+const uint8_t kSecDevice[] = {10, 16, 18, 19, 13, 20, 17, 15}; // UTC, Clock, Sort, Names, Screen, 2nd screen, GPS, Font (read-only)
 constexpr int kTopCount = 7;                          // Node, LoRa, WiFi, MQTT, Device, Radio, About
 Msg g_msgs[kMaxMsgs];
 int g_msgCount = 0;         // populated slots (grows to kMaxMsgs)
@@ -339,6 +341,11 @@ uint8_t g_nodeSort = 0;
 // (falls back to long). Long reads better on this 240px list, but users coming
 // from the phone app expect the short call-sign — so it's a choice, not a rule.
 uint8_t g_nameShort = 0;
+// Mirror to an external ILI9341 on the EXT header. Off by default and, when off,
+// costs exactly nothing: the driver object is never constructed and pushFrame()
+// returns after the built-in push. Only meaningful in companion mode — see extInit().
+uint8_t g_extScreen = 0;
+AdvExtDisplay *g_ext = nullptr;
 const char *kUiCfgPath = "/advui_ui.bin";
 int32_t g_screenOffSec = 300; // screen auto-off timeout; 0 = never
 
@@ -1268,6 +1275,8 @@ const EnumOpt kScreenOpts[] = {{"15 s", 15}, {"30 s", 30}, {"1 min", 60}, {"5 mi
 // rest are single-criterion. Unread stays pinned on top in every mode.
 const EnumOpt kSortOpts[] = {{"Smart", 0}, {"Last heard", 1}, {"Name", 2}, {"Hops", 3}};
 const EnumOpt kNameOpts[] = {{"Long", 0}, {"Short", 1}};
+const EnumOpt kExtOpts[] = {{"Off", 0}, {"On", 1}};
+constexpr int kExtCount = 2;
 constexpr int kNameCount = 2;
 // Only offered when there's no font partition: loading from the card costs
 // ~32 KB of heap (see AdvFont.h), enough to cost this board its networking.
@@ -1291,6 +1300,7 @@ void saveUiCfg()
     int8_t b = (int8_t)g_battRest; // -1 when never sampled off-charge
     f.write((uint8_t *)&b, 1);
     f.write(&g_nameShort, 1);
+    f.write(&g_extScreen, 1);
     f.close();
 }
 
@@ -1308,6 +1318,9 @@ void loadUiCfg()
     uint8_t ns = 0;
     if (f.read(&ns, 1) == 1 && ns <= 1)
         g_nameShort = ns;
+    uint8_t es = 0;
+    if (f.read(&es, 1) == 1 && es <= 1)
+        g_extScreen = es;
     f.close();
 }
 const EnumOpt kRoleOpts2[] = {{"Client", 0},      {"Client Mute", 1}, {"Client Hidden", 8},
@@ -1354,6 +1367,7 @@ PickList pickListFor(int target)
     case 2: return {kUtcOpts, kUtcCount, "UTC offset"};
     case 10: return {kSortOpts, kSortCount, "Node sort"};
     case 11: return {kNameOpts, kNameCount, "Node names"};
+    case 13: return {kExtOpts, kExtCount, "2nd screen"};
     case 12: return {kFontOpts, kFontCount, "Unicode font"};
     case 4: return {kScreenOpts, kScreenCount, "Screen off"};
     case 5: return {kRoleOpts2, kRoleCount, "Role"};
@@ -2215,6 +2229,7 @@ void AdvUI::initHardware()
         // central link needs that heap.
         config.bluetooth.enabled = false;
         bleCompanionInit(); // BLE central for the companion link (scan/pair/connect)
+        extInit();          // external panel, if the user turned it on (companion only)
     }
     bootMs = millis();
     drawSplash(); // branded splash instead of black while the mesh comes up
@@ -2245,7 +2260,7 @@ void AdvUI::drawKbMissing()
     g->setCursor((240 - g->textWidth(t4)) / 2, 96);
     g->print(t4);
     if (haveCanvas)
-        canvas.pushSprite(0, 0);
+        pushFrame();
 }
 
 void AdvUI::drawSplash()
@@ -2284,7 +2299,7 @@ void AdvUI::drawSplash()
     g->print(vline);
 
     if (haveCanvas)
-        canvas.pushSprite(0, 0);
+        pushFrame();
 }
 
 // Picks incoming text messages out of the FromRadio stream and files them in the
@@ -2874,7 +2889,7 @@ void AdvUI::drawChats()
         g->print("type a name to find a node");
         drawFooter(g, "type find   Tab: all nodes");
         if (haveCanvas)
-            canvas.pushSprite(0, 0);
+            pushFrame();
         return;
     }
 
@@ -2969,7 +2984,7 @@ void AdvUI::drawChats()
         drawFooter(g, "ENTER open  Del erase  Tab nodes");
 
     if (haveCanvas)
-        canvas.pushSprite(0, 0);
+        pushFrame();
 }
 
 void AdvUI::drawNodeList()
@@ -3068,7 +3083,7 @@ void AdvUI::drawNodeList()
     drawFooter(g, "</>fav  ENTER open  type find  ESC/Tab chats");
 
     if (haveCanvas)
-        canvas.pushSprite(0, 0);
+        pushFrame();
 }
 
 void AdvUI::rebuildFiltered()
@@ -3130,7 +3145,7 @@ void AdvUI::drawPicker()
     drawFooter(g, "up/dn  </>fav  ENTER open  ESC back");
 
     if (haveCanvas)
-        canvas.pushSprite(0, 0);
+        pushFrame();
 }
 
 void AdvUI::drawNode()
@@ -3611,7 +3626,7 @@ void AdvUI::drawNode()
     }
 
     if (haveCanvas)
-        canvas.pushSprite(0, 0);
+        pushFrame();
 }
 
 void AdvUI::drawSetName()
@@ -3644,7 +3659,7 @@ void AdvUI::drawSetName()
     drawFooter(g, "type   ENTER save   ESC cancel");
 
     if (haveCanvas)
-        canvas.pushSprite(0, 0);
+        pushFrame();
 }
 
 // Writes the edited name into the engine's owner and broadcasts it — the same
@@ -3767,6 +3782,58 @@ bool AdvUI::applyName()
     return false;
 }
 
+// Brings up the external panel. Guarded twice on purpose: the pins it drives are
+// CS 5, RST 3 and DC 6, which are the SX1262's NSS, RST and BUSY. Touching them with
+// a cap fitted would fight the radio for its chip select, so this refuses to run
+// outside companion mode even if the stored flag says otherwise.
+void AdvUI::extInit()
+{
+    if (g_ext || !g_extScreen || !g_radioCompanion)
+        return;
+    g_ext = new (std::nothrow) AdvExtDisplay();
+    if (!g_ext) {
+        LOG_WARN("advui: no memory for the second screen");
+        g_extScreen = 0;
+        return;
+    }
+    {
+        concurrency::LockGuard guard(spiLock); // the SD card is on this bus too
+        g_ext->init();
+        g_ext->setRotation(7); // 240x320 panel driven as 320x240 landscape
+        g_ext->fillScreen(0);
+    }
+    canvas.setPivot(120, 67); // centre of our frame, the anchor pushFrame() scales about
+    LOG_INFO("advui: second screen up (ILI9341 320x240 on the EXT header)");
+}
+
+void AdvUI::extStop()
+{
+    if (!g_ext)
+        return;
+    {
+        concurrency::LockGuard guard(spiLock);
+        g_ext->fillScreen(0);
+    }
+    delete g_ext;
+    g_ext = nullptr;
+    LOG_INFO("advui: second screen off");
+}
+
+// The single place a finished frame reaches the panels. The external one gets the
+// same canvas scaled to its width — no second framebuffer, which is the whole reason
+// this fits: a second 240x135 buffer would be another 32,400 bytes, and 64,800 total
+// is the figure that already starved esp-aes and broke PKI on this chip.
+void AdvUI::pushFrame()
+{
+    if (!haveCanvas)
+        return;
+    canvas.pushSprite(0, 0);
+    if (!g_ext)
+        return;
+    concurrency::LockGuard guard(spiLock);
+    canvas.pushRotateZoom(g_ext, 160, 120, 0.0f, kExtZoom, kExtZoom);
+}
+
 // Who made this, what it is built on, and where to go with a question. The font
 // credit is not decoration: GNU Unifont ships under the OFL / GPL font exception,
 // and this firmware carries 2.2 MB of it.
@@ -3848,14 +3915,15 @@ void AdvUI::drawSettings()
         drawAbout(g);
         drawFooter(g, "ESC back");
         if (haveCanvas)
-            canvas.pushSprite(0, 0);
+            pushFrame();
         return;
     }
 
     const char *labels[kNumSettings] = {"Name", "Short",       "Region", "Preset", "Frequency",
                                         "Channel", "Role",     "Hops",   "Power",  "Rebroadcast",
                                         "UTC",     "WiFi",     "MQTT",   "Screen", "Radio",
-                                        "Font",    "Clock",    "GPS",    "Sort",  "Names"};
+                                        "Font",    "Clock",    "GPS",    "Sort",  "Names",
+                                        "2nd screen"};
     char vals[kNumSettings][24];
     if (g_radioCompanion) { // rows 0-5 show (and remote-admin edit) the linked node
         meshtastic_NodeInfoLite *me = g_linkMyNode ? nodeByNum(g_linkMyNode) : nullptr;
@@ -3945,6 +4013,9 @@ void AdvUI::drawSettings()
     strcpy(vals[17], config.position.gps_mode == meshtastic_Config_PositionConfig_GpsMode_ENABLED ? "on" : "off");
     strcpy(vals[18], kSortOpts[g_nodeSort < kSortCount ? g_nodeSort : 0].name);
     strcpy(vals[19], kNameOpts[g_nameShort ? 1 : 0].name);
+    // Says why it is unavailable rather than silently showing "Off": these pins belong
+    // to the radio, so the answer depends on which radio mode the node is running.
+    strcpy(vals[20], !g_radioCompanion ? "companion only" : (g_extScreen ? "On" : "Off"));
 
     // What the current level shows: top = sections + direct entries (with a
     // representative value as the preview), sub = the section's flat items.
@@ -4006,7 +4077,7 @@ void AdvUI::drawSettings()
     drawFooter(g, setSection < 0 ? "up/dn   ENTER open   ESC back" : "up/dn   ENTER edit   ESC sections");
 
     if (haveCanvas)
-        canvas.pushSprite(0, 0);
+        pushFrame();
 }
 
 // WiFi / MQTT sub-settings page (booleans toggle on Enter, text via the name editor).
@@ -4162,7 +4233,7 @@ void AdvUI::drawNetPage()
     drawFooter(g, netDirty ? "ENTER edit   ESC save+reboot" : "ENTER edit   ESC back");
 
     if (haveCanvas)
-        canvas.pushSprite(0, 0);
+        pushFrame();
 }
 
 // Companion: scan for Meshtastic nodes over BLE and pick the radio to pair with.
@@ -4230,7 +4301,7 @@ void AdvUI::drawBleScan()
     drawFooter(g, "up/dn  ENTER connect  R rescan  ESC");
 
     if (haveCanvas)
-        canvas.pushSprite(0, 0);
+        pushFrame();
 }
 
 // Companion: the node is showing a pairing PIN on its screen — type it here.
@@ -4267,7 +4338,7 @@ void AdvUI::drawBlePin()
     drawFooter(g, "digits  ENTER ok  ESC cancel");
 
     if (haveCanvas)
-        canvas.pushSprite(0, 0);
+        pushFrame();
 }
 
 // Local mode: a phone is pairing with US — show the passkey it must enter (the
@@ -4304,7 +4375,7 @@ void AdvUI::drawBtPin()
     drawFooter(g, "ESC hide");
 
     if (haveCanvas)
-        canvas.pushSprite(0, 0);
+        pushFrame();
 }
 
 // Companion: link progress/status against the saved node.
@@ -4368,7 +4439,7 @@ void AdvUI::drawBleLink()
                                             : "R reconnect  F forget  ESC scan");
 
     if (haveCanvas)
-        canvas.pushSprite(0, 0);
+        pushFrame();
 }
 
 void AdvUI::drawPickList()
@@ -4432,7 +4503,7 @@ void AdvUI::drawPickList()
     drawFooter(g, "up/dn   ENTER select   ESC back");
 
     if (haveCanvas)
-        canvas.pushSprite(0, 0);
+        pushFrame();
 }
 
 void AdvUI::drawReboot()
@@ -4452,7 +4523,7 @@ void AdvUI::drawReboot()
     g->print(t2);
 
     if (haveCanvas)
-        canvas.pushSprite(0, 0);
+        pushFrame();
 }
 
 // Emoji palette: a grid of bitmaps; Enter inserts the picked emoji into the message.
@@ -4481,7 +4552,7 @@ void AdvUI::drawEmoji()
     drawFooter(g, "arrows  ENTER insert  ESC back");
 
     if (haveCanvas)
-        canvas.pushSprite(0, 0);
+        pushFrame();
 }
 
 #ifdef ADVUI_SCREENSHOT
@@ -4922,6 +4993,15 @@ void AdvUI::openSetting(int item)
         pickSel = strcmp(sdFontState(), "sd") == 0 ? 1 : 0;
         pickScroll = 0;
         mode = MODE_PICKLIST;
+    } else if (item == 20) { // second screen -> picker, companion only
+        // Refuse outright rather than let the picker set a flag that extInit() will
+        // ignore: with a cap fitted, CS/RST/DC are the radio's NSS/RST/BUSY.
+        if (!g_radioCompanion)
+            return;
+        pickTarget = 13;
+        pickSel = g_extScreen ? 1 : 0;
+        pickScroll = 0;
+        mode = MODE_PICKLIST;
     } else if (item == 19) { // node-list name style -> picker
         pickTarget = 11;
         pickSel = g_nameShort ? 1 : 0;
@@ -5203,6 +5283,14 @@ void AdvUI::handleKey(char ch)
             } else if (pickTarget == 11) { // long vs short names: live, same tiny file
                 g_nameShort = (uint8_t)kNameOpts[pickSel].value;
                 saveUiCfg();
+                mode = MODE_SETTINGS;
+            } else if (pickTarget == 13) { // second screen: brought up or torn down live
+                g_extScreen = (uint8_t)kExtOpts[pickSel].value;
+                saveUiCfg();
+                if (g_extScreen)
+                    extInit();
+                else
+                    extStop();
                 mode = MODE_SETTINGS;
             } else if (pickTarget == 12) { // unicode font from the card: live, both ways
                 if (kFontOpts[pickSel].value)

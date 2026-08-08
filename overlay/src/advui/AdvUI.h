@@ -1,6 +1,7 @@
 #pragma once
 
 #include "AdvDisplay.h"
+#include "AdvExtDisplay.h"
 #include "AdvKeyboard.h"
 #include "concurrency/OSThread.h"
 #include "mesh/PhoneAPI.h"
@@ -65,6 +66,9 @@ class AdvUI : public concurrency::OSThread
     void drawNodeList();
     void drawPicker();
     void drawNode();
+    void extInit();
+    void extStop();
+    void pushFrame(); // finished frame -> built-in panel, and the external one when on
     void drawAbout(lgfx::LGFXBase *g);
     void drawSettings();
     void openSetting(int item); // dispatch a settings item (flat index) to its editor/picker

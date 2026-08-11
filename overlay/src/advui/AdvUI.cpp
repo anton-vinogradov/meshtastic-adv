@@ -59,9 +59,44 @@ const char *nodeName(const meshtastic_NodeInfoLite *n)
     return n->long_name[0] ? n->long_name : n->short_name;
 }
 
+// Favourites the Cardputer owns, as opposed to the ones living in a node database.
+// In companion mode the database belongs to the node being driven, not to us, so the
+// flag there is not ours to set — which is why the arrows silently did nothing in that
+// mode while channel favourites, which were always local state, worked fine.
+constexpr int kMaxFavNodes = 24;
+uint32_t g_favNodes[kMaxFavNodes];
+uint8_t g_favNodeCount = 0;
+
+bool favNodeLocal(uint32_t num)
+{
+    for (uint8_t i = 0; i < g_favNodeCount; i++)
+        if (g_favNodes[i] == num)
+            return true;
+    return false;
+}
+
+// Returns true when the set actually changed, so callers know whether to persist.
+bool setFavNodeLocal(uint32_t num, bool on)
+{
+    for (uint8_t i = 0; i < g_favNodeCount; i++) {
+        if (g_favNodes[i] != num)
+            continue;
+        if (on)
+            return false;
+        g_favNodes[i] = g_favNodes[--g_favNodeCount]; // order carries no meaning here
+        return true;
+    }
+    if (!on || g_favNodeCount >= kMaxFavNodes)
+        return false;
+    g_favNodes[g_favNodeCount++] = num;
+    return true;
+}
+
 bool isFav(const meshtastic_NodeInfoLite *n)
 {
-    return n->bitfield & NODEINFO_BITFIELD_IS_FAVORITE_MASK;
+    if (n->bitfield & NODEINFO_BITFIELD_IS_FAVORITE_MASK)
+        return true;
+    return g_favNodeCount && favNodeLocal(n->num);
 }
 
 // Case-insensitive substring match; empty needle matches everything.
@@ -1312,6 +1347,9 @@ void saveUiCfg()
     uint8_t on = g_extRot ? 1 : 0; // v0.5.0 wrote the pair; keep the shape, derive both
     f.write(&on, 1);
     f.write(&g_extRot, 1);
+    f.write(&g_favNodeCount, 1);
+    for (uint8_t i = 0; i < g_favNodeCount; i++)
+        f.write((uint8_t *)&g_favNodes[i], 4);
     f.close();
 }
 
@@ -1334,6 +1372,17 @@ void loadUiCfg()
     const bool haveRot = f.read(&er, 1) == 1;
     if (haveOn && es) // a v0.5.0 file says on; take its orientation when the menu still offers it
         g_extRot = (haveRot && (er == 1 || er == 3 || er == 5 || er == 7)) ? er : 3;
+    uint8_t fc = 0;
+    g_favNodeCount = 0; // replace, never append: a second call would run off the array
+    if (f.read(&fc, 1) == 1) {
+        for (uint8_t i = 0; i < fc && g_favNodeCount < kMaxFavNodes; i++) {
+            uint32_t num = 0;
+            if (f.read((uint8_t *)&num, 4) != 4)
+                break;
+            if (num)
+                g_favNodes[g_favNodeCount++] = num;
+        }
+    }
     f.close();
 }
 const EnumOpt kRoleOpts2[] = {{"Client", 0},      {"Client Mute", 1}, {"Client Hidden", 8},
@@ -2383,7 +2432,9 @@ void AdvUI::handleFromRadio(const meshtastic_FromRadio &fr)
     addMsg(p.from, p.to, p.channel, p.rx_time, unread, text, p.id, status, p.decoded.reply_id);
 
     if (unread) {
-        bool fav = (p.to == NODENUM_BROADCAST) ? chanFav(p.channel) : (!g_radioCompanion && nodeDB && nodeDB->isFavorite(p.from));
+        bool fav = (p.to == NODENUM_BROADCAST)
+                       ? chanFav(p.channel)
+                       : ((!g_radioCompanion && nodeDB && nodeDB->isFavorite(p.from)) || favNodeLocal(p.from));
 #ifdef HAS_NEOPIXEL
         // LED flash on any incoming: green from a favourite, blue otherwise.
         if (fav)
@@ -2779,6 +2830,30 @@ void AdvUI::deleteConversation(const Conv &c)
     histPurge(c.isChan, c.ch, c.node); // erase means erase: the flash archive too
 }
 
+// One node, favourited or not, wherever the user pressed the arrow. Both the chats
+// list and the node list route through here so they cannot drift apart — the chats
+// screen had its own copy, which kept the companion-mode bug alive in half the UI
+// after the node list was fixed.
+void AdvUI::favNode(uint32_t num, bool on)
+{
+    // Onboard, the node database is ours and its flag is the one the phone app and the
+    // rest of Meshtastic read. In companion mode that database belongs to the node we
+    // are driving, so the favourite is kept here instead.
+    if (nodeDB && !g_radioCompanion)
+        nodeDB->set_favorite(on, num);
+    else if (setFavNodeLocal(num, on))
+        saveUiCfg();
+}
+
+// Node number at a position in the filtered list, or 0 when there is nothing there.
+uint32_t AdvUI::nodeNumAt(int i)
+{
+    if (i < 0 || i >= filteredCount)
+        return 0;
+    meshtastic_NodeInfoLite *n = nodeAt(filtered[i]);
+    return n ? n->num : 0;
+}
+
 void AdvUI::favEntry(int s, bool on)
 {
     if (s < chanCount) {
@@ -2788,10 +2863,10 @@ void AdvUI::favEntry(int s, bool on)
         else
             g_favChannels &= ~(1u << ci);
         g_msgsDirty = true; // persisted alongside the messages
-    } else if (nodeDB && !g_radioCompanion) { // node favourites live in the local DB only
+    } else {
         meshtastic_NodeInfoLite *node = nodeAt(filtered[s - chanCount]);
         if (node)
-            nodeDB->set_favorite(on, node->num);
+            favNode(node->num, on);
     }
 }
 
@@ -2924,7 +2999,8 @@ void AdvUI::drawChats()
         if (i == sel)
             g->fillRect(0, y - 1, 240, rowH, 0x2945);
         bool unread = c.isChan ? hasUnreadChannel(c.ch) : hasUnreadFrom(c.node);
-        bool fav = c.isChan ? chanFav(c.ch) : (!g_radioCompanion && nodeDB && nodeDB->isFavorite(c.node));
+        bool fav = c.isChan ? chanFav(c.ch)
+                            : ((!g_radioCompanion && nodeDB && nodeDB->isFavorite(c.node)) || favNodeLocal(c.node));
 
         int nameX = 6;
         if (unread) { // red envelope before the name
@@ -5604,8 +5680,8 @@ void AdvUI::handleKey(char ch)
                     else
                         g_favChannels &= ~(1u << c.ch);
                     g_msgsDirty = true;
-                } else if (nodeDB && !g_radioCompanion) {
-                    nodeDB->set_favorite(left, c.node);
+                } else {
+                    favNode(c.node, left);
                 }
             }
             return;
@@ -5696,8 +5772,24 @@ void AdvUI::handleKey(char ch)
         return;
     }
     if (left || right) { // favourite / unfavourite the selected entry
-        if (sel < total)
+        if (sel < total) {
+            // Favouriting re-sorts the list under the cursor: the node jumps to the top
+            // and a different one takes its place at this index. Held down, the key
+            // repeat then favourited whatever slid underneath, painting a run of nodes
+            // yellow. Follow the node instead of the index, so the cursor stays on the
+            // one the user was pointing at, wherever the sort has moved it.
+            const bool isChan = sel < chanCount;
+            const uint32_t was = isChan ? 0 : nodeNumAt(sel - chanCount);
             favEntry(sel, left);
+            if (!isChan && was) {
+                rebuildFiltered();
+                for (int i = 0; i < filteredCount; i++)
+                    if (nodeNumAt(i) == was) {
+                        sel = chanCount + i;
+                        break;
+                    }
+            }
+        }
         return;
     }
     if (bksp) {

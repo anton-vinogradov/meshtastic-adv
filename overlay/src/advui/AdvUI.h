@@ -97,6 +97,8 @@ class AdvUI : public concurrency::OSThread
     void drawChannelRow(int chIdx, int y);
     void openEntry(int s); // open the combined-list entry at index s (channel or node)
     int firstUnreadIdx();  // ring index of the first unread message in the open thread, or -1
+    uint32_t nodeNumAt(int i);
+    void favNode(uint32_t num, bool on);
     void favEntry(int s, bool on);
     void handleFromRadio(const meshtastic_FromRadio &fr);
     void sendMessage(uint32_t to, const char *text, uint32_t replyId = 0);

@@ -33,6 +33,12 @@ class ReleaseWorkflowTests(unittest.TestCase):
         self.assertIn("secrets.HIL_FIXTURE_JSON", block)
         self.assertIn("umask 077", block)
         self.assertIn("--release-image", block)
+        self.assertNotIn("runner.temp", block.split("steps:", 1)[0])
+        self.assertEqual(block.count("${{ runner.temp }}"), 3)
+
+    def test_host_ci_runs_actionlint(self):
+        block = job("host-tests")
+        self.assertIn("docker://rhysd/actionlint:1.7.12", block)
 
     def test_malformed_release_tag_cannot_reach_physical_hil(self):
         host = job("host-tests")

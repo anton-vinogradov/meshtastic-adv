@@ -273,6 +273,7 @@ gate; production firmware is restored even on failure. RF routing is provided by
 the embedded upstream Meshtastic engine and is
 not re-tested as a release condition for the ADV UI layer. The private RF runner
 remains available as an explicit, manual integration diagnostic.
+The host gate also runs pinned `actionlint` validation over the workflow itself.
 
 Tags must use SemVer syntax. A stable `vX.Y.Z` tag updates the web installer and,
 when credentials are configured, M5Burner. A tag such as `vX.Y.Z-rc.1` passes the

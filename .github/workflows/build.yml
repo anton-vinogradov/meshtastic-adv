@@ -20,6 +20,10 @@ jobs:
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@v4
+      - name: Validate workflow definitions
+        uses: docker://rhysd/actionlint:1.7.12
+        with:
+          args: -color
       - uses: actions/setup-python@v5
         with:
           python-version: '3.11'
@@ -73,7 +77,7 @@ jobs:
       - name: Locate release images
         id: img
         run: |
-          echo "factory=$(ls firmware/.pio/build/m5stack-cardputer-adv-advui/*.factory.bin | head -1)" >> "$GITHUB_OUTPUT"
+          echo "factory=$(find firmware/.pio/build/m5stack-cardputer-adv-advui -maxdepth 1 -type f -name '*.factory.bin' -print -quit)" >> "$GITHUB_OUTPUT"
           echo "app=$(find firmware/.pio/build/m5stack-cardputer-adv-advui -maxdepth 1 -type f -name 'firmware-*.bin' ! -name '*.factory.bin' -print -quit)" >> "$GITHUB_OUTPUT"
 
       - uses: actions/upload-artifact@v4
@@ -97,8 +101,6 @@ jobs:
     concurrency:
       group: meshtastic-adv-physical-hil
       cancel-in-progress: false
-    env:
-      HIL_FIXTURE: ${{ runner.temp }}/meshtastic-adv-fixture-${{ github.run_id }}.json
     steps:
       - name: Checkout release source and pinned firmware
         uses: actions/checkout@v4
@@ -128,6 +130,7 @@ jobs:
 
       - name: Materialize the identity-bound lab fixture
         env:
+          HIL_FIXTURE: ${{ runner.temp }}/meshtastic-adv-fixture-${{ github.run_id }}.json
           HIL_FIXTURE_JSON: ${{ secrets.HIL_FIXTURE_JSON }}
         run: |
           umask 077
@@ -135,6 +138,8 @@ jobs:
           python -c 'import os,pathlib; p=pathlib.Path(os.environ["HIL_FIXTURE"]); p.write_text(os.environ["HIL_FIXTURE_JSON"]); p.chmod(0o600)'
 
       - name: Release behavioral HIL
+        env:
+          HIL_FIXTURE: ${{ runner.temp }}/meshtastic-adv-fixture-${{ github.run_id }}.json
         run: |
           python scripts/verify.py \
             --usb \
@@ -151,6 +156,8 @@ jobs:
 
       - name: Remove the identity-bound temporary fixture
         if: always()
+        env:
+          HIL_FIXTURE: ${{ runner.temp }}/meshtastic-adv-fixture-${{ github.run_id }}.json
         run: |
           case "$HIL_FIXTURE" in "$RUNNER_TEMP"/meshtastic-adv-fixture-*.json) ;; *) exit 2 ;; esac
           rm -f -- "$HIL_FIXTURE"
@@ -216,8 +223,8 @@ jobs:
           # copy back at the single site-root unifont.bin (2 MB, not per-version)
           jq '.builds[0].parts |= map(if .path == "unifont.bin" then .path = "../../unifont.bin" else . end)' \
             docs/manifest.json > "docs/versions/${GITHUB_REF_NAME}/manifest.json"
-          (cd docs/versions && ls -d v* | sort -rV | tail -n +7 | xargs -r rm -rf)
-          (cd docs/versions && ls -d v* | sort -rV) | jq -R . | jq -s . > docs/versions/index.json
+          (cd docs/versions && find . -mindepth 1 -maxdepth 1 -type d -name 'v*' -exec basename {} \; | sort -rV | tail -n +7 | xargs -r rm -rf)
+          (cd docs/versions && find . -mindepth 1 -maxdepth 1 -type d -name 'v*' -exec basename {} \; | sort -rV) | jq -R . | jq -s . > docs/versions/index.json
           python /tmp/check-installer.py docs
           git add docs/firmware.factory.bin docs/unifont.bin docs/manifest.json docs/versions
           if git diff --cached --quiet; then

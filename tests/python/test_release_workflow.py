@@ -36,6 +36,14 @@ class ReleaseWorkflowTests(unittest.TestCase):
         self.assertNotIn("runner.temp", block.split("steps:", 1)[0])
         self.assertEqual(block.count("${{ runner.temp }}"), 3)
 
+    def test_physical_hil_uses_relocatable_runner_python(self):
+        block = job("release-hil")
+        self.assertNotIn("actions/setup-python", block)
+        self.assertIn("command -v python3.12", block)
+        self.assertIn('python3.12 -m venv "$RUNNER_TEMP/meshtastic-adv-hil-venv"', block)
+        self.assertIn('echo "$RUNNER_TEMP/meshtastic-adv-hil-venv/bin" >> "$GITHUB_PATH"', block)
+        self.assertIn("python -m pip install -r hil/requirements.txt", block)
+
     def test_host_ci_runs_actionlint(self):
         block = job("host-tests")
         self.assertIn("docker://rhysd/actionlint:1.7.12", block)

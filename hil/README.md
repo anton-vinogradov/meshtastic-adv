@@ -274,6 +274,10 @@ the embedded upstream Meshtastic engine and is
 not re-tested as a release condition for the ADV UI layer. The private RF runner
 remains available as an explicit, manual integration diagnostic.
 The host gate also runs pinned `actionlint` validation over the workflow itself.
+The macOS runner must provide Homebrew `python3.12`; the job creates a private
+virtual environment under `RUNNER_TEMP`. It deliberately does not use
+`actions/setup-python`: downloadable macOS Python builds from that action are
+non-relocatable and require privileged access to `/Users/runner/hostedtoolcache`.
 
 Tags must use SemVer syntax. A stable `vX.Y.Z` tag updates the web installer and,
 when credentials are configured, M5Burner. A tag such as `vX.Y.Z-rc.1` passes the

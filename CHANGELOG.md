@@ -5,7 +5,46 @@ release notes remain available on the [GitHub Releases page](https://github.com/
 
 ## [Unreleased]
 
-This is the planned scope of the Meshtastic ADV 1.0 release candidate.
+No user-visible changes are pending after 1.0.3.
+
+## [1.0.3] - 2026-08-28
+
+### Fixed
+
+- Retrying a failed quoted DM now preserves its Meshtastic `reply_id`; rendered
+  quote context is resolved only against an earlier message in the current
+  conversation instead of an unrelated packet-ID collision.
+- Settings now cover every region and device role implemented by the pinned
+  2.7.26 engine, plus the active regional/common TX power values. The deliberate
+  US/26 dBm profile is preserved, and an unknown value refuses to open rather
+  than silently becoming the first picker option.
+- Long WiFi/MQTT fields keep their cursor visible by horizontally advancing on
+  complete UTF-8 runes.
+- Duplicate packets, unchanged reactions/ACKs and unrelated companion envelopes
+  no longer trigger a framebuffer redraw, LED flash or favourite alert.
+- The manual screenshot driver retries truncated serial frames and never writes
+  partial black PNGs or paths outside its selected output directory.
+
+### Changed
+
+- Recurring UI, BLE and keyboard intervals use the engine's rollover-safe
+  throttle helper. Dead keyboard multi-tap state was removed, reducing the
+  persistent keyboard object and simplifying held-key repeat timing.
+- Behavioral HIL now proves failed-reply retransmission on the actual wire field
+  and asserts that duplicate or ignored ingress is a no-op for visible UI state.
+- The installer validator checks all six archived images/manifests, exact index
+  order and uniqueness. Archive pruning validates every direct SemVer child
+  before any bounded removal instead of passing repository names to shell `rm`.
+- M5Burner publication now downloads the credential-free public CDN artifact and
+  verifies its size and SHA-256 against the tagged merged image.
+- Release and HIL environments bootstrap an audited, hash-locked `pip`, then
+  install the hash-locked PlatformIO CLI without its unused vulnerable Home web
+  stack. nanopb's gRPC generator is declared and locked instead of being
+  downloaded during a clean build.
+
+## [1.0.2] - 2026-08-27
+
+The 1.0 release line delivered the following product and release-engineering scope.
 
 ### Added
 
@@ -68,4 +107,6 @@ This is the planned scope of the Meshtastic ADV 1.0 release candidate.
   cannot reuse stale output, and prereleases cannot enter stable distribution
   channels.
 
-[Unreleased]: https://github.com/anton-vinogradov/meshtastic-adv/compare/v0.5.2...HEAD
+[Unreleased]: https://github.com/anton-vinogradov/meshtastic-adv/compare/v1.0.3...HEAD
+[1.0.3]: https://github.com/anton-vinogradov/meshtastic-adv/compare/v1.0.2...v1.0.3
+[1.0.2]: https://github.com/anton-vinogradov/meshtastic-adv/compare/v0.5.2...v1.0.2

@@ -3,6 +3,7 @@
 #include "AdvStorage.h"
 #include "BluetoothCommon.h" // MESH_SERVICE_UUID + characteristic UUIDs
 #include "DebugConfiguration.h"
+#include "Throttle.h"
 #include "configuration.h"
 #include "mesh/generated/meshtastic/mesh.pb.h"
 #include "mesh/mesh-pb-constants.h"
@@ -666,7 +667,7 @@ void pumpLoop()
 {
     uint32_t lastRssiMs = 0;
     while (!g_cancelRequested.load() && g_linkState == BLE_CONNECTED && g_client && g_client->isConnected()) {
-        if (millis() - lastRssiMs > 3000) { // refresh the link RSSI for the status page
+        if (!Throttle::isWithinTimespanMs(lastRssiMs, 3000)) { // refresh link RSSI for the status page
             lastRssiMs = millis();
             g_linkRssi = g_client->getRssi();
         }

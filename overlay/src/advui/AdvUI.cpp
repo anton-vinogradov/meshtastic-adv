@@ -7,6 +7,7 @@
 #include "AdvUtf8.h"
 #include "SPILock.h" // the external panel shares SPI2 with the SD card
 #include "SafeFile.h"
+#include "Throttle.h"
 #include <new> // std::nothrow: the second-screen driver must fail soft, not abort
 #include "BluetoothStatus.h"
 #include "CyrillicFont.h"
@@ -63,6 +64,7 @@ extern uint8_t g_nameShort;
 #ifdef ADVUI_HIL
 ErrorCode g_hilNextSendError = ERRNO_OK;
 uint8_t g_hilLastSendError = ERRNO_OK;
+uint32_t g_hilLastTxReply = 0;
 #endif
 
 const char *sendFailureText(SendFailure failure)
@@ -238,8 +240,8 @@ constexpr uint32_t kValidEpoch = 1600000000u;
 
 void histAppend(const Msg &m, uint32_t replyId); // eviction victims go to the flash archive
 
-void addMsg(uint32_t from, uint32_t to, uint8_t ch, uint32_t rxTime, bool unread, const char *text, uint32_t id,
-           uint8_t status, uint32_t replyId = 0)
+bool addMsg(uint32_t from, uint32_t to, uint8_t ch, uint32_t rxTime, bool unread, const char *text, uint32_t id,
+            uint8_t status, uint32_t replyId = 0)
 {
     // MeshPacket.id is guaranteed unique only per sender. A global-id dedupe
     // silently dropped one of two unrelated nodes when their random IDs happened
@@ -247,7 +249,7 @@ void addMsg(uint32_t from, uint32_t to, uint8_t ch, uint32_t rxTime, bool unread
     if (id) // a loopback copy of a message we already hold (e.g. our own send)
         for (int i = 0; i < g_msgCount; i++)
             if (g_msgs[i].from == from && g_msgs[i].id == id)
-                return;
+                return false;
     if (rxTime < kValidEpoch || !validStoredEpoch(rxTime)) {
         // The engine quality-gates rx_time, so it hands us 0 even when the system
         // clock is actually fine (it survives soft resets). Prefer the live clock;
@@ -319,20 +321,24 @@ void addMsg(uint32_t from, uint32_t to, uint8_t ch, uint32_t rxTime, bool unread
     m.read = !unread;
     utf8CopyValid(m.text, sizeof(m.text), text);
     markMsgsDirty();
+    return true;
 }
 
 // Mark the sent message whose id matches an incoming ACK/routing response.
 // Skip MSG_IN: incoming messages now carry their sender's packet id (for reactions),
 // and a random id collision must not flip their status.
-void ackMsg(uint32_t reqId, uint8_t status, uint8_t err)
+bool ackMsg(uint32_t reqId, uint8_t status, uint8_t err)
 {
     for (int i = 0; i < g_msgCount; i++)
         if (g_msgs[i].id == reqId && g_msgs[i].id != 0 && g_msgs[i].status != MSG_IN) {
+            if (g_msgs[i].status == status && g_msgs[i].err == err)
+                return false;
             g_msgs[i].status = status;
             g_msgs[i].err = err;
             markMsgsDirty();
-            return;
+            return true;
         }
+    return false;
 }
 
 // --- Reactions (tapback) --------------------------------------------------------
@@ -404,16 +410,18 @@ void dropMarkedReactions(bool *drop)
     g_reactNext = kept % kMaxReacts;
 }
 
-void addReaction(uint32_t msgId, uint32_t from, const char *label, uint32_t targetFrom = 0)
+bool addReaction(uint32_t msgId, uint32_t from, const char *label, uint32_t targetFrom = 0)
 {
     LOG_INFO("advui: reaction msgId=0x%08x targetFrom=0x%08x from=0x%08x %s", (unsigned)msgId,
              (unsigned)targetFrom, (unsigned)from, label);
     for (int i = 0; i < g_reactCount; i++)
         if (g_reacts[i].msgId == msgId && g_reacts[i].targetFrom == targetFrom && g_reacts[i].from == from) {
             // Replace this sender's previous reaction to this exact message.
+            if (!strcmp(g_reacts[i].label, label))
+                return false;
             utf8CopyValid(g_reacts[i].label, sizeof(g_reacts[i].label), label);
             markMsgsDirty();
-            return;
+            return true;
         }
     Reaction &r = g_reacts[g_reactNext];
     r.msgId = msgId;
@@ -424,6 +432,7 @@ void addReaction(uint32_t msgId, uint32_t from, const char *label, uint32_t targ
     if (g_reactCount < kMaxReacts)
         g_reactCount++;
     markMsgsDirty();
+    return true;
 }
 
 // The quick-reaction strip (labels must exist in graphics::emotes[]).
@@ -1690,21 +1699,21 @@ const char *roleTag(const meshtastic_NodeInfoLite *n)
 
 const char *regionName(meshtastic_Config_LoRaConfig_RegionCode r)
 {
-    switch (r) {
-    case meshtastic_Config_LoRaConfig_RegionCode_UNSET:
-        return "UNSET";
-    case meshtastic_Config_LoRaConfig_RegionCode_US:
-        return "US";
-    case meshtastic_Config_LoRaConfig_RegionCode_EU_868:
-        return "EU_868";
-    case meshtastic_Config_LoRaConfig_RegionCode_RU:
-        return "RU";
-    default: {
-        static char buf[8];
-        snprintf(buf, sizeof(buf), "R%d", (int)r);
-        return buf;
-    }
-    }
+    // Keep this aligned with RadioInterface::regions in the pinned engine, not
+    // merely the wider protobuf enum: 27..33 are schema-reserved but have no
+    // regional radio definition in Meshtastic 2.7.26.
+    static const char *const names[] = {
+        "UNSET",  "US",      "EU_433", "EU_868", "CN",      "JP",      "ANZ",
+        "KR",     "TW",      "RU",     "IN",     "NZ_865",  "TH",      "LORA_24",
+        "UA_433", "UA_868",  "MY_433", "MY_919", "SG_923",  "PH_433",  "PH_868",
+        "PH_915", "ANZ_433", "KZ_433", "KZ_863", "NP_865",  "BR_902",
+    };
+    const int value = (int)r;
+    if (value >= 0 && value < (int)(sizeof(names) / sizeof(names[0])))
+        return names[value];
+    static char unknown[8];
+    snprintf(unknown, sizeof(unknown), "R%d", value);
+    return unknown;
 }
 
 const char *presetName(meshtastic_Config_LoRaConfig_ModemPreset p)
@@ -1736,10 +1745,13 @@ struct EnumOpt {
     const char *name;
     int value;
 };
-const EnumOpt kRegionOpts[] = {{"UNSET", 0},   {"US", 1},      {"EU_433", 2}, {"EU_868", 3}, {"CN", 4},
-                               {"JP", 5},       {"ANZ", 6},     {"KR", 7},     {"TW", 8},     {"RU", 9},
-                               {"IN", 10},      {"NZ_865", 11}, {"TH", 12},    {"UA_433", 14},
-                               {"UA_868", 15},  {"KZ_433", 23}, {"KZ_863", 24}};
+const EnumOpt kRegionOpts[] = {
+    {"UNSET", 0},   {"US", 1},       {"EU_433", 2},  {"EU_868", 3}, {"CN", 4},      {"JP", 5},
+    {"ANZ", 6},     {"KR", 7},       {"TW", 8},      {"RU", 9},     {"IN", 10},     {"NZ_865", 11},
+    {"TH", 12},     {"LORA_24", 13}, {"UA_433", 14}, {"UA_868", 15}, {"MY_433", 16}, {"MY_919", 17},
+    {"SG_923", 18}, {"PH_433", 19},  {"PH_868", 20}, {"PH_915", 21}, {"ANZ_433", 22}, {"KZ_433", 23},
+    {"KZ_863", 24}, {"NP_865", 25},  {"BR_902", 26},
+};
 const EnumOpt kPresetOpts[] = {{"LongFast", 0},  {"LongSlow", 1},  {"LongMod", 7},    {"MedSlow", 3},
                                {"MediumFast", 4}, {"ShortSlow", 5}, {"ShortFast", 6},  {"ShortTurbo", 8}};
 // UTC offset choices (value = minutes) with a representative city, scrolled in the picker.
@@ -1841,12 +1853,22 @@ void loadUiCfg()
     }
     f.close();
 }
-const EnumOpt kRoleOpts2[] = {{"Client", 0},      {"Client Mute", 1}, {"Client Hidden", 8},
-                              {"Router", 2},      {"Router Late", 11}, {"Repeater", 4},
-                              {"Tracker", 5},     {"Sensor", 6},       {"TAK", 7}};
+const EnumOpt kRoleOpts2[] = {
+    {"Client", 0},        {"Client Mute", 1},  {"Router", 2},       {"Router Client", 3},
+    {"Repeater", 4},      {"Tracker", 5},      {"Sensor", 6},       {"TAK", 7},
+    {"Client Hidden", 8}, {"Lost & Found", 9}, {"TAK Tracker", 10}, {"Router Late", 11},
+    {"Client Base", 12},
+};
 const EnumOpt kHopOpts[] = {{"1", 1}, {"2", 2}, {"3", 3}, {"4", 4}, {"5", 5}, {"6", 6}, {"7", 7}};
-const EnumOpt kPowerOpts[] = {{"max (region)", 0}, {"2 dBm", 2},   {"5 dBm", 5},   {"8 dBm", 8},  {"11 dBm", 11},
-                              {"14 dBm", 14},      {"17 dBm", 17}, {"20 dBm", 20}, {"22 dBm", 22}};
+// Include each active region limit plus the common hardware/user values. In
+// particular, 26 dBm is a deliberate US-profile value used by existing nodes;
+// opening this picker must never turn it into the old fallback value.
+const EnumOpt kPowerOpts[] = {
+    {"max (region)", 0}, {"2 dBm", 2},   {"5 dBm", 5},   {"8 dBm", 8},   {"10 dBm", 10},
+    {"11 dBm", 11},     {"13 dBm", 13}, {"14 dBm", 14}, {"17 dBm", 17}, {"19 dBm", 19},
+    {"20 dBm", 20},     {"22 dBm", 22}, {"23 dBm", 23}, {"24 dBm", 24}, {"26 dBm", 26},
+    {"27 dBm", 27},     {"30 dBm", 30}, {"36 dBm", 36},
+};
 const EnumOpt kRebroadOpts[] = {{"All", 0},        {"All skip decode", 1}, {"Local only", 2},
                                 {"Known only", 3}, {"Core ports only", 5}, {"None", 4}};
 const EnumOpt kGpsOpts[] = {{"On", 1}, {"Off", 0}}; // config.position.gps_mode ENABLED / DISABLED
@@ -1902,7 +1924,7 @@ int optIndex(const EnumOpt *opts, int cnt, int value)
     for (int i = 0; i < cnt; i++)
         if (opts[i].value == value)
             return i;
-    return 0;
+    return -1; // never let an unknown current value silently become the first option
 }
 
 // Text-editor (MODE_SETNAME) targets: 0 long name, 1 short name, 2 frequency, 3 channel, 4 clock.
@@ -2817,24 +2839,23 @@ void AdvUI::drawSplash()
 // ring. Everything else (config, node DB, telemetry, ...) is ignored here.
 void AdvUI::onMeshPacket(const meshtastic_FromRadio &fr)
 {
-    handleFromRadio(fr);
-    uiDirty = true; // a handled packet is one of the events a frame is worth drawing for
+    uiDirty = handleFromRadio(fr) || uiDirty;
 }
 
-void AdvUI::handleFromRadio(const meshtastic_FromRadio &fr)
+bool AdvUI::handleFromRadio(const meshtastic_FromRadio &fr)
 {
     if (fr.which_payload_variant == meshtastic_FromRadio_queueStatus_tag) {
         const meshtastic_QueueStatus &status = fr.queueStatus;
         if (status.mesh_packet_id && status.res != ERRNO_OK)
-            ackMsg(status.mesh_packet_id, MSG_FAILED, (uint8_t)status.res);
-        return;
+            return ackMsg(status.mesh_packet_id, MSG_FAILED, (uint8_t)status.res);
+        return false;
     }
     if (fr.which_payload_variant != meshtastic_FromRadio_packet_tag)
-        return;
+        return false;
     const meshtastic_MeshPacket &p = fr.packet;
     seenNote(p.from); // ledger sees every sender, whatever the engine stamps
     if (p.which_payload_variant != meshtastic_MeshPacket_decoded_tag)
-        return;
+        return false;
 
     // A routing response carrying our request id is the ACK/NAK for a sent message.
     // Decode it: error_reason NONE = delivered, anything else (no route, no ack,
@@ -2844,13 +2865,14 @@ void AdvUI::handleFromRadio(const meshtastic_FromRadio &fr)
         bool ok = pb_decode_from_bytes(p.decoded.payload.bytes, p.decoded.payload.size, &meshtastic_Routing_msg, &routing);
         if (ok && routing.which_variant == meshtastic_Routing_error_reason_tag) {
             bool delivered = routing.error_reason == meshtastic_Routing_Error_NONE;
-            ackMsg(p.decoded.request_id, delivered ? MSG_DELIVERED : MSG_FAILED, (uint8_t)routing.error_reason);
+            return ackMsg(p.decoded.request_id, delivered ? MSG_DELIVERED : MSG_FAILED,
+                          (uint8_t)routing.error_reason);
         }
-        return;
+        return false;
     }
 
     if (p.decoded.portnum != meshtastic_PortNum_TEXT_MESSAGE_APP)
-        return;
+        return false;
 
     char text[236]; // sized like Msg.text: the full wire payload fits
     size_t n = p.decoded.payload.size;
@@ -2868,12 +2890,12 @@ void AdvUI::handleFromRadio(const meshtastic_FromRadio &fr)
         // Keep self echoes too: a reaction sent from the phone has our node id,
         // and must appear on the Cardputer. sendReaction() may also add the same
         // tuple locally, but addReaction is idempotent per (message, sender).
-        addReaction(p.decoded.reply_id, p.from, text, reactionTargetFrom(p, me));
+        const bool changed = addReaction(p.decoded.reply_id, p.from, text, reactionTargetFrom(p, me));
 #ifdef HAS_NEOPIXEL
-        if (p.from != me)
+        if (changed && p.from != me)
             flashLed(60, 40, 90); // soft violet: a reaction, not a message
 #endif
-        return;
+        return changed;
     }
 
     bool unread = p.from != me && (p.to == me || p.to == NODENUM_BROADCAST); // DM to us, or a channel broadcast
@@ -2887,9 +2909,9 @@ void AdvUI::handleFromRadio(const meshtastic_FromRadio &fr)
     if (p.from == me)
         status = MSG_SENDING;
     // keep the id (reactions/replies reference it) and the reply link (draws the quote)
-    addMsg(p.from, p.to, p.channel, p.rx_time, unread, text, p.id, status, p.decoded.reply_id);
+    const bool changed = addMsg(p.from, p.to, p.channel, p.rx_time, unread, text, p.id, status, p.decoded.reply_id);
 
-    if (unread) {
+    if (changed && unread) {
         bool fav = (p.to == NODENUM_BROADCAST)
                        ? chanFav(p.channel)
                        : ((!g_radioCompanion && nodeDB && nodeDB->isFavorite(p.from)) || favNodeLocal(p.from));
@@ -2906,6 +2928,7 @@ void AdvUI::handleFromRadio(const meshtastic_FromRadio &fr)
             startBeep();
 #endif
     }
+    return changed;
 }
 
 struct SendResult {
@@ -2961,6 +2984,9 @@ static SendResult sendTextPacket(uint32_t to, const char *text, int chIdx = 0, u
             return {0, SendFailure::ENCODE_FAILED, 0};
         if (!bleQueueToRadio(buf, (uint16_t)len))
             return {0, SendFailure::QUEUE_FULL, ERRNO_UNKNOWN};
+#ifdef ADVUI_HIL
+        g_hilLastTxReply = p.decoded.reply_id; // capture the structure that was actually encoded and queued
+#endif
         return {p.id, SendFailure::NONE, ERRNO_OK};
     }
 
@@ -3024,6 +3050,7 @@ static SendResult sendTextPacket(uint32_t to, const char *text, int chIdx = 0, u
     // engine boundary: emulate successful queue admission, then feed the real
     // UI routing/QueueStatus handlers below. The immutable RadioLibInterface
     // guard remains defence in depth for every engine-owned packet.
+    g_hilLastTxReply = p->decoded.reply_id; // capture the exact packet structure admitted by ADV HIL
     packetPool.release(p);
     g_hilLastSendError = ERRNO_DISABLED;
     return {id, SendFailure::NONE, ERRNO_OK};
@@ -3090,7 +3117,7 @@ SendFailure AdvUI::sendChannel(int chIdx, const char *text, uint32_t replyId)
 // Sends a tapback on the message at ring index msgIdx and records it locally.
 SendFailure AdvUI::sendReaction(int msgIdx, const char *label)
 {
-    if (msgIdx < 0 || msgIdx >= kMaxMsgs)
+    if (msgIdx < 0 || msgIdx >= g_msgCount)
         return SendFailure::RADIO_REJECTED;
     Msg &m = g_msgs[msgIdx];
     if (!m.id) {
@@ -3627,7 +3654,7 @@ void AdvUI::drawNodeList()
         total = (size_t)(seen > mirrored ? seen : mirrored);
     } else {
         static uint32_t lastRecon = 0;
-        if (g_seen24 < 0 || millis() - lastRecon > 60000) {
+        if (g_seen24 < 0 || !Throttle::isWithinTimespanMs(lastRecon, 60000)) {
             seenReconcile();
             lastRecon = millis();
         }
@@ -3909,13 +3936,16 @@ void AdvUI::drawNode()
                 snprintf(full, sizeof(full), "%s%s%s", tpre, out ? "> " : "< ", m.text);
             }
             if (replyId) { // a reply: quote the original above it, if we still hold it
-                const Msg *om = nullptr; // the staged page first, then the live ring
-                for (int q = 0; q < histCount && !om; q++)
-                    if (g_arch[q].id == replyId && g_arch[q].id != 0)
-                        om = &g_arch[q];
-                for (int q = 0; q < g_msgCount && !om; q++)
-                    if (g_msgs[q].id == replyId && g_msgs[q].id != 0)
-                        om = &g_msgs[q];
+                // Packet IDs are unique per sender, not globally. Search only
+                // backward in this already conversation-scoped timeline; a
+                // global ring/archive scan could quote another sender's packet
+                // with the same ID, or even a later packet after ID reuse.
+                const Msg *om = nullptr;
+                for (int q = i - 1; q >= 0; q--)
+                    if (srcs[q].m->id == replyId && srcs[q].m->id != 0) {
+                        om = srcs[q].m;
+                        break;
+                    }
                 if (om) {
                     DLine &d = pushLine();
                     char qt[8]; // the original's own arrival time — the frame is often
@@ -4275,10 +4305,13 @@ void AdvUI::drawSetName()
     g->setFont(&lgfx::fonts::FreeSansBold9pt7b);
     g->setTextSize(1);
     g->setTextColor(0xFFFF);
-    char field[27];
+    char field[sizeof(nameBuf) + 2];
     snprintf(field, sizeof(field), "%s_", nameBuf);
+    const char *shown = field; // keep the cursor visible for 64-byte WiFi/MQTT fields
+    while (shown[0] && g->textWidth(shown) > 228)
+        shown += utf8Decode(shown).bytes;
     g->setCursor(6, 44);
-    g->print(field);
+    g->print(shown);
 
     g->setFont(&lgfx::fonts::Font0);
     g->setTextSize(1);
@@ -4929,7 +4962,7 @@ void AdvUI::drawBleScan()
         g->print(rb);
     }
 
-    if (bleSavedMs && millis() - bleSavedMs < 4000) {
+    if (bleSavedMs && Throttle::isWithinTimespanMs(bleSavedMs, 4000)) {
         g->setFont(&lgfx::fonts::Font0);
         g->setTextColor(0x07E0);
         g->setCursor(4, 108);
@@ -5258,11 +5291,11 @@ void AdvUI::hilState()
     for (const unsigned char *p = (const unsigned char *)m.text; *p; p++)
         textFnv = (textFnv ^ *p) * 16777619U;
     Serial.printf("@@LAST v=2 incoming=%u sending=%u delivered=%u failed=%u sent=%u id=%08x from=%08x to=%08x "
-                  "ch=%u status=%u err=%u reply=%08x read=%u text_len=%u text_fnv=%08x\n",
+                  "ch=%u status=%u err=%u reply=%08x tx_reply=%08x read=%u text_len=%u text_fnv=%08x\n",
                   statuses[MSG_IN], statuses[MSG_SENDING], statuses[MSG_DELIVERED], statuses[MSG_FAILED],
                   statuses[MSG_SENT], (unsigned)m.id, (unsigned)m.from, (unsigned)m.to, (unsigned)m.ch,
                   (unsigned)m.status, (unsigned)m.err, (unsigned)(last >= 0 ? g_msgReply[last] : 0),
-                  m.read ? 1U : 0U, (unsigned)strlen(m.text), (unsigned)textFnv);
+                  (unsigned)g_hilLastTxReply, m.read ? 1U : 0U, (unsigned)strlen(m.text), (unsigned)textFnv);
 
     CompNode comp = {};
     const int compNodes = g_compNodeCount.load();
@@ -5373,6 +5406,7 @@ void AdvUI::hilHome()
     msgLen = 0;
     sendFailure = SendFailure::NONE;
     g_hilLastSendError = ERRNO_OK;
+    g_hilLastTxReply = 0;
     pendingLat = 0;
     pendingReplyId = 0;
     reactSel = -1;
@@ -5391,28 +5425,27 @@ void AdvUI::hilInject(const uint8_t *bytes, uint16_t len)
     static meshtastic_FromRadio fr;
     fr = meshtastic_FromRadio_init_default;
     const bool ok = bytes && len && pb_decode_from_bytes(bytes, len, &meshtastic_FromRadio_msg, &fr);
-    if (ok) {
-        handleFromRadio(fr); // identical ingress to radio/BLE traffic
+    const bool changed = ok && handleFromRadio(fr); // identical ingress to radio/BLE traffic
+    if (changed) {
         uiDirty = true;
     }
-    Serial.printf("@@INJECT v=1 ok=%u bytes=%u variant=%u\n", ok ? 1U : 0U, (unsigned)len,
-                  ok ? (unsigned)fr.which_payload_variant : 0U);
+    Serial.printf("@@INJECT v=1 ok=%u changed=%u bytes=%u variant=%u\n", ok ? 1U : 0U, changed ? 1U : 0U,
+                  (unsigned)len, ok ? (unsigned)fr.which_payload_variant : 0U);
     Serial.flush();
 }
 
 void AdvUI::hilInjectCompanion(const uint8_t *bytes, uint16_t len)
 {
     const bool ok = bleHilInjectFromRadio(bytes, len);
+    bool uiChanged = false;
     if (ok) {
         // Companion mesh packets normally cross the fixed pump->UI queue. Drain
         // it here as runOnce would after a real BLE read, retaining that boundary.
-        bool uiChanged = false;
         BleFrame frame;
         while (bleNextPacket(&frame)) {
             meshtastic_FromRadio fr = meshtastic_FromRadio_init_default;
             if (pb_decode_from_bytes(frame.data, frame.len, &meshtastic_FromRadio_msg, &fr)) {
-                handleFromRadio(fr);
-                uiChanged = true;
+                uiChanged = handleFromRadio(fr) || uiChanged;
             }
         }
         // Production routes node/channel/config frames on the BLE pump without
@@ -5421,7 +5454,8 @@ void AdvUI::hilInjectCompanion(const uint8_t *bytes, uint16_t len)
         if (uiChanged)
             uiDirty = true;
     }
-    Serial.printf("@@CINJECT v=1 ok=%u bytes=%u\n", ok ? 1U : 0U, (unsigned)len);
+    Serial.printf("@@CINJECT v=1 ok=%u changed=%u bytes=%u\n", ok ? 1U : 0U, uiChanged ? 1U : 0U,
+                  (unsigned)len);
     Serial.flush();
 }
 
@@ -5917,6 +5951,19 @@ void AdvUI::openSetting(int item)
     const bool compLoraValid = g_radioCompanion && bleCopyCompLora(&compLora);
     const bool compDeviceValid = g_radioCompanion && bleCopyCompDevice(&compDevice);
     const bool compPrimaryValid = g_radioCompanion && bleCopyCompChannel(0, &compPrimary);
+    auto openPick = [this](int target, int current) {
+        const PickList list = pickListFor(target);
+        const int index = optIndex(list.opts, list.cnt, current);
+        if (index < 0) {
+            LOG_WARN("advui: refusing %s picker for unsupported current value %d", list.title, current);
+            return false;
+        }
+        pickTarget = target;
+        pickSel = index;
+        pickScroll = 0;
+        mode = MODE_PICKLIST;
+        return true;
+    };
     if (item <= 1) { // 0 = long name, 1 = short name
         editTarget = item;
         const char *cur;
@@ -5934,18 +5981,11 @@ void AdvUI::openSetting(int item)
     } else if (item == 2) { // Region
         if (g_radioCompanion && !compLoraValid)
             return; // config not synced yet: nothing to edit against
-        pickTarget = 0;
-        pickSel = optIndex(kRegionOpts, kRegionCount, (int)(g_radioCompanion ? compLora.region : config.lora.region));
-        pickScroll = 0;
-        mode = MODE_PICKLIST;
+        openPick(0, (int)(g_radioCompanion ? compLora.region : config.lora.region));
     } else if (item == 3) { // Preset
         if (g_radioCompanion && !compLoraValid)
             return;
-        pickTarget = 1;
-        pickSel =
-            optIndex(kPresetOpts, kPresetCount, (int)(g_radioCompanion ? compLora.modem_preset : config.lora.modem_preset));
-        pickScroll = 0;
-        mode = MODE_PICKLIST;
+        openPick(1, (int)(g_radioCompanion ? compLora.modem_preset : config.lora.modem_preset));
     } else if (item == 4) { // Frequency (MHz)
         if (g_radioCompanion && !compLoraValid)
             return;
@@ -5971,37 +6011,21 @@ void AdvUI::openSetting(int item)
     } else if (item == 6) { // Role
         if (g_radioCompanion && !compDeviceValid)
             return;
-        pickTarget = 5;
-        pickSel = optIndex(kRoleOpts2, kRoleCount, (int)(g_radioCompanion ? compDevice.role : config.device.role));
-        pickScroll = 0;
-        mode = MODE_PICKLIST;
+        openPick(5, (int)(g_radioCompanion ? compDevice.role : config.device.role));
     } else if (item == 7) { // Hop limit
         if (g_radioCompanion && !compLoraValid)
             return;
-        pickTarget = 6;
-        pickSel = optIndex(kHopOpts, kHopCount, (int)(g_radioCompanion ? compLora.hop_limit : config.lora.hop_limit));
-        pickScroll = 0;
-        mode = MODE_PICKLIST;
+        openPick(6, (int)(g_radioCompanion ? compLora.hop_limit : config.lora.hop_limit));
     } else if (item == 8) { // TX power
         if (g_radioCompanion && !compLoraValid)
             return;
-        pickTarget = 7;
-        pickSel = optIndex(kPowerOpts, kPowerCount, (int)(g_radioCompanion ? compLora.tx_power : config.lora.tx_power));
-        pickScroll = 0;
-        mode = MODE_PICKLIST;
+        openPick(7, (int)(g_radioCompanion ? compLora.tx_power : config.lora.tx_power));
     } else if (item == 9) { // Rebroadcast mode
         if (g_radioCompanion && !compDeviceValid)
             return;
-        pickTarget = 8;
-        pickSel = optIndex(kRebroadOpts, kRebroadCount,
-                           (int)(g_radioCompanion ? compDevice.rebroadcast_mode : config.device.rebroadcast_mode));
-        pickScroll = 0;
-        mode = MODE_PICKLIST;
+        openPick(8, (int)(g_radioCompanion ? compDevice.rebroadcast_mode : config.device.rebroadcast_mode));
     } else if (item == 10) { // UTC offset -> city/offset picker
-        pickTarget = 2;
-        pickSel = optIndex(kUtcOpts, kUtcCount, g_utcOffsetMin);
-        pickScroll = 0;
-        mode = MODE_PICKLIST;
+        openPick(2, g_utcOffsetMin);
     } else if (item == 15 && (sdFontOffered() || strcmp(sdFontState(), "sd") == 0)) {
         pickTarget = 12; // unicode font source (only meaningful without the partition)
         pickSel = strcmp(sdFontState(), "sd") == 0 ? 1 : 0;
@@ -6012,20 +6036,14 @@ void AdvUI::openSetting(int item)
         // ignore: with a cap fitted, CS/RST/DC are the radio's NSS/RST/BUSY.
         if (!g_radioCompanion)
             return;
-        pickTarget = 13;
-        pickSel = optIndex(kExtOpts, kExtCount, (int)g_extRot);
-        pickScroll = 0;
-        mode = MODE_PICKLIST;
+        openPick(13, (int)g_extRot);
     } else if (item == 19) { // node-list name style -> picker
         pickTarget = 11;
         pickSel = g_nameShort ? 1 : 0;
         pickScroll = 0;
         mode = MODE_PICKLIST;
     } else if (item == 18) { // node-list sort -> mode picker
-        pickTarget = 10;
-        pickSel = optIndex(kSortOpts, kSortCount, (int)g_nodeSort);
-        pickScroll = 0;
-        mode = MODE_PICKLIST;
+        openPick(10, (int)g_nodeSort);
     } else if (item == 16) { // manual clock -> HH:MM entry (applied in applyName)
         editTarget = 4;
         nameBuf[0] = 0;
@@ -6033,21 +6051,14 @@ void AdvUI::openSetting(int item)
         nameReturn = MODE_SETTINGS;
         mode = MODE_SETNAME;
     } else if (item == 13) { // Screen auto-off -> timeout picker
-        pickTarget = 4;
-        pickSel = optIndex(kScreenOpts, kScreenCount, (int)g_screenOffSec);
-        pickScroll = 0;
-        mode = MODE_PICKLIST;
+        openPick(4, (int)g_screenOffSec);
     } else if (item == 14) { // Radio backend -> onboard/companion picker
         pickTarget = 3;
         pickSel = g_radioCompanion ? 1 : 0;
         pickScroll = 0;
         mode = MODE_PICKLIST;
     } else if (item == 17) { // GPS on/off (local device position config)
-        pickTarget = 9;
-        pickSel = optIndex(kGpsOpts, kGpsCount,
-                           config.position.gps_mode == meshtastic_Config_PositionConfig_GpsMode_ENABLED ? 1 : 0);
-        pickScroll = 0;
-        mode = MODE_PICKLIST;
+        openPick(9, config.position.gps_mode == meshtastic_Config_PositionConfig_GpsMode_ENABLED ? 1 : 0);
     } else if (item == 11 || item == 12) { // WiFi / MQTT sub-page
         netPage = item == 11 ? 0 : 1;
         netSel = 0;
@@ -6473,7 +6484,7 @@ void AdvUI::handleKey(char ch)
                 int idx = i;
                 Msg &m = g_msgs[idx];
                 if (m.from == me && m.to == selectedNum && m.status == MSG_FAILED) {
-                    SendResult result = sendTextPacket(selectedNum, m.text);
+                    SendResult result = sendTextPacket(selectedNum, m.text, 0, g_msgReply[idx]);
                     sendFailure = result.failure;
                     if (result.failure == SendFailure::NONE) {
                         m.id = result.id; // the new ACK will find it by this id
@@ -6781,7 +6792,8 @@ int32_t AdvUI::runOnce()
     { // Sample the honest (off-charge) battery % every 30 s and persist it when it
       // moves, so the header can show a real figure while USB hides the true charge.
         static uint32_t lastBattMs = 0;
-        if (powerStatus && powerStatus->getHasBattery() && (!lastBattMs || millis() - lastBattMs > 30000)) {
+        if (powerStatus && powerStatus->getHasBattery() &&
+            (!lastBattMs || !Throttle::isWithinTimespanMs(lastBattMs, 30000))) {
             lastBattMs = millis();
             int p = powerStatus->getBatteryChargePercent();
             // With the bolt up the live figure cannot be trusted upwards — under charge
@@ -6801,7 +6813,7 @@ int32_t AdvUI::runOnce()
       // dirty ring is flushed after its quiet debounce; the next tick records
       // the day. A permanently busy stream can safely defer this daily hint.
         static uint32_t lastEpochNoteMs = 0;
-        if (!g_msgsDirty && millis() - lastEpochNoteMs > 60 * 1000UL) {
+        if (!g_msgsDirty && !Throttle::isWithinTimespanMs(lastEpochNoteMs, 60 * 1000UL)) {
             lastEpochNoteMs = millis();
             epochNote();
         }
@@ -6993,8 +7005,7 @@ int32_t AdvUI::runOnce()
         while (bleNextPacket(&frame)) {
             fr = meshtastic_FromRadio_init_default;
             if (pb_decode_from_bytes(frame.data, frame.len, &meshtastic_FromRadio_msg, &fr)) {
-                handleFromRadio(fr); // same pipeline: messages, reactions, delivery ACKs
-                uiDirty = true;
+                uiDirty = handleFromRadio(fr) || uiDirty; // messages, reactions, delivery ACKs only
             }
         }
     }
@@ -7043,7 +7054,7 @@ int32_t AdvUI::runOnce()
     if (!kbMissing)
         kb.clearInt(); // re-arm the TCA8418 interrupt, else it stops reporting after the first event
 
-    if (!splashDone && (keyDuringSplash || millis() - bootMs > 2000))
+    if (!splashDone && (keyDuringSplash || !Throttle::isWithinTimespanMs(bootMs, 2000)))
         splashDone = true;
 
     // Announce ourselves early so neighbours see us right away — stock waits ~30s.
@@ -7085,7 +7096,7 @@ int32_t AdvUI::runOnce()
                     continue; // not around: don't spend airtime on it
                 bool fresh = false;
                 for (int k = 0; k < 16; k++)
-                    if (asked[k] == n->num && millis() - askedAtMs[k] < 6 * 60 * 60 * 1000UL)
+                    if (asked[k] == n->num && Throttle::isWithinTimespanMs(askedAtMs[k], 6 * 60 * 60 * 1000UL))
                         fresh = true;
                 if (fresh)
                     continue;
@@ -7156,7 +7167,8 @@ int32_t AdvUI::runOnce()
     // Auto-reconnect: a dropped (or otherwise idle) companion link retries every ~7s
     // wherever the user is (except the scan — leaving there means re-picking a node).
     if (g_radioCompanion && (g_linkState == BLE_FAILED || g_linkState == BLE_IDLE) && g_peerAddr[0] &&
-        companionEntered && mode != MODE_BLESCAN && mode != MODE_BLEPIN && millis() - bleRetryMs > 7000) {
+        companionEntered && mode != MODE_BLESCAN && mode != MODE_BLEPIN &&
+        !Throttle::isWithinTimespanMs(bleRetryMs, 7000)) {
         bleRetryMs = millis();
         bleAttemptArmed = bleAttemptMark();
         if (bleAttemptArmed)
@@ -7188,9 +7200,9 @@ int32_t AdvUI::runOnce()
     // Atomic config writes can fail transiently (full/torn LittleFS, interrupted
     // readback). Keep the in-RAM choice dirty and retry at a bounded cadence;
     // otherwise a successful-looking setting silently rolls back after reboot.
-    if (g_uiCfgDirty && millis() - g_lastUiCfgSaveMs > 3000)
+    if (g_uiCfgDirty && !Throttle::isWithinTimespanMs(g_lastUiCfgSaveMs, 3000))
         persistUiCfg();
-    if (g_radioCfgDirty && millis() - g_lastRadioCfgSaveMs > 3000)
+    if (g_radioCfgDirty && !Throttle::isWithinTimespanMs(g_lastRadioCfgSaveMs, 3000))
         persistRadioCfg();
 
     // Persist after three quiet seconds. The previous fixed-cadence throttle
@@ -7212,7 +7224,7 @@ int32_t AdvUI::runOnce()
     // needs the user). While dark, skip all rendering — the panel is unpowered.
     bool sleepable = splashDone && g_screenOffSec > 0 && mode != MODE_BLEPIN && mode != MODE_BLESCAN &&
                      mode != MODE_REBOOT && mode != MODE_BTPIN;
-    if (screenOn && sleepable && millis() - lastActivityMs >= (uint32_t)g_screenOffSec * 1000)
+    if (screenOn && sleepable && !Throttle::isWithinTimespanMs(lastActivityMs, (uint32_t)g_screenOffSec * 1000))
         screenSleep();
     if (!screenOn) {
         if (splashDone && !sleepable && g_screenOffSec > 0)
@@ -7226,7 +7238,7 @@ int32_t AdvUI::runOnce()
     // scan hits, link counters), or the ~10 s refresh for battery %/ages. Idle
     // frames cost a full 32 KB render + SPI push at 5 Hz otherwise.
     bool liveScreen = !splashDone || mode == MODE_BLESCAN || mode == MODE_BLELINK;
-    if (!(uiDirty || liveScreen || mode != lastDrawnMode || millis() - lastDrawMs > 10000)) {
+    if (!(uiDirty || liveScreen || mode != lastDrawnMode || !Throttle::isWithinTimespanMs(lastDrawMs, 10000))) {
 #ifdef HAS_I2S
         if (g_beeping)
             return 20; // keep pumping the tone at the fast tick

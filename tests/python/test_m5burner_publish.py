@@ -4,6 +4,7 @@ import tempfile
 import types
 import unittest
 from pathlib import Path
+from unittest import mock
 
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -26,6 +27,24 @@ class Response:
 
     def json(self):
         return self.payload
+
+
+class BinaryResponse:
+    def __init__(self, payload, url=None):
+        self.payload = payload
+        self.url = url or f"{m5.CDN}/ready.bin"
+
+    def raise_for_status(self):
+        return None
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *_args):
+        return False
+
+    def iter_content(self, chunk_size):
+        return (self.payload[i:i + chunk_size] for i in range(0, len(self.payload), chunk_size))
 
 
 class FakeSession:
@@ -70,13 +89,19 @@ class M5BurnerPublisherTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             binary = Path(directory) / "firmware.bin"
             binary.write_bytes(b"firmware")
-            return m5.publish(
-                session,
-                email="fixture@example.invalid",
-                password="secret",
-                version=version,
-                binary=binary,
-            )
+            with mock.patch.object(
+                m5.requests,
+                "get",
+                return_value=BinaryResponse(b"firmware"),
+                create=True,
+            ):
+                return m5.publish(
+                    session,
+                    email="fixture@example.invalid",
+                    password="secret",
+                    version=version,
+                    binary=binary,
+                )
 
     def test_existing_published_version_is_verified_without_mutation(self):
         session = FakeSession([{"version": "1.0.1", "file": "ready.bin", "published": True}])
@@ -100,6 +125,28 @@ class M5BurnerPublisherTests(unittest.TestCase):
         session = FakeSession([{"version": "1.0.1", "file": "wrong.bin", "published": True}])
         with self.assertRaisesRegex(RuntimeError, "public catalog"):
             m5.verify_public_version(session, "1.0.1", "expected.bin", attempts=1, delay=0)
+
+    def test_public_binary_requires_exact_bytes(self):
+        with tempfile.TemporaryDirectory() as directory:
+            binary = Path(directory) / "firmware.bin"
+            binary.write_bytes(b"expected")
+            with mock.patch.object(
+                m5.requests,
+                "get",
+                return_value=BinaryResponse(b"different"),
+                create=True,
+            ):
+                with self.assertRaisesRegex(RuntimeError, "public binary did not converge"):
+                    m5.verify_public_binary("ready.bin", binary, attempts=1, delay=0)
+
+    def test_public_binary_rejects_cross_origin_redirect(self):
+        with tempfile.TemporaryDirectory() as directory:
+            binary = Path(directory) / "firmware.bin"
+            binary.write_bytes(b"firmware")
+            response = BinaryResponse(b"firmware", url="https://example.invalid/ready.bin")
+            with mock.patch.object(m5.requests, "get", return_value=response, create=True):
+                with self.assertRaisesRegex(RuntimeError, "public binary did not converge"):
+                    m5.verify_public_binary("ready.bin", binary, attempts=1, delay=0)
 
 
 if __name__ == "__main__":

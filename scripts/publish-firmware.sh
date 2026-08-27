@@ -50,8 +50,9 @@ import sys
 
 root = pathlib.Path(sys.argv[1])
 version = sys.argv[2]
-if not re.fullmatch(r"\d+\.\d+\.\d+(?:[-+][0-9A-Za-z.-]+)?", version):
-    raise SystemExit(f"invalid release version: {version!r}")
+core = r"(?:0|[1-9][0-9]*)"
+if not re.fullmatch(rf"{core}\.{core}\.{core}", version):
+    raise SystemExit(f"invalid stable release version: {version!r}")
 
 config = configparser.ConfigParser()
 config.read(root / "firmware/version.properties")
@@ -73,19 +74,9 @@ for build in archived_manifest["builds"]:
         if part.get("path") == "unifont.bin":
             part["path"] = "../../unifont.bin"
 (archive / "manifest.json").write_text(json.dumps(archived_manifest, indent=2) + "\n")
-
-def version_key(path):
-    match = re.match(r"v(\d+)\.(\d+)\.(\d+)", path.name)
-    return tuple(map(int, match.groups())) if match else (-1, -1, -1)
-
-archives = sorted((path for path in (docs / "versions").glob("v*") if path.is_dir()),
-                  key=version_key, reverse=True)
-for old in archives[6:]:
-    shutil.rmtree(old)
-(docs / "versions/index.json").write_text(json.dumps([path.name for path in archives[:6]], indent=2) + "\n")
 PY
 
-python3 "$REPO_ROOT/scripts/check-installer.py" "$REPO_ROOT/docs"
+python3 "$REPO_ROOT/scripts/check-installer.py" --prune "$REPO_ROOT/docs"
 
 git -C "$REPO_ROOT" add docs/firmware.factory.bin docs/manifest.json docs/versions
 echo ">> staged docs/firmware.factory.bin ($(du -h "$REPO_ROOT/docs/firmware.factory.bin" | cut -f1)), release=$VERSION"

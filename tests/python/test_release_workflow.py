@@ -42,7 +42,15 @@ class ReleaseWorkflowTests(unittest.TestCase):
         self.assertIn("command -v python3.12", block)
         self.assertIn('python3.12 -m venv "$RUNNER_TEMP/meshtastic-adv-hil-venv"', block)
         self.assertIn('echo "$RUNNER_TEMP/meshtastic-adv-hil-venv/bin" >> "$GITHUB_PATH"', block)
+        self.assertIn(
+            "python -m pip install --require-hashes --no-deps -r requirements/pip.txt",
+            block,
+        )
         self.assertIn("python -m pip install --require-hashes -r hil/requirements.txt", block)
+        self.assertIn(
+            "python -m pip install --require-hashes --no-deps -r requirements/platformio.txt",
+            block,
+        )
 
     def test_host_ci_runs_actionlint(self):
         block = job("host-tests")
@@ -100,7 +108,8 @@ class ReleaseWorkflowTests(unittest.TestCase):
         self.assertIn('python scripts/release_tag.py "$GITHUB_REF_NAME" >> "$GITHUB_OUTPUT"', block[:checkout_main])
         self.assertIn("cp /tmp/unifont.bin docs/unifont.bin", block[checkout_main:publish])
         self.assertIn('engine="${{ steps.tagged.outputs.engine }}"', block[staging:checkout_main])
-        self.assertIn("python /tmp/check-installer.py docs", block[checkout_main:publish])
+        self.assertIn("python /tmp/check-installer.py --prune docs", block[checkout_main:publish])
+        self.assertNotIn("xargs -r rm -rf", block)
         self.assertIn("python /tmp/verify_web_publish.py", block[checkout_main:publish])
         self.assertIn("--firmware /tmp/fw.bin", block[checkout_main:publish])
         self.assertIn("--font /tmp/unifont.bin", block[checkout_main:publish])
@@ -118,6 +127,9 @@ class ReleaseWorkflowTests(unittest.TestCase):
         self.assertIn('"${release_flags[@]}"', release)
         self.assertIn("--verify-tag", release)
         self.assertIn("if: steps.tagged.outputs.prerelease == 'false'", m5burner)
+        local_publisher = (ROOT / "scripts/publish-firmware.sh").read_text()
+        self.assertIn("invalid stable release version", local_publisher)
+        self.assertNotIn("(?:[-+][0-9A-Za-z.-]+)?", local_publisher)
 
     def test_m5burner_publisher_never_sends_auth_over_plain_http(self):
         publisher = (ROOT / "scripts/m5burner_publish.py").read_text()
@@ -142,7 +154,8 @@ class ReleaseWorkflowTests(unittest.TestCase):
             else:
                 self.assertRegex(reference, r"@[0-9a-f]{40}$")
         self.assertNotRegex(WORKFLOW, r"pip install ['\"]?[^\n]*[<>=]")
-        self.assertEqual(WORKFLOW.count("pip install --require-hashes"), 3)
+        self.assertEqual(WORKFLOW.count("pip install --require-hashes -r"), 3)
+        self.assertEqual(WORKFLOW.count("pip install --require-hashes --no-deps"), 5)
 
     def test_release_tooling_excludes_fixed_python_vulnerabilities(self):
         for relative in ("hil/requirements.txt", "requirements/release.txt"):
@@ -153,6 +166,13 @@ class ReleaseWorkflowTests(unittest.TestCase):
                 "cryptography==50.0.1 ; platform_machine != 'x86_64' or sys_platform != 'darwin'",
                 lock,
             )
+        hil_lock = (ROOT / "hil/requirements.txt").read_text()
+        self.assertNotRegex(hil_lock, r"(?m)^(?:starlette|uvicorn|wsproto|ajsonrpc)==")
+        self.assertRegex(hil_lock, r"(?m)^grpcio-tools==")
+        platformio_lock = (ROOT / "requirements/platformio.txt").read_text()
+        self.assertRegex(platformio_lock, r"(?m)^platformio==6\.1\.19 \\")
+        pip_lock = (ROOT / "requirements/pip.txt").read_text()
+        self.assertRegex(pip_lock, r"(?m)^pip==26\.2\.1 \\")
 
     def test_installer_commit_errors_are_not_treated_as_no_change(self):
         block = job("release")

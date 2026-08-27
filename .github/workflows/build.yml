@@ -58,11 +58,16 @@ jobs:
           path: |
             ~/.platformio
             ~/.cache/pip
-          key: pio-${{ hashFiles('firmware/platformio.ini', 'firmware/variants/**/platformio.ini', 'overlay/variants/**/platformio.ini', 'hil/requirements.txt') }}
+          key: pio-${{ hashFiles('firmware/platformio.ini', 'firmware/variants/**/platformio.ini', 'overlay/variants/**/platformio.ini', 'hil/requirements.txt', 'requirements/pip.txt', 'requirements/platformio.txt') }}
           restore-keys: pio-
 
       - name: Install build dependencies
-        run: python -m pip install --require-hashes -r hil/requirements.txt
+        run: |
+          python -m pip install --require-hashes --no-deps -r requirements/pip.txt
+          python -m pip install --require-hashes -r hil/requirements.txt
+          # `pio run` does not use PlatformIO Home. Install the hash-pinned CLI
+          # without its vulnerable, incompatible web-server dependency ceiling.
+          python -m pip install --require-hashes --no-deps -r requirements/platformio.txt
 
       - name: Firmware verification
         run: python scripts/verify.py --firmware-only --artifacts hil-artifacts/ci-firmware
@@ -118,7 +123,10 @@ jobs:
           echo "$RUNNER_TEMP/meshtastic-adv-hil-venv/bin" >> "$GITHUB_PATH"
 
       - name: Install lab dependencies
-        run: python -m pip install --require-hashes -r hil/requirements.txt
+        run: |
+          python -m pip install --require-hashes --no-deps -r requirements/pip.txt
+          python -m pip install --require-hashes -r hil/requirements.txt
+          python -m pip install --require-hashes --no-deps -r requirements/platformio.txt
 
       - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
@@ -210,7 +218,9 @@ jobs:
           echo "engine=$engine" >> "$GITHUB_OUTPUT"
 
       - name: Install hash-locked release tooling
-        run: python -m pip install --require-hashes -r /tmp/release-requirements.txt
+        run: |
+          python -m pip install --require-hashes --no-deps -r requirements/pip.txt
+          python -m pip install --require-hashes -r /tmp/release-requirements.txt
 
       - name: Refresh the installer image on main
         if: steps.tagged.outputs.prerelease == 'false'
@@ -234,9 +244,10 @@ jobs:
           # copy back at the single site-root unifont.bin (2 MB, not per-version)
           jq '.builds[0].parts |= map(if .path == "unifont.bin" then .path = "../../unifont.bin" else . end)' \
             docs/manifest.json > "docs/versions/${GITHUB_REF_NAME}/manifest.json"
-          (cd docs/versions && find . -mindepth 1 -maxdepth 1 -type d -name 'v*' -exec basename {} \; | sort -rV | tail -n +7 | xargs -r rm -rf)
-          (cd docs/versions && find . -mindepth 1 -maxdepth 1 -type d -name 'v*' -exec basename {} \; | sort -rV) | jq -R . | jq -s . > docs/versions/index.json
-          python /tmp/check-installer.py docs
+          # Prune only direct, validated SemVer directories. Passing repository
+          # names through `xargs rm -rf` could reinterpret a crafted name as an
+          # option or a parent path before the post-build validator ever ran.
+          python /tmp/check-installer.py --prune docs
           git add docs/firmware.factory.bin docs/unifont.bin docs/manifest.json docs/versions
           if git diff --cached --quiet; then
             echo "installer already contains ${GITHUB_REF_NAME}"

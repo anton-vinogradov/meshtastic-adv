@@ -1,4 +1,5 @@
 #include "AdvKeyboard.h"
+#include "Throttle.h"
 #include "configuration.h"
 #include <Arduino.h>
 #include <Wire.h>
@@ -14,7 +15,7 @@ using Key = TCA8418KeyboardBase::TCA8418Key;
 constexpr uint8_t kRows = 7;
 constexpr uint8_t kCols = 8;
 constexpr uint8_t kNumKeys = 56;
-constexpr uint32_t kMultiTapThreshold = 1500;
+constexpr uint32_t kModifierLatchMs = 1500;
 constexpr uint32_t kLongPressMs = 900;    // ESC held this long -> settings, not "back"
 constexpr uint32_t kRepeatDelayMs = 350;  // hold an arrow/backspace this long to start repeating
 constexpr uint32_t kRepeatEveryMs = 80;   // then repeat at this rate
@@ -139,7 +140,7 @@ void AdvKeyboard::trigger()
 {
     // Emit ESC's long-press the moment the hold crosses the threshold (while still
     // held), independent of the FIFO — so settings open on hold, not on release.
-    if (escDown && !escLongFired && millis() - escPressMs >= kLongPressMs) {
+    if (escDown && !escLongFired && !Throttle::isWithinTimespanMs(escPressMs, kLongPressMs)) {
         queueEvent(kLongEsc);
         escLongFired = true;
     }
@@ -147,11 +148,15 @@ void AdvKeyboard::trigger()
     // Auto-repeat for a held arrow / backspace (they emit on the press, see pressed()).
     if (repeatKey >= 0) {
         uint32_t now = millis();
-        if (now - repeatStartMs > kRepeatMaxMs) {
+        if (!Throttle::isWithinTimespanMs(repeatStartMs, kRepeatMaxMs)) {
             repeatKey = -1;
-        } else if ((int32_t)(now - repeatNextMs) >= 0) {
-            queueEvent(repeatChar);
-            repeatNextMs = now + kRepeatEveryMs;
+        } else {
+            const uint32_t interval = repeatStarted ? kRepeatEveryMs : kRepeatDelayMs;
+            if (!Throttle::isWithinTimespanMs(repeatLastMs, interval)) {
+                queueEvent(repeatChar);
+                repeatLastMs = now;
+                repeatStarted = true;
+            }
         }
     }
 
@@ -177,7 +182,7 @@ void AdvKeyboard::pressed(uint8_t key)
     if (key == 0) // a failed/short register read is not a matrix position
         return;
 
-    if (modifierFlag && (millis() - last_modifier_time > kMultiTapThreshold))
+    if (modifierFlag && !Throttle::isWithinTimespanMs(last_modifier_time, kModifierLatchMs))
         modifierFlag = 0;
 
     int row = (key - 1) / 10;
@@ -185,39 +190,33 @@ void AdvKeyboard::pressed(uint8_t key)
     if (row < 0 || row >= kRows || col < 0 || col >= kCols)
         return;
 
-    next_key = row * kCols + col;
+    const int nextKey = row * kCols + col;
     state = Held;
 
     uint32_t now = millis();
-    tap_interval = now - last_tap;
 
-    if (next_key == 0) { // ESC key down — start the long-press timer
+    if (nextKey == 0) { // ESC key down — start the long-press timer
         escPressMs = now;
         escDown = true;
         escLongFired = false;
     }
 
-    updateModifierFlag(next_key);
-    if (isModifierKey(next_key))
+    updateModifierFlag(nextKey);
+    if (isModifierKey(nextKey))
         last_modifier_time = now;
 
-    if (next_key != last_key || tap_interval > kMultiTapThreshold)
-        char_idx = 0;
-    else
-        char_idx += 1;
-
-    last_key = next_key;
-    last_tap = now;
+    last_key = nextKey;
 
     // Arrows (nav mode) and backspace emit on the press and auto-repeat while held —
     // that's what makes held-scrolling work. Their release is suppressed (released()).
     bool arrow = modifierFlag == 0 && navKeys &&
-                 (next_key == 43 || next_key == 46 || next_key == 47 || next_key == 51);
-    bool bsp = modifierFlag == 0 && next_key == 52;
+                 (nextKey == 43 || nextKey == 46 || nextKey == 47 || nextKey == 51);
+    bool bsp = modifierFlag == 0 && nextKey == 52;
     if (arrow || bsp) {
-        repeatKey = next_key;
-        repeatChar = arrow ? TapMap[next_key][2] : TapMap[next_key][0]; // [2] = the arrow code
-        repeatNextMs = now + kRepeatDelayMs;
+        repeatKey = nextKey;
+        repeatChar = arrow ? TapMap[nextKey][2] : TapMap[nextKey][0]; // [2] = the arrow code
+        repeatLastMs = now;
+        repeatStarted = false;
         repeatStartMs = now;
         queueEvent(repeatChar);
     } else {
@@ -235,8 +234,6 @@ void AdvKeyboard::released()
         state = Idle;
         return;
     }
-
-    last_tap = millis();
 
     // ESC: the long-press already fires from trigger() while held. On release just
     // clean up, and emit the normal "back" code only if it was a short tap.

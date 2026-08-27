@@ -298,7 +298,7 @@ def require_serial():
         import serial
         from serial.tools import list_ports
     except ImportError as exc:
-        raise HilError("pyserial is required (pip install -r hil/requirements.txt)") from exc
+        raise HilError("pyserial is required (install the hash-locked HIL requirements)") from exc
     return serial, list_ports
 
 
@@ -1365,7 +1365,8 @@ def message_flow(fixture: dict[str, object], artifacts: Path) -> Report:
         report.check("ingress/incoming-unicode-dm", incoming_case)
 
         def duplicate_case():
-            session.inject(make_text_frame(source, me, 0x1001, "duplicate must be ignored"))
+            duplicate = session.inject(make_text_frame(source, me, 0x1001, "duplicate must be ignored"))
+            require_fields(duplicate, {"changed": "0"})
             return require_fields(session.query(), {"messages": "1", "incoming": "1"})
 
         report.check("ingress/packet-id-deduplication", duplicate_case)
@@ -1381,6 +1382,8 @@ def message_flow(fixture: dict[str, object], artifacts: Path) -> Report:
                     make_fromradio_frame(source, me, 0x1008, b"position fixture", portnum=3)
                 ),
             }
+            for response in responses.values():
+                require_fields(response, {"changed": "0"})
             after = session.query()
             unchanged = {
                 key: before[key]
@@ -1511,14 +1514,32 @@ def message_flow(fixture: dict[str, object], artifacts: Path) -> Report:
         report.check("ui/send-routing-filters-and-positive-ack", ack_case)
 
         def nak_case():
-            session.inject(make_text_frame(me, source, 0x2002, "outgoing failed"))
+            # A failed reply retains its local link and must put the same
+            # reply_id back on the wire when ENTER retries it in place.
+            session.inject(
+                make_text_frame(me, source, 0x2002, "outgoing failed reply", reply_id=0x1001)
+            )
             require_fields(session.wait_state({"messages": "5", "sending": "1"}), {"status": "1"})
             session.inject(make_routing_frame(source, me, 0x2002, 5))  # MAX_RETRANSMIT
-            return require_fields(
-                session.wait_state({"sending": "0", "failed": "1"}), {"delivered": "1"}
+            require_fields(
+                session.wait_state({"sending": "0", "failed": "1"}),
+                {"delivered": "1", "reply": "00001001"},
             )
+            retried = require_fields(
+                session.key("~", {"sending": "1", "failed": "0"}),
+                {"tx_reply": "00001001", "reply": "00001001"},
+            )
+            retry_id = int(retried["id"], 16)
+            if retry_id == 0x2002:
+                raise HilError(f"reply retry reused rejected packet id: {retried}")
+            session.inject(make_routing_frame(source, me, retry_id, 5))
+            failed_again = require_fields(
+                session.wait_state({"sending": "0", "failed": "1"}),
+                {"delivered": "1", "reply": "00001001", "tx_reply": "00001001"},
+            )
+            return {"retried": retried, "failed_again": failed_again}
 
-        report.check("ingress/routing-negative-ack", nak_case)
+        report.check("ui/failed-reply-resend-preserves-wire-link", nak_case)
 
         def malformed_utf8_case():
             session.inject(make_text_frame(source, me, 0x1005, b"A\x80B"))

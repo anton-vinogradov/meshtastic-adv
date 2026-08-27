@@ -65,7 +65,7 @@ overflows and reloads persistent history, checks 29 framebuffer captures, reboot
 and finally restores and verifies the exact application bytes users will receive.
 See the honest [HIL coverage matrix](hil/README.md#coverage-matrix), including what
 still needs a camera, key jig or controlled RF lab for physical proof.
-The upcoming release scope and migration notes are kept in the [changelog](CHANGELOG.md).
+Release hardening changes and migration notes are kept in the [changelog](CHANGELOG.md).
 
 ## Install
 
@@ -170,7 +170,8 @@ Hardware remains an explicit opt-in; commands, fixture safeguards and the covera
 
 The read **and** write paths are done and running on real hardware: node list, DMs, channels, delivery status, Cyrillic, emoji, reactions, replies, favourites, sound, timestamps, persisted history, on-device settings and BLE companion mode all work today. Companion mode is verified end-to-end over the air (encrypted DM through the linked node, routing ACK back).
 
-Current work is focused on field hardening, memory headroom and quality-of-life polish.
+The stable 1.0 line is maintained with the same hardware release gate; ongoing work
+focuses on field reliability, memory headroom and small usability improvements.
 
 ## License
 

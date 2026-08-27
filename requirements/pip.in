@@ -1,0 +1,3 @@
+# Bootstrap every CI/HIL virtual environment away from the vulnerable pip that
+# can be bundled with the host Python before it handles the project locks.
+pip==26.2.1

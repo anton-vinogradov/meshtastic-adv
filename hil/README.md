@@ -41,7 +41,10 @@ MAC mismatch stops before the first flash write.
 ## First-time setup
 
 ```sh
-python3 -m pip install -r hil/requirements.txt
+python3 -m pip install --require-hashes --no-deps -r requirements/pip.txt
+python3 -m pip install --require-hashes -r hil/requirements.txt
+# Build-only CLI: PlatformIO Home is deliberately not installed.
+python3 -m pip install --require-hashes --no-deps -r requirements/platformio.txt
 python3 scripts/hil.py inventory
 python3 scripts/hil.py init \
   --dut E8:F6:0A:00:00:01 \
@@ -178,7 +181,8 @@ replies, reactions, channel broadcasts, a real
 key-driven compose/send path whose HIL admission result is deterministic before
 the mesh enqueue (with the radio-silent transport guard still protecting all
 engine-owned packets),
-positive routing ACK, `MAX_RETRANSMIT` NAK, malformed UTF-8 and protobuf, plus
+positive routing ACK, `MAX_RETRANSMIT` NAK and a key-driven failed-reply retry
+that preserves the original `reply_id` on the wire, malformed UTF-8 and protobuf, plus
 negative filters for non-packet envelopes, still-encrypted payloads, unrelated
 ports, route-discovery traffic, missing request IDs and malformed routing data.
 It also covers rendering, persistence and reboot recovery. It then feeds

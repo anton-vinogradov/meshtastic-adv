@@ -31,7 +31,7 @@ class InstallerConsistencyTests(unittest.TestCase):
             font.write(b"\0")
         manifest = {
             "version": f"1.2.3 (advui · engine {engine})",
-            "builds": [{"parts": [
+            "builds": [{"chipFamily": "ESP32-S3", "parts": [
                 {"path": "firmware.factory.bin", "offset": 0},
                 {"path": "unifont.bin", "offset": check_installer.FONT_OFFSET},
             ]}],
@@ -70,6 +70,64 @@ class InstallerConsistencyTests(unittest.TestCase):
         (docs / "unifont.bin").write_bytes(b"AUF2truncated")
         with self.assertRaises(ValueError):
             check_installer.validate(docs)
+
+    def test_rejects_duplicate_or_unordered_index(self):
+        docs = self.fixture()
+        (docs / "versions/index.json").write_text('["v1.2.3", "v1.2.3"]')
+        with self.assertRaises(ValueError):
+            check_installer.validate(docs)
+
+    def test_rejects_corrupt_older_archive(self):
+        docs = self.fixture()
+        source = docs / "versions/v1.2.3"
+        older = docs / "versions/v1.2.2"
+        older.mkdir()
+        older_manifest = json.loads((source / "manifest.json").read_text())
+        older_manifest["version"] = "1.2.2 (advui · engine 2.7.26)"
+        (older / "manifest.json").write_text(json.dumps(older_manifest))
+        (older / "firmware.factory.bin").write_bytes(b"truncated")
+        (docs / "versions/index.json").write_text('["v1.2.3", "v1.2.2"]')
+        with self.assertRaises(ValueError):
+            check_installer.validate(docs)
+
+    def test_rejects_unindexed_archive_directory(self):
+        docs = self.fixture()
+        (docs / "versions/v1.2.2").mkdir()
+        with self.assertRaises(ValueError):
+            check_installer.validate(docs)
+
+    def test_prune_keeps_newest_six_and_rewrites_exact_index(self):
+        docs = self.fixture()
+        source = docs / "versions/v1.2.3"
+        for patch in range(2, 9):
+            name = f"v1.2.{patch}"
+            if name == "v1.2.3":
+                continue
+            archive = docs / "versions" / name
+            archive.mkdir()
+            manifest = json.loads((source / "manifest.json").read_text())
+            manifest["version"] = f"1.2.{patch} (advui · engine 2.7.26)"
+            (archive / "manifest.json").write_text(json.dumps(manifest))
+            image = bytearray((source / "firmware.factory.bin").read_bytes())
+            (archive / "firmware.factory.bin").write_bytes(image)
+        kept = check_installer.prune_archives(docs)
+        self.assertEqual(kept, [f"v1.2.{patch}" for patch in range(8, 2, -1)])
+        self.assertFalse((docs / "versions/v1.2.2").exists())
+        self.assertEqual(json.loads((docs / "versions/index.json").read_text()), kept)
+
+    def test_prune_rejects_all_unsafe_entries_before_deleting(self):
+        docs = self.fixture()
+        oldest = docs / "versions/v0.0.1"
+        oldest.mkdir()
+        (docs / "versions/v unsafe").mkdir()
+        with self.assertRaises(ValueError):
+            check_installer.prune_archives(docs)
+        self.assertTrue(oldest.exists())
+
+    def test_archive_rejects_noncanonical_or_prerelease_versions(self):
+        for name in ("v01.2.3", "v1.2.3-rc.1", "v1.2.3+local"):
+            with self.subTest(name=name), self.assertRaises(ValueError):
+                check_installer.archive_key(name)
 
 
 if __name__ == "__main__":

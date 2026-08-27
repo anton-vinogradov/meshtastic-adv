@@ -55,6 +55,16 @@ class HilRunnerTests(unittest.TestCase):
         self.assertIn("if (uiChanged)\n            uiDirty = true", body)
         self.assertNotIn("}\n        uiDirty = true;", body)
 
+    def test_ignored_and_duplicate_ingress_do_not_dirty_the_display(self):
+        source = (ROOT / "overlay/src/advui/AdvUI.cpp").read_text()
+        ingress = source.split("bool AdvUI::handleFromRadio", 1)[1].split("struct SendResult", 1)[0]
+        self.assertIn("const bool changed = addMsg", ingress)
+        self.assertIn("if (changed && unread)", ingress)
+        self.assertIn("return changed", ingress)
+        self.assertIn("uiDirty = handleFromRadio(fr) || uiDirty", source)
+        runner = (ROOT / "scripts/hil.py").read_text()
+        self.assertIn('require_fields(duplicate, {"changed": "0"})', runner)
+
     def test_name_editor_enforces_wire_byte_limits_before_owner_broadcast(self):
         source = (ROOT / "overlay/src/advui/AdvUI.cpp").read_text()
         editor = source.split("if (mode == MODE_SETNAME)", 1)[1].split("if (mode == MODE_BTPIN)", 1)[0]
@@ -69,7 +79,7 @@ class HilRunnerTests(unittest.TestCase):
         compose = source.split("if (mode == MODE_COMPOSE)", 1)[1].split("// Home: recent conversations", 1)[0]
         self.assertIn("preserve both the draft and its reply target", compose)
         self.assertIn("sendFailure != SendFailure::NONE", compose)
-        ingress = source.split("void AdvUI::handleFromRadio", 1)[1].split("static SendResult sendTextPacket", 1)[0]
+        ingress = source.split("bool AdvUI::handleFromRadio", 1)[1].split("static SendResult sendTextPacket", 1)[0]
         self.assertIn("meshtastic_FromRadio_queueStatus_tag", ingress)
         self.assertIn("ackMsg(status.mesh_packet_id, MSG_FAILED", ingress)
         companion = (ROOT / "overlay/src/advui/AdvBle.cpp").read_text()
@@ -77,6 +87,41 @@ class HilRunnerTests(unittest.TestCase):
         self.assertLess(source.index("if (injected != ERRNO_OK)"), source.index("service->sendToMesh"))
         self.assertIn("emulate successful queue admission", source)
         self.assertIn("g_hilLastSendError = ERRNO_DISABLED", source)
+
+    def test_reply_render_and_resend_are_scoped(self):
+        source = (ROOT / "overlay/src/advui/AdvUI.cpp").read_text()
+        render = source.split("if (replyId) { // a reply", 1)[1].split("if (chatAnchorMsgIdx", 1)[0]
+        self.assertIn("for (int q = i - 1; q >= 0; q--)", render)
+        self.assertIn("srcs[q].m->id == replyId", render)
+        self.assertNotIn("g_arch[q].id == replyId", render)
+        resend = source.split("// resend the newest failed DM in place", 1)[1].split("} else if (tab)", 1)[0]
+        self.assertIn("sendTextPacket(selectedNum, m.text, 0, g_msgReply[idx])", resend)
+        self.assertIn("g_hilLastTxReply = p->decoded.reply_id", source)
+        self.assertNotIn("g_hilLastTxReply = replyId", source)
+        runner = (ROOT / "scripts/hil.py").read_text()
+        self.assertIn('"tx_reply": "00001001"', runner)
+
+    def test_settings_cover_engine_regions_roles_and_intentional_power(self):
+        source = (ROOT / "overlay/src/advui/AdvUI.cpp").read_text()
+        regions = source.split("const EnumOpt kRegionOpts[]", 1)[1].split("const EnumOpt kPresetOpts[]", 1)[0]
+        for value in range(27):
+            self.assertRegex(regions, rf'\{{"[A-Z0-9_]+",\s*{value}\}}')
+        roles = source.split("const EnumOpt kRoleOpts2[]", 1)[1].split("const EnumOpt kHopOpts[]", 1)[0]
+        for value in range(13):
+            self.assertRegex(roles, rf'\{{"[A-Za-z &]+",\s*{value}\}}')
+        power = source.split("const EnumOpt kPowerOpts[]", 1)[1].split("const EnumOpt kRebroadOpts[]", 1)[0]
+        self.assertIn('{"26 dBm", 26}', power)
+        self.assertIn("return -1; // never let an unknown current value", source)
+        open_setting = source.split("void AdvUI::openSetting(int item)", 1)[1].split("void AdvUI::handleKey", 1)[0]
+        self.assertIn("if (index < 0)", open_setting)
+        self.assertIn("refusing %s picker for unsupported current value", open_setting)
+
+    def test_long_settings_editor_keeps_cursor_visible(self):
+        source = (ROOT / "overlay/src/advui/AdvUI.cpp").read_text()
+        editor = source.split("void AdvUI::drawSetName()", 1)[1].split("bool AdvUI::applyName()", 1)[0]
+        self.assertIn("char field[sizeof(nameBuf) + 2]", editor)
+        self.assertIn("while (shown[0] && g->textWidth(shown) > 228)", editor)
+        self.assertIn("shown += utf8Decode(shown).bytes", editor)
 
     def test_advisory_epoch_write_cannot_overlap_a_message_burst(self):
         source = (ROOT / "overlay/src/advui/AdvUI.cpp").read_text()

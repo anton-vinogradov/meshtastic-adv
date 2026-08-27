@@ -47,18 +47,15 @@ class AdvKeyboard : public TCA8418KeyboardBase
     uint8_t modifierFlag = 0;
     uint32_t last_modifier_time = 0;
     int last_key = -1;
-    int next_key = -1;
-    uint32_t last_tap = 0;
-    uint8_t char_idx = 0;
-    uint32_t tap_interval = 0;
     uint32_t escPressMs = 0;   // when the ESC key went down, for long-press detection
     bool escDown = false;      // ESC currently held
     bool escLongFired = false; // long-press already emitted for this hold
     bool navKeys = true;       // , ; . / emit arrows (nav) vs literal symbols (typing)
     int repeatKey = -1;         // matrix index of the held auto-repeat key (-1 = none)
     uint8_t repeatChar = 0;     // code re-emitted while it is held
-    uint32_t repeatNextMs = 0;  // when the next auto-repeat fires
+    uint32_t repeatLastMs = 0;  // press time, then the previous repeated event
     uint32_t repeatStartMs = 0; // failsafe: stop repeating if the release event got lost
+    bool repeatStarted = false; // false while waiting for the longer initial delay
 };
 
 } // namespace advui

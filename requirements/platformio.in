@@ -1,0 +1,3 @@
+# Build-only CLI. Install this lock with --no-deps after hil/requirements.txt;
+# the PlatformIO Home web server is intentionally outside ADV's attack surface.
+platformio==6.1.19

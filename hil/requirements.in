@@ -1,13 +1,24 @@
-# PlatformIO 6.1.19 (the current upstream release) pins starlette<0.53 even
-# though ADV only invokes its CLI builder, never the vulnerable web stack.
-# Re-audit and remove this exception as soon as PlatformIO relaxes that bound.
-platformio==6.1.19
+# PlatformIO itself is installed from requirements/platformio.txt with
+# --no-deps. Its optional Home server pins a vulnerable Starlette generation;
+# ADV invokes only `pio run`, so retain the CLI's actual runtime dependencies
+# here and leave the unused web stack out of the trusted build/HIL environment.
+bottle>=0.13,<0.14
+click>=8.0.4,<8.4
+colorama>=0.4,<1
+marshmallow>=3,<4
+pyelftools>=0.27,<1
+requests>=2,<3
+semantic_version>=2.10,<3
+tabulate>=0.9,<1
 pyserial>=3.5,<4
 Pillow>=10,<13
 meshtastic>=2.7,<3
 PyYAML>=6,<7
 esptool>=5.3,<6
 rich-click>=1.8,<2
+# nanopb invokes grpcio-tools while generating protobuf sources. Declare it
+# here so a clean firmware build never lets nanopb download an unpinned tool.
+grpcio-tools>=1.43,<2
 
 # esptool only caps cryptography below 49 on Intel macOS. Keep supported Linux
 # CI and the ARM64 lab runner on a fixed release instead of letting a universal

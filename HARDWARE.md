@@ -28,8 +28,10 @@ GNSS (ATGM336H on the same Cap):
   variant already handles this — when we replace the UI we must **not** drop this init, or the radio goes
   silent (SPI works, but nothing is transmitted/received).
 - **No antenna = possible hardware damage.** Never power the cap without the RP-SMA antenna attached.
-- **Region defaults to UNSET.** Stock firmware will not transmit until the LoRa region is configured. For
-  M0 baseline, set it via the phone app or the `meshtastic` Python CLI; our own UI exposes it later (M4).
-- **No PSRAM.** ESP32-S3FN8 has ~300 KB usable SRAM. The mesh engine already fits (stock firmware runs),
-  but the UI must be frugal: keep message history on **SD**, not in RAM. A 240×135×16-bit framebuffer is
-  ~64 KB — acceptable, but budget it deliberately.
+- **Region defaults to UNSET.** The radio will not transmit until a region is configured. ADV opens the
+  region picker on first boot and keeps it available under **Settings → LoRa → Region**; it never silently
+  replaces an intentional profile such as US.
+- **No PSRAM.** ESP32-S3FN8 has ~300 KB usable SRAM. The UI therefore uses a fixed 240×135×8-bit canvas
+  (32.4 KB), a bounded live-message ring, and a pageable archive in internal LittleFS. The Unicode font
+  lives in its own flash partition and can fall back to SD; it is never loaded wholesale into RAM. The
+  roughly 8.4 KiB BLE companion mirror/queue block is allocated on demand and is absent in onboard-LoRa mode.

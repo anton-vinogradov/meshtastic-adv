@@ -2,6 +2,10 @@
 
 **English** | [Русский](README.ru.md)
 
+[![Build](https://github.com/anton-vinogradov/meshtastic-adv/actions/workflows/build.yml/badge.svg)](https://github.com/anton-vinogradov/meshtastic-adv/actions/workflows/build.yml)
+[![Release](https://img.shields.io/github/v/release/anton-vinogradov/meshtastic-adv)](https://github.com/anton-vinogradov/meshtastic-adv/releases/latest)
+[![License](https://img.shields.io/github/license/anton-vinogradov/meshtastic-adv)](LICENSE)
+
 **A keyboard-first [Meshtastic](https://meshtastic.org) client for the [M5Stack Cardputer ADV](https://shop.m5stack.com/products/m5stack-cardputer-adv) — with its own Cap LoRa-1262 (SX1262), or driving any stock Meshtastic node over Bluetooth.**
 
 A from-scratch on-device UI focused on one thing: making it genuinely comfortable to **message people over the mesh** from a pocket QWERTY device — no phone required — while keeping the proven Meshtastic radio stack underneath. No LoRa cap? [Companion mode](#companion-mode-drive-another-node-over-ble) turns the Cardputer into a terminal for a Heltec / T-Beam / RAK you already own.
@@ -19,7 +23,7 @@ A from-scratch on-device UI focused on one thing: making it genuinely comfortabl
 
 ## Why
 
-The Cardputer has a real keyboard, a colour screen, a speaker and an SD card — but the stock on-device Meshtastic UI barely uses any of it, and typing a message on it is painful. This project **keeps the Meshtastic mesh engine 100% intact** (LoRa PHY, routing, PKI crypto, node DB, protobufs) and replaces **only the UI/input layer** with a clean chat experience built for the keyboard.
+The Cardputer has a real keyboard, a colour screen, a speaker and an SD card — but the stock on-device Meshtastic UI barely uses any of it, and typing a message on it is painful. This project keeps the upstream Meshtastic radio, routing, PKI and protobuf stack underneath, and builds a clean chat experience around the keyboard.
 
 You get a device that boots straight into a usable messenger: pick a contact, type, hit enter.
 
@@ -28,7 +32,7 @@ You get a device that boots straight into a usable messenger: pick a contact, ty
 - **🗨️ Recent chats home** — boots into your conversations (DMs + channels), newest first, each with a last-message preview, time and unread badge. Opening one jumps straight to the first unread message.
 - **💬 Direct messages** — open a node, type, send. PKI-encrypted DMs like the phone app.
 - **📢 Channels** — read and broadcast to any channel, right alongside your DMs.
-- **✅ Delivery status** — every sent message shows *sending* (dot) → *delivered* (green check, from the routing ACK) → *failed* (red ✗ with the reason). Channel broadcasts get a "sent" check.
+- **✅ Delivery status** — every sent message shows *sending* (dot) → *delivered* (green check, from the routing ACK) → *failed* (red ✗ with the reason). For channel broadcasts, the check is an implicit mesh acknowledgement: a neighbour was heard relaying the packet.
 - **⌨️ Cyrillic input + 😀 emoji** — type Russian on the Latin keyboard via a live transliteration layer (**Fn+L**); receive/render non-Latin text and inline emoji bitmaps; a **Tab** palette inserts emoji.
 - **🈶 Full Unicode text** — CJK, Greek, Hebrew, Arabic… any script in the Basic Multilingual Plane, plus the emoji blocks (reactions from phone users render as glyphs, not tofu), via a GNU Unifont partition the installer flashes automatically (Latin/Cyrillic stay on the fast embedded font).
 - **📇 Node list** — press **Tab** for everyone on the mesh, with a signal-bar meter (from SNR), hop count, last-heard age and role, in fixed columns.
@@ -51,6 +55,18 @@ You get a device that boots straight into a usable messenger: pick a contact, ty
 
 <p align="center"><b><a href="docs/interface.md#screens-at-a-glance">▶ See every screen with captions →</a></b></p>
 
+## Tested before release
+
+Every `v*` tag is held until the exact source passes the hardware-free tests,
+both firmware builds and size budgets, then a real Cardputer ADV on a trusted
+runner. The physical gate is radio-silent and identity-bound; it replays ordinary
+serialized `FromRadio` traffic through the production decoder, drives the real UI,
+overflows and reloads persistent history, checks 29 framebuffer captures, reboots,
+and finally restores and verifies the exact application bytes users will receive.
+See the honest [HIL coverage matrix](hil/README.md#coverage-matrix), including what
+still needs a camera, key jig or controlled RF lab for physical proof.
+The upcoming release scope and migration notes are kept in the [changelog](CHANGELOG.md).
+
 ## Install
 
 The easiest way is the **[web installer](https://anton-vinogradov.github.io/meshtastic-adv/)** (ESP Web Tools):
@@ -65,7 +81,7 @@ The easiest way is the **[web installer](https://anton-vinogradov.github.io/mesh
 - **M5Launcher catalog** — in the launcher's online-install (OTA) menu, find **Meshtastic ADV** and install from there: the catalog entry is a complete merged image and the launcher places everything correctly. Same firmware is in **M5Burner** (Cardputer category).
 - **M5Launcher from SD card** — use `meshtastic-adv-cardputer-adv-merged.bin` from the [latest release](https://github.com/anton-vinogradov/meshtastic-adv/releases) and flash it as a **full firmware** (written to address `0x0`, replacing the launcher) — *not* as an app/OTA install. An app-slot install runs this firmware on the launcher's partition layout, which ends in restarts and a dead keyboard. Don't use `factory.bin` here: it lacks the Unicode font.
 
-Prefer the CLI? Grab `firmware.factory.bin` from the [latest release](https://github.com/anton-vinogradov/meshtastic-adv/releases) and flash at offset `0x0` with esptool; add `unifont.bin` at `0x340000` for the full-Unicode font (or drop it on the SD card root instead) — or just take `meshtastic-adv-cardputer-adv-merged.bin`, which is both in one file.
+Prefer the CLI? Grab `meshtastic-adv-vX.Y.Z.factory.bin` from the [latest release](https://github.com/anton-vinogradov/meshtastic-adv/releases) and flash it at offset `0x0` with esptool; add `unifont.bin` at `0x340000` for the full-Unicode font (or drop it on the SD card root instead) — or just take `meshtastic-adv-cardputer-adv-merged.bin`, which contains both in one file.
 
 ## How to drive it
 
@@ -107,14 +123,15 @@ The UI and the mesh engine talk over the **same protobuf Client API** (`ToRadio`
 ```
   ┌─────────────────────────────┐        ToRadio / FromRadio        ┌──────────────────────────┐
   │  UI (this project, scratch) │  ───────────────────────────────▶ │  Meshtastic mesh engine  │
-  │  keyboard · screen · sound  │  ◀─────────────  protobuf  ─────── │  (upstream, unmodified)  │
+  │  keyboard · screen · sound  │  ◀─────────────  protobuf  ─────── │     (upstream core)      │
   └─────────────────────────────┘                                   │  LoRa · routing · crypto │
                                                                     └──────────────────────────┘
 ```
 
-- **Same feature set as stock** — anything the engine can do is reachable through the API the phone uses.
+- **Same Client API** — the UI uses the stock wire protocol, so the official phone app remains compatible.
 - **UI is fully ours** — the stock `Screen` / canned-message / input modules are disabled.
-- **No fork** — upstream `meshtastic/firmware` is a pristine git submodule; our code lives in an `overlay/` that is copied in at build time with two tiny `main.cpp` injections. Pulling newer upstream doesn't break the UI.
+- **Memory follows the selected radio** — the fixed BLE companion mirror and transport queues are allocated only in companion mode, returning about 8.4 KiB to the normal onboard-LoRa build.
+- **No long-lived firmware fork** — upstream `meshtastic/firmware` is a pinned git submodule; our code lives in `overlay/` and the build applies a small, deterministic integration patch set for startup, USB reliability and low-memory operation.
 
 See [docs/interface.md](docs/interface.md) for the on-screen details and [HARDWARE.md](HARDWARE.md) for the Cap LoRa-1262 pinout.
 
@@ -139,13 +156,21 @@ cd meshtastic-adv
 scripts/flash.sh        # syncs the overlay, builds, uploads, resets
 ```
 
-Requires PlatformIO. The build env is `m5stack-cardputer-adv-advui`. `scripts/sync-overlay.sh` copies `overlay/` into the submodule and applies the injections; `scripts/flash.sh` also handles the native-USB reset dance.
+Requires PlatformIO. The embedded engine is pinned to upstream beta `v2.7.26.54e0d8d`; the 2.8 development line is deliberately not the release base yet. The build env is `m5stack-cardputer-adv-advui`. `scripts/sync-overlay.sh` copies `overlay/` into the submodule and applies the integration patches; `scripts/flash.sh` also handles the native-USB reset dance. With more than one ESP device attached it deliberately refuses to guess — use `scripts/flash.sh --port /dev/cu.usbmodemXXXX`.
+
+Run syntax and unit tests, sanitizers, both firmware builds and their flash/DRAM/IRAM budgets with:
+
+```sh
+python3 scripts/verify.py
+```
+
+Hardware remains an explicit opt-in; commands, fixture safeguards and the coverage matrix live in [hil/](hil/README.md). The private RF runner is a separate integration diagnostic, not a re-test of the embedded Meshtastic routing engine. When moving back from a 2.8 development build, ADV discards only its incompatible, rebuildable node cache; node identity, channels and radio settings remain untouched. Take a verified configuration backup before any physical flash anyway.
 
 ## Status
 
 The read **and** write paths are done and running on real hardware: node list, DMs, channels, delivery status, Cyrillic, emoji, reactions, replies, favourites, sound, timestamps, persisted history, on-device settings and BLE companion mode all work today. Companion mode is verified end-to-end over the air (encrypted DM through the linked node, routing ACK back).
 
-Next up: full-Unicode font from SD (CJK) and quality-of-life polish.
+Current work is focused on field hardening, memory headroom and quality-of-life polish.
 
 ## License
 

@@ -126,7 +126,7 @@ the middle, the compose bar sits at the bottom.
   and so does backspace while erasing text); opening a thread auto-jumps to the first unread.
 - **Scrolling past the top pages into the flash archive**: messages evicted from the live
   window aren't gone — the newest 256 land in an archive on internal flash, and ↑ at the top
-  of the thread walks back through them 16 at a time (the footer shows `history N/K`;
+  of the thread walks back through them 8 at a time (the footer shows `history N/K`;
   ↓ keeps walking back toward newer; **ESC** leaves the chat as usual). Deleting a chat
   wipes its archive too.
 - **Type** and hit **Enter** to send. **Fn+L** toggles the Cyrillic transliteration layer
@@ -153,7 +153,7 @@ a section (or WiFi / MQTT / Radio directly), ESC steps back up.
 | Section | Rows |
 | ------- | ---- |
 | **Node**   | **Name** and **Short** — the node's long/short names (text editor)         |
-| **LoRa**   | **Region** (required on first boot) · **Preset** (LongFast, MediumFast, …) · **Frequency** (slot override, MHz) · **Channel** (primary name; key kept) · **Role** (Client, Client Mute/Hidden, Router (Late), Repeater, Tracker, Sensor, TAK) · **Hops** (1–7) · **Power** (region max or 2–22 dBm) · **Rebroadcast** (All / Local only / Known only / Core ports only / None) |
+| **LoRa**   | **Region** (required on first boot) · **Preset** (LongFast, MediumFast, …) · **Frequency** (SX1262 override, 150–960 MHz; leave blank for automatic) · **Channel** (primary name; key kept) · **Role** (Client, Client Mute/Hidden, Router (Late), Repeater, Tracker, Sensor, TAK) · **Hops** (1–7) · **Power** (region max or 2–22 dBm) · **Rebroadcast** (All / Local only / Known only / Core ports only / None) |
 | **WiFi**   | join a network (NTP time comes with it); enabling WiFi turns Bluetooth off |
 | **MQTT**   | bridge the mesh to the internet: default public broker or your own         |
 | **Device** | **UTC** — offset picker with city labels, drives all timestamps · **Clock** — the device time, `not set` until it syncs; type `HH:MM` to set it by hand when there's no phone, NTP or GPS node around (the clock resets on every reboot, and messages received while it's unset stay timeless) · **Screen** — auto-off timeout (15 s … 5 min or never; default 5 min) · **Font** — where the Unicode font came from (`flash` / `sd` / `off`), read-only |

@@ -1,0 +1,10 @@
+platformio==6.1.19
+pyserial>=3.5,<4
+Pillow>=10,<13
+meshtastic>=2.7,<3
+PyYAML>=6,<7
+# PlatformIO's tool-esptoolpy archive contains the esptool sources but does not
+# install their Python dependencies into every external PIO virtualenv. Pin the
+# matching major here so local and self-hosted release builds can package bins.
+esptool>=4.11,<5
+rich-click>=1.8,<2

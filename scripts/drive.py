@@ -1,13 +1,32 @@
-#!/usr/bin/env python
+#!/usr/bin/env python3
 # Remote-drive the ADVUI_SCREENSHOT build over serial: inject keys, capture live
 # screenshots (@@SHOT rgb332 hex dump) into PNGs. One long session per run.
-import sys, time, datetime
+import argparse
+import datetime
+import glob
+import os
+import time
+
+parser = argparse.ArgumentParser()
+parser.add_argument("out", nargs="?", default=".")
+parser.add_argument("script", help="semicolon-separated commands: W:sec K:keys L:name T:text C")
+parser.add_argument("--port", default=os.environ.get("MESHTASTIC_PORT"))
+args = parser.parse_args()
+
+PORT = args.port
+if not PORT:
+    ports = glob.glob("/dev/cu.usbmodem*")
+    if len(ports) != 1:
+        parser.error("choose one serial device with --port or MESHTASTIC_PORT")
+    PORT = ports[0]
+if not os.path.exists(PORT):
+    parser.error(f"serial device does not exist: {PORT}")
+
+OUT = args.out
+SCRIPT = args.script
+
 import serial
 from PIL import Image
-
-PORT = "/dev/cu.usbmodem2101"
-OUT = sys.argv[1] if len(sys.argv) > 1 else "."
-SCRIPT = sys.argv[2]  # semicolon-separated commands: W:sec K:keys L:name T:text C (=type clock now)
 
 s = serial.Serial(PORT, 115200, timeout=1)
 

@@ -89,6 +89,19 @@ class AdvUI : public concurrency::OSThread
     void screenshot(const char *name); // dump the current canvas over serial
     void runDemoDump();                // render each screen with sample data + dump, then reboot
 #endif
+#ifdef ADVUI_HIL
+    const char *hilModeName() const;
+    void hilState();       // machine-readable state for host assertions
+    void hilReactionState(); // on-demand reaction identity diagnostics (kept out of hot Q path)
+    void hilFrameDigest(); // cheap visual assertion without transferring a full frame
+    void hilHome();        // deterministic, non-persistent navigation reset
+    void hilInject(const uint8_t *bytes, uint16_t len); // real FromRadio protobuf ingress
+    void hilInjectCompanion(const uint8_t *bytes, uint16_t len); // stock BLE config-stream ingress
+    void hilClearData();   // erase all HIL-namespaced fixture/config files
+    void hilPersist();     // force the HIL message store to disk for reboot tests
+    void hilLoadLegacyStore(); // write/load a synthetic AVS4 migration fixture
+    void hilSeenSaturation(); // prove a full recency ledger admits a fresh sender
+#endif
     bool applyName(); // returns true if it scheduled a reboot (frequency/channel)
     void applyLoRa(int target, int value);
     void rebuildFiltered();
@@ -118,12 +131,12 @@ class AdvUI : public concurrency::OSThread
     uint8_t queryLen = 0;
 
     static constexpr int kMaxFiltered = 128;
-    uint16_t filtered[kMaxFiltered]; // node DB indices, sorted + query-matched (picker)
+    uint16_t filtered[kMaxFiltered] = {}; // node DB indices, sorted + query-matched (picker)
     int filteredCount = 0;
-    uint8_t chanList[8];  // enabled channel indices shown above the nodes
+    uint8_t chanList[8] = {}; // enabled channel indices shown above the nodes
     int chanCount = 0;
     static constexpr int kMaxConv = 32;
-    Conv conv[kMaxConv];  // recent conversations (MODE_CHATS)
+    Conv conv[kMaxConv] = {}; // recent conversations (MODE_CHATS)
     int convCount = 0;
     int sel = 0;          // cursor into the current list (chats / combined nodes+channels)
     int scrollTop = 0;    // first visible row
@@ -132,7 +145,7 @@ class AdvUI : public concurrency::OSThread
     int chatScroll = 0;       // thread view: lines scrolled up from the bottom (0 = newest)
     int chatAnchorMsgIdx = -1; // on open: ring index to scroll to (first unread), -1 = bottom
     // Flash-archive depth: the thread renders ONE continuous timeline — a staged
-    // slice of up to 16 archived messages followed by the live ring whenever the
+    // slice of up to 8 archived messages followed by the live ring whenever the
     // slice touches the seam. Scrolling at the window edges slides it deeper or
     // back toward live; the view anchor below keeps the reading position still
     // across slides, so there are no page swaps to see.

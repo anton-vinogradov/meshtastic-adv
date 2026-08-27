@@ -5,7 +5,7 @@
 # GitHub release assets don't send CORS headers and esp-web-tools fetches the binary
 # from the Pages origin. So the image is committed under docs/ and deployed via Pages.
 #
-# Usage: scripts/publish-firmware.sh <version-label>
+# Usage: scripts/publish-firmware.sh <version>
 #   then review and: git commit && git push   (Pages redeploys the installer)
 set -euo pipefail
 
@@ -14,30 +14,79 @@ ENV="m5stack-cardputer-adv-advui"
 REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 BUILD_DIR="$REPO_ROOT/firmware/.pio/build/$ENV"
 
-VERSION="${1:?usage: publish-firmware.sh <version-label>}"
+VERSION="${1:?usage: publish-firmware.sh <version>}"
+VERSION="${VERSION#v}"
 
-echo ">> syncing overlay into the pristine firmware tree"
+echo ">> syncing overlay into the pinned upstream firmware tree"
 "$REPO_ROOT/scripts/sync-overlay.sh"
 
 echo ">> building $ENV"
 ( cd "$REPO_ROOT/firmware" && "$PIO" run -e "$ENV" )
 
-FACTORY="$(ls -t "$BUILD_DIR"/firmware-*.factory.bin | head -1)"
-[ -f "$FACTORY" ] || { echo "!! factory image not found in $BUILD_DIR"; exit 1; }
+FACTORY=""
+shopt -s nullglob
+factory_images=("$BUILD_DIR"/firmware-*.factory.bin)
+shopt -u nullglob
+for image in "${factory_images[@]}"; do
+    if [ -z "$FACTORY" ] || [ "$image" -nt "$FACTORY" ]; then
+        FACTORY="$image"
+    fi
+done
+[ -n "$FACTORY" ] && [ -f "$FACTORY" ] || { echo "!! factory image not found in $BUILD_DIR"; exit 1; }
 
 cp "$FACTORY" "$REPO_ROOT/docs/firmware.factory.bin"
 
-# bump the manifest version label
-python3 - "$REPO_ROOT/docs/manifest.json" "$VERSION" <<'PY'
-import json, sys
-path, ver = sys.argv[1], sys.argv[2]
-m = json.load(open(path))
-m["version"] = ver
-with open(path, "w") as f:
-    json.dump(m, f, indent=2)
-    f.write("\n")
+# Update the current installer and same-origin archive as one transaction. The
+# label is derived from the pinned submodule; callers cannot accidentally claim
+# a different Meshtastic engine than the image they just built.
+python3 - "$REPO_ROOT" "$VERSION" <<'PY'
+import configparser
+import copy
+import json
+import pathlib
+import re
+import shutil
+import sys
+
+root = pathlib.Path(sys.argv[1])
+version = sys.argv[2]
+if not re.fullmatch(r"\d+\.\d+\.\d+(?:[-+][0-9A-Za-z.-]+)?", version):
+    raise SystemExit(f"invalid release version: {version!r}")
+
+config = configparser.ConfigParser()
+config.read(root / "firmware/version.properties")
+engine_parts = config["VERSION"]
+engine = ".".join(engine_parts[name] for name in ("major", "minor", "build"))
+
+docs = root / "docs"
+manifest_path = docs / "manifest.json"
+manifest = json.loads(manifest_path.read_text())
+manifest["version"] = f"{version} (advui · engine {engine})"
+manifest_path.write_text(json.dumps(manifest, indent=2) + "\n")
+
+archive = docs / "versions" / f"v{version}"
+archive.mkdir(parents=True, exist_ok=True)
+shutil.copy2(docs / "firmware.factory.bin", archive / "firmware.factory.bin")
+archived_manifest = copy.deepcopy(manifest)
+for build in archived_manifest["builds"]:
+    for part in build["parts"]:
+        if part.get("path") == "unifont.bin":
+            part["path"] = "../../unifont.bin"
+(archive / "manifest.json").write_text(json.dumps(archived_manifest, indent=2) + "\n")
+
+def version_key(path):
+    match = re.match(r"v(\d+)\.(\d+)\.(\d+)", path.name)
+    return tuple(map(int, match.groups())) if match else (-1, -1, -1)
+
+archives = sorted((path for path in (docs / "versions").glob("v*") if path.is_dir()),
+                  key=version_key, reverse=True)
+for old in archives[6:]:
+    shutil.rmtree(old)
+(docs / "versions/index.json").write_text(json.dumps([path.name for path in archives[:6]], indent=2) + "\n")
 PY
 
-git -C "$REPO_ROOT" add docs/firmware.factory.bin docs/manifest.json
-echo ">> staged docs/firmware.factory.bin ($(du -h "$REPO_ROOT/docs/firmware.factory.bin" | cut -f1)), manifest version=$VERSION"
+python3 "$REPO_ROOT/scripts/check-installer.py" "$REPO_ROOT/docs"
+
+git -C "$REPO_ROOT" add docs/firmware.factory.bin docs/manifest.json docs/versions
+echo ">> staged docs/firmware.factory.bin ($(du -h "$REPO_ROOT/docs/firmware.factory.bin" | cut -f1)), release=$VERSION"
 echo ">> next: git -C $REPO_ROOT commit && git -C $REPO_ROOT push   # deploys the installer via Pages"

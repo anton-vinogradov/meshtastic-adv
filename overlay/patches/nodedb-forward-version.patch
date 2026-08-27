@@ -1,0 +1,17 @@
+diff --git a/src/mesh/NodeDB.cpp b/src/mesh/NodeDB.cpp
+index 4b31cf0..1564152 100644
+--- a/src/mesh/NodeDB.cpp
++++ b/src/mesh/NodeDB.cpp
+@@ -1254,8 +1254,10 @@ void NodeDB::loadFromDisk()
+ #endif
+     auto state = loadProto(nodeDatabaseFileName, getMaxNodesAllocatedSize(), sizeof(meshtastic_NodeDatabase),
+                            &meshtastic_NodeDatabase_msg, &nodeDatabase);
+-    if (nodeDatabase.version < DEVICESTATE_MIN_VER) {
+-        LOG_WARN("NodeDatabase %d is old, discard", nodeDatabase.version);
++    // advui-inject-forward-nodedb: v25 flattened NodeInfoLite and is not
++    // backward-decodable by the v24 schema. Drop only this rebuildable cache.
++    if (nodeDatabase.version != DEVICESTATE_CUR_VER) {
++        LOG_WARN("NodeDatabase %d is incompatible, discard", nodeDatabase.version);
+         installDefaultNodeDatabase();
+     } else {
+         meshNodes = &nodeDatabase.nodes;

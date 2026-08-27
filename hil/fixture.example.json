@@ -1,0 +1,31 @@
+{
+  "schema": 2,
+  "devices": {
+    "dut": {
+      "kind": "m5stack-cardputer-adv",
+      "usb_serial": "AA:BB:CC:DD:EE:FF",
+      "expected_region": "US",
+      "expected_tx_power": 26
+    }
+  },
+  "protected_devices": [
+    {
+      "kind": "do-not-touch",
+      "usb_serial": "11:22:33:44:55:66"
+    }
+  ],
+  "wifi_peers": [
+    {
+      "name": "n77a",
+      "host": "192.0.2.10",
+      "node_id": "!01020304",
+      "access": "read-only"
+    },
+    {
+      "name": "n77b",
+      "host": "192.0.2.11",
+      "node_id": "!05060708",
+      "access": "read-only"
+    }
+  ]
+}

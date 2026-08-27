@@ -3,6 +3,11 @@
 .pioenvs/
 .piolibdeps/
 *.pyc
+__pycache__/
+
+# Local HIL fixture identities and generated evidence
+hil/fixture.local.json
+hil-artifacts/
 
 # Build artifacts / flashable images
 *.bin

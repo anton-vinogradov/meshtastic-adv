@@ -12,13 +12,34 @@ concurrency:
   cancel-in-progress: true
 
 permissions:
-  contents: write
+  contents: read
 
 jobs:
+  host-tests:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Validate release tag
+        if: startsWith(github.ref, 'refs/tags/v')
+        run: python scripts/release_tag.py "$GITHUB_REF_NAME"
+      - name: Host verification
+        run: python scripts/verify.py --quick --artifacts hil-artifacts/ci-host
+      - name: Upload host verification evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: host-verification
+          path: hil-artifacts/ci-host
+
   firmware:
     runs-on: ubuntu-latest
+    timeout-minutes: 45
     steps:
-      - name: Checkout (with the pristine firmware submodule)
+      - name: Checkout (with the pinned upstream firmware submodule)
         uses: actions/checkout@v4
         with:
           submodules: recursive
@@ -33,41 +54,159 @@ jobs:
           path: |
             ~/.platformio
             ~/.cache/pip
-          key: pio-${{ hashFiles('firmware/platformio.ini') }}
+          key: pio-${{ hashFiles('firmware/platformio.ini', 'firmware/variants/**/platformio.ini', 'overlay/variants/**/platformio.ini', 'hil/requirements.txt') }}
           restore-keys: pio-
 
-      - name: Install PlatformIO
-        run: pip install --upgrade platformio
+      - name: Install build dependencies
+        run: python -m pip install -r hil/requirements.txt
 
-      - name: Sync the overlay into the submodule
-        run: bash scripts/sync-overlay.sh
+      - name: Firmware verification
+        run: python scripts/verify.py --firmware-only --artifacts hil-artifacts/ci-firmware
 
-      - name: Build (m5stack-cardputer-adv-advui)
-        working-directory: firmware
-        run: pio run -e m5stack-cardputer-adv-advui
+      - name: Upload firmware verification evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: firmware-verification
+          path: hil-artifacts/ci-firmware
 
-      - name: Locate the factory image
+      - name: Locate release images
         id: img
-        run: echo "path=$(ls firmware/.pio/build/m5stack-cardputer-adv-advui/*.factory.bin | head -1)" >> "$GITHUB_OUTPUT"
+        run: |
+          echo "factory=$(ls firmware/.pio/build/m5stack-cardputer-adv-advui/*.factory.bin | head -1)" >> "$GITHUB_OUTPUT"
+          echo "app=$(find firmware/.pio/build/m5stack-cardputer-adv-advui -maxdepth 1 -type f -name 'firmware-*.bin' ! -name '*.factory.bin' -print -quit)" >> "$GITHUB_OUTPUT"
 
       - uses: actions/upload-artifact@v4
         with:
           name: firmware-factory
-          path: ${{ steps.img.outputs.path }}
+          path: |
+            ${{ steps.img.outputs.factory }}
+            ${{ steps.img.outputs.app }}
 
-      # ---------- tag-only: refresh the web installer + cut a release ----------
-      - name: Refresh the installer image on main
-        if: startsWith(github.ref, 'refs/tags/v')
+  # A tag is not published until the exact source passes our behavioral HIL. This
+  # runner is intentionally tag-only: untrusted pull requests never reach local
+  # USB devices. The fixture secret binds the DUT by USB MAC and lists every
+  # other attached ESP device as protected. RF routing belongs to upstream
+  # Meshtastic and is intentionally not a release gate for this UI firmware.
+  release-hil:
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: [host-tests, firmware]
+    runs-on: [self-hosted, macOS, meshtastic-adv-hil]
+    timeout-minutes: 45
+    environment: release-hil
+    concurrency:
+      group: meshtastic-adv-physical-hil
+      cancel-in-progress: false
+    env:
+      HIL_FIXTURE: ${{ runner.temp }}/meshtastic-adv-fixture-${{ github.run_id }}.json
+    steps:
+      - name: Checkout release source and pinned firmware
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install lab dependencies
+        run: python -m pip install -r hil/requirements.txt
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: firmware-factory
+          path: release-input
+
+      - name: Bind HIL restore to the exact release artifact
+        id: release_app
         run: |
-          cp "${{ steps.img.outputs.path }}" /tmp/fw.bin
-          ver="${GITHUB_REF_NAME#v}"
+          factory=$(find release-input -type f -name '*.factory.bin' -print -quit)
+          app=$(find release-input -type f -name 'firmware-*.bin' ! -name '*.factory.bin' -print -quit)
+          test -n "$factory" && test -n "$app"
+          FACTORY="$factory" APP="$app" python -c 'import os,pathlib,sys; f=pathlib.Path(os.environ["FACTORY"]).read_bytes(); a=pathlib.Path(os.environ["APP"]).read_bytes(); mismatch=not a or f[0x10000:0x10000+len(a)] != a; sys.exit("factory/app byte mismatch") if mismatch else None'
+          echo "path=$app" >> "$GITHUB_OUTPUT"
+
+      - name: Materialize the identity-bound lab fixture
+        env:
+          HIL_FIXTURE_JSON: ${{ secrets.HIL_FIXTURE_JSON }}
+        run: |
+          umask 077
+          test -n "$HIL_FIXTURE_JSON"
+          python -c 'import os,pathlib; p=pathlib.Path(os.environ["HIL_FIXTURE"]); p.write_text(os.environ["HIL_FIXTURE_JSON"]); p.chmod(0o600)'
+
+      - name: Release behavioral HIL
+        run: |
+          python scripts/verify.py \
+            --usb \
+            --release-image "${{ steps.release_app.outputs.path }}" \
+            --fixture "$HIL_FIXTURE" \
+            --artifacts hil-artifacts/release-hil
+
+      - name: Upload behavioral HIL evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-hil-evidence
+          path: hil-artifacts/release-hil
+
+      - name: Remove the identity-bound temporary fixture
+        if: always()
+        run: |
+          case "$HIL_FIXTURE" in "$RUNNER_TEMP"/meshtastic-adv-fixture-*.json) ;; *) exit 2 ;; esac
+          rm -f -- "$HIL_FIXTURE"
+
+  # ---------- tag-only, gated by host + firmware + behavioral HIL ----------
+  release:
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: [host-tests, firmware, release-hil]
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    concurrency:
+      group: meshtastic-adv-release-publish
+      cancel-in-progress: false
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: firmware-factory
+          path: release-input
+
+      - name: Stage exact tagged release inputs
+        id: tagged
+        run: |
+          python scripts/release_tag.py "$GITHUB_REF_NAME" >> "$GITHUB_OUTPUT"
+          factory=$(find release-input -type f -name '*.factory.bin' -print -quit)
+          test -n "$factory"
+          cp "$factory" /tmp/fw.bin
+          cp docs/unifont.bin /tmp/unifont.bin
+          cp scripts/check-installer.py /tmp/check-installer.py
+          cp scripts/mkm5burner.sh /tmp/mkm5burner.sh
+          cp scripts/m5burner_publish.py /tmp/m5burner_publish.py
+          engine=$(python -c 'import configparser; c=configparser.ConfigParser(); c.read("firmware/version.properties"); v=c["VERSION"]; print("{}.{}.{}".format(v["major"], v["minor"], v["build"]))')
+          echo "engine=$engine" >> "$GITHUB_OUTPUT"
+
+      - name: Refresh the installer image on main
+        if: steps.tagged.outputs.prerelease == 'false'
+        run: |
+          ver="${{ steps.tagged.outputs.version }}"
+          engine="${{ steps.tagged.outputs.engine }}"
           git config user.name  "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git fetch origin main
           git checkout -B main origin/main
           cp /tmp/fw.bin docs/firmware.factory.bin
+          cp /tmp/unifont.bin docs/unifont.bin
           tmp=$(mktemp)
-          jq --arg v "$ver (advui · engine 2.8.0)" '.version=$v' docs/manifest.json > "$tmp" && mv "$tmp" docs/manifest.json
+          jq --arg v "$ver (advui · engine $engine)" '.version=$v' docs/manifest.json > "$tmp" && mv "$tmp" docs/manifest.json
           # Archive this version for the installer's version picker. Images must be
           # same-origin (GitHub Releases lack CORS), so they live under docs/; only
           # the 6 newest stay archived — older ones remain on the Releases page.
@@ -79,37 +218,50 @@ jobs:
             docs/manifest.json > "docs/versions/${GITHUB_REF_NAME}/manifest.json"
           (cd docs/versions && ls -d v* | sort -rV | tail -n +7 | xargs -r rm -rf)
           (cd docs/versions && ls -d v* | sort -rV) | jq -R . | jq -s . > docs/versions/index.json
-          git add docs/firmware.factory.bin docs/manifest.json docs/versions
-          git commit -m "ci: web installer image for ${GITHUB_REF_NAME} [skip ci]" || { echo "no change"; exit 0; }
-          git push origin HEAD:main
+          python /tmp/check-installer.py docs
+          git add docs/firmware.factory.bin docs/unifont.bin docs/manifest.json docs/versions
+          if git diff --cached --quiet; then
+            echo "installer already contains ${GITHUB_REF_NAME}"
+          else
+            git commit -m "ci: web installer image for ${GITHUB_REF_NAME} [skip ci]"
+            git push origin HEAD:main
+          fi
 
       - name: Create the GitHub release
-        if: startsWith(github.ref, 'refs/tags/v')
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
+          release_flags=(--verify-tag)
+          if [ "${{ steps.tagged.outputs.prerelease }}" = true ]; then
+            release_flags+=(--prerelease --latest=false)
+          else
+            release_flags+=(--latest)
+          fi
           cp /tmp/fw.bin "meshtastic-adv-${GITHUB_REF_NAME}.factory.bin"
           # One-file merged image (firmware + partition table + Unicode font) for
           # M5Burner and the Launcher catalog, which greps releases for a stable
           # asset name; flash it at 0x0.
-          pip install esptool >/dev/null
-          python -m esptool --chip esp32s3 merge_bin -o meshtastic-adv-cardputer-adv-merged.bin \
-            --flash_mode keep --flash_size keep \
-            0x0 /tmp/fw.bin 0x340000 docs/unifont.bin
+          python -m pip install 'esptool>=4.11,<5' >/dev/null
+          MESHTASTIC_FACTORY=/tmp/fw.bin \
+            MESHTASTIC_FONT=/tmp/unifont.bin \
+            MESHTASTIC_MERGED_OUT="$GITHUB_WORKSPACE/meshtastic-adv-cardputer-adv-merged.bin" \
+            MESHTASTIC_REPO_ROOT="$GITHUB_WORKSPACE" \
+            bash /tmp/mkm5burner.sh "${{ steps.tagged.outputs.version }}"
           if gh release view "${GITHUB_REF_NAME}" >/dev/null 2>&1; then
-            gh release upload "${GITHUB_REF_NAME}" "meshtastic-adv-${GITHUB_REF_NAME}.factory.bin" docs/unifont.bin meshtastic-adv-cardputer-adv-merged.bin --clobber
+            gh release upload "${GITHUB_REF_NAME}" "meshtastic-adv-${GITHUB_REF_NAME}.factory.bin" /tmp/unifont.bin meshtastic-adv-cardputer-adv-merged.bin --clobber
           else
             gh release create "${GITHUB_REF_NAME}" \
               --title "Meshtastic ADV ${GITHUB_REF_NAME}" \
               --generate-notes \
-              "meshtastic-adv-${GITHUB_REF_NAME}.factory.bin" docs/unifont.bin meshtastic-adv-cardputer-adv-merged.bin
+              "${release_flags[@]}" \
+              "meshtastic-adv-${GITHUB_REF_NAME}.factory.bin" /tmp/unifont.bin meshtastic-adv-cardputer-adv-merged.bin
           fi
 
       - name: Publish to M5Burner
         # Pushes the merged image as a new version of our M5Burner entry — the
         # source both Burner and the M5Launcher catalog install from. Skipped
         # when the secrets aren't set; a publish hiccup must not fail a release.
-        if: startsWith(github.ref, 'refs/tags/v')
+        if: steps.tagged.outputs.prerelease == 'false'
         continue-on-error: true
         env:
           M5B_EMAIL: ${{ secrets.M5BURNER_EMAIL }}
@@ -120,7 +272,7 @@ jobs:
             exit 0
           fi
           pip install requests >/dev/null
-          python scripts/m5burner_publish.py \
+          python /tmp/m5burner_publish.py \
             --email "$M5B_EMAIL" --password "$M5B_PWD" \
-            --version "${GITHUB_REF_NAME#v}" \
+            --version "${{ steps.tagged.outputs.version }}" \
             --bin meshtastic-adv-cardputer-adv-merged.bin

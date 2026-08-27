@@ -101,7 +101,7 @@ uint8_t i2cRead(uint8_t dev, uint8_t reg, uint8_t *data, uint8_t len)
     uint8_t i = 0;
     while (Wire.available() && i < len)
         data[i++] = Wire.read();
-    return 0;
+    return i == len ? 0 : 1;
 }
 
 uint8_t i2cWrite(uint8_t dev, uint8_t reg, uint8_t *data, uint8_t len)
@@ -174,12 +174,15 @@ void AdvKeyboard::pressed(uint8_t key)
     if (state == Init || state == Busy)
         return;
 
+    if (key == 0) // a failed/short register read is not a matrix position
+        return;
+
     if (modifierFlag && (millis() - last_modifier_time > kMultiTapThreshold))
         modifierFlag = 0;
 
     int row = (key - 1) / 10;
     int col = (key - 1) % 10;
-    if (row >= kRows || col >= kCols)
+    if (row < 0 || row >= kRows || col < 0 || col >= kCols)
         return;
 
     next_key = row * kCols + col;
@@ -197,12 +200,6 @@ void AdvKeyboard::pressed(uint8_t key)
     updateModifierFlag(next_key);
     if (isModifierKey(next_key))
         last_modifier_time = now;
-
-    if ((int32_t)tap_interval < 0) {
-        last_tap = 0;
-        state = Busy;
-        return;
-    }
 
     if (next_key != last_key || tap_interval > kMultiTapThreshold)
         char_idx = 0;
@@ -247,10 +244,10 @@ void AdvKeyboard::released()
         bool longFired = escLongFired;
         escDown = false;
         escLongFired = false;
+        modifierFlag = 0; // ESC uses the Fn column only as a key-map lookup; it must not latch Fn
         if (longFired)
             return;
-        modifierFlag = modifierFn;
-        queueEvent(TapMap[0][modifierFlag % TapMod[0]]);
+        queueEvent(TapMap[0][modifierFn % TapMod[0]]);
         return;
     }
 

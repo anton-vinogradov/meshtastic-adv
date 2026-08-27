@@ -17,7 +17,7 @@ import sys
 import requests
 
 FID = "78f98d6ec06fe700fa9edced6434a3f0"  # our "Meshtastic ADV" entry
-API = "http://m5burner-api.m5stack.com"
+API = "https://m5burner-api.m5stack.com"
 
 
 def main():

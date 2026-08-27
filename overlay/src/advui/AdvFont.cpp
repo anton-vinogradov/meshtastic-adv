@@ -5,7 +5,11 @@
 #include <SPI.h>
 #include <cstdlib>
 #include <cstring>
+#include <esp_idf_version.h>
 #include <esp_partition.h>
+#if ESP_IDF_VERSION_MAJOR < 5
+#include <esp_spi_flash.h>
+#endif
 
 namespace advui
 {
@@ -96,13 +100,19 @@ void sdFontInit()
         bool v1 = !v2 && memcmp(magic, "AUF1", 4) == 0;
         size_t need = v2 ? kFontSizeV2 : kFontSizeV1;
         const void *ptr = nullptr;
+#if ESP_IDF_VERSION_MAJOR >= 5
         esp_partition_mmap_handle_t h;
+        constexpr auto mmapSpace = ESP_PARTITION_MMAP_DATA;
+#else
+        spi_flash_mmap_handle_t h;
+        constexpr auto mmapSpace = SPI_FLASH_MMAP_DATA;
+#endif
         esp_err_t err;
         if (!v1 && !v2) {
             snprintf(g_state, sizeof(g_state), "not flashed");
         } else if (part->size < need) {
             snprintf(g_state, sizeof(g_state), "part too small");
-        } else if ((err = esp_partition_mmap(part, 0, need, ESP_PARTITION_MMAP_DATA, &ptr, &h)) != ESP_OK) {
+        } else if ((err = esp_partition_mmap(part, 0, need, mmapSpace, &ptr, &h)) != ESP_OK) {
             snprintf(g_state, sizeof(g_state), "mmap 0x%x", (unsigned)err);
         } else {
             g_map = (const uint8_t *)ptr;
@@ -143,12 +153,14 @@ void sdFontLoadFromSd()
         LOG_INFO("advui: %s missing/invalid, unicode font off", kFontPath);
         if (g_font)
             g_font.close();
+        SD.end(); // release FATFS/SPI buffers acquired by the successful mount
         return;
     }
     g_v2 = v2;
     g_cache = (CacheEnt *)calloc(kCacheN, sizeof(CacheEnt));
     if (!g_cache) {
         g_font.close();
+        SD.end(); // a failed optional feature must not keep its ~32 KB mount cost
         return;
     }
     for (int i = 0; i < kCacheN; i++)
@@ -170,7 +182,10 @@ bool sdFontOffered()
 
 void sdFontUnload()
 {
-    if (!g_ready)
+    // A flash-backed font is permanently memory-mapped for this boot. It is not
+    // an SD resource and must never be torn down with SD.end(); Settings only
+    // offers this toggle for the SD fallback, but keep the primitive safe too.
+    if (!g_ready || g_map)
         return;
     concurrency::LockGuard guard(spiLock);
     if (g_font)
@@ -179,6 +194,7 @@ void sdFontUnload()
     g_cache = nullptr;
     SD.end();
     g_ready = false;
+    g_v2 = false;
     snprintf(g_state, sizeof(g_state), "off");
 }
 

@@ -20,7 +20,9 @@
 // panel wired straight to those rails dies; use a board with its own regulator,
 // or feed it 3.3 V from elsewhere.
 
+#ifndef LGFX_USE_V1
 #define LGFX_USE_V1
+#endif
 #include <LovyanGFX.hpp>
 
 namespace advui

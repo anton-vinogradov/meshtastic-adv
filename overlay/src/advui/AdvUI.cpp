@@ -2,7 +2,11 @@
 #include "AdvBle.h"
 #include "AdvVersion.h"
 #include "AdvFont.h"
+#include "AdvMeshCompat.h"
+#include "AdvStorage.h"
+#include "AdvUtf8.h"
 #include "SPILock.h" // the external panel shares SPI2 with the SD card
+#include "SafeFile.h"
 #include <new> // std::nothrow: the second-screen driver must fail soft, not abort
 #include "BluetoothStatus.h"
 #include "CyrillicFont.h"
@@ -27,13 +31,17 @@
 #include <WiFi.h>                    // live WiFi.status()/localIP()/RSSI() for the settings page
 #endif
 #ifdef HAS_NEOPIXEL
-#include "esp32-hal-rgb-led.h" // rgbLedWrite(): stateless RMT driver for the onboard RGB LED
+#include "esp32-hal-rgb-led.h" // stateless RMT driver for the onboard RGB LED
+#include "esp_arduino_version.h"
 #include <Esp.h>
 #include <esp_heap_caps.h>
 #endif
 #include <algorithm>
 #include <cctype>
 #include <esp_random.h>
+#ifdef ADVUI_HIL
+#include <esp_system.h>
+#endif
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -55,8 +63,8 @@ extern uint8_t g_nameShort;
 const char *nodeName(const meshtastic_NodeInfoLite *n)
 {
     if (g_nameShort)
-        return n->short_name[0] ? n->short_name : n->long_name;
-    return n->long_name[0] ? n->long_name : n->short_name;
+        return nodeShortName(n)[0] ? nodeShortName(n) : nodeLongName(n);
+    return nodeLongName(n)[0] ? nodeLongName(n) : nodeShortName(n);
 }
 
 // Favourites the Cardputer owns, as opposed to the ones living in a node database.
@@ -94,7 +102,7 @@ bool setFavNodeLocal(uint32_t num, bool on)
 
 bool isFav(const meshtastic_NodeInfoLite *n)
 {
-    if (n->bitfield & NODEINFO_BITFIELD_IS_FAVORITE_MASK)
+    if (nodeIsFavorite(n))
         return true;
     return g_favNodeCount && favNodeLocal(n->num);
 }
@@ -119,8 +127,9 @@ bool ciContains(const char *hay, const char *needle)
 
 // Incoming text messages, kept in a small RAM ring (oldest overwritten). Enough
 // to show a node's recent thread and to know who we've talked to for sorting.
-// MSG_SENT = handed to the mesh as a broadcast (no per-recipient ack possible),
-// distinct from MSG_DELIVERED which is an ack-confirmed DM.
+// MSG_SENT is retained for legacy/untracked broadcasts. New broadcasts request
+// an implicit routing result and remain MSG_SENDING until it arrives, just like
+// an end-to-end-acknowledged DM.
 enum MsgStatus : uint8_t { MSG_IN = 0, MSG_SENDING = 1, MSG_DELIVERED = 2, MSG_FAILED = 3, MSG_SENT = 4 };
 
 struct Msg {
@@ -135,6 +144,7 @@ struct Msg {
     char text[236]; // fits the 233-byte wire maximum (DATA_PAYLOAD_LEN) + NUL;
                     // 160 used to cut long Cyrillic messages mid-word
 };
+static_assert(sizeof(Msg) == 256, "AVS4/AVH2 Msg layout changed; bump both persistence formats");
 
 // Short names for meshtastic_Routing_Error, shown next to a failed message.
 //
@@ -190,7 +200,14 @@ constexpr int kTopCount = 7;                          // Node, LoRa, WiFi, MQTT,
 Msg g_msgs[kMaxMsgs];
 int g_msgCount = 0;         // populated slots (grows to kMaxMsgs)
 bool g_msgsDirty = false;   // ring changed since the last flash save
-uint32_t g_lastSaveMs = 0;  // when we last wrote the ring to flash
+uint32_t g_lastMsgChangeMs = 0; // restart the quiet-time debounce on every mutation
+
+void markMsgsDirty()
+{
+    const uint32_t now = millis();
+    g_msgsDirty = true;
+    g_lastMsgChangeMs = now;
+}
 
 // Parallel to g_msgs: the packet id this slot's message replies to (0 = not a reply).
 // A separate array so the Msg layout (and the saved-file magic) stays unchanged.
@@ -208,16 +225,19 @@ void histAppend(const Msg &m, uint32_t replyId); // eviction victims go to the f
 void addMsg(uint32_t from, uint32_t to, uint8_t ch, uint32_t rxTime, bool unread, const char *text, uint32_t id,
            uint8_t status, uint32_t replyId = 0)
 {
-    if (id) // a loopback copy of a message we already hold (e.g. our own send
+    // MeshPacket.id is guaranteed unique only per sender. A global-id dedupe
+    // silently dropped one of two unrelated nodes when their random IDs happened
+    // to collide; loopback suppression needs the complete (sender, id) identity.
+    if (id) // a loopback copy of a message we already hold (e.g. our own send)
         for (int i = 0; i < g_msgCount; i++)
-            if (g_msgs[i].id == id)
+            if (g_msgs[i].from == from && g_msgs[i].id == id)
                 return;
-    if (rxTime < kValidEpoch) {
+    if (rxTime < kValidEpoch || !validStoredEpoch(rxTime)) {
         // The engine quality-gates rx_time, so it hands us 0 even when the system
         // clock is actually fine (it survives soft resets). Prefer the live clock;
         // only truly clockless arrivals fall back to the uptime moment.
         uint32_t now = getTime(false);
-        rxTime = now >= kValidEpoch ? now : millis() / 1000 + 1;
+        rxTime = validStoredEpoch(now) ? now : millis() / 1000 + 1;
     }
     // The ring is a compact chronological array (index 0 = oldest). When it's full
     // we evict the oldest CHANNEL broadcast, not the oldest message — so a busy
@@ -246,12 +266,19 @@ void addMsg(uint32_t from, uint32_t to, uint8_t ch, uint32_t rxTime, bool unread
             return false;
         };
         int victim = -1;
-        for (int pass = 0; pass < 4 && victim < 0; pass++)
+        // First run every tier without touching an in-flight packet: once a
+        // message leaves RAM, a later routing ACK can no longer update it. Only
+        // an all-pending ring is allowed to fall through to the same tiers with
+        // that protection relaxed.
+        for (int pass = 0; pass < 8 && victim < 0; pass++)
             for (int i = 0; i < g_msgCount; i++) {
+                if (pass < 4 && g_msgs[i].status == MSG_SENDING)
+                    continue;
+                const int tier = pass % 4;
                 bool bcast = g_msgs[i].to == NODENUM_BROADCAST;
-                bool ok = pass == 0   ? (bcast && hasNewer(i))
-                          : pass == 1 ? (!bcast && hasNewer(i))
-                          : pass == 2 ? bcast
+                bool ok = tier == 0   ? (bcast && hasNewer(i))
+                          : tier == 1 ? (!bcast && hasNewer(i))
+                          : tier == 2 ? bcast
                                       : true;
                 if (ok) {
                     victim = i;
@@ -274,9 +301,8 @@ void addMsg(uint32_t from, uint32_t to, uint8_t ch, uint32_t rxTime, bool unread
     m.status = status;
     m.err = 0;
     m.read = !unread;
-    strncpy(m.text, text, sizeof(m.text) - 1);
-    m.text[sizeof(m.text) - 1] = 0;
-    g_msgsDirty = true;
+    utf8CopyValid(m.text, sizeof(m.text), text);
+    markMsgsDirty();
 }
 
 // Mark the sent message whose id matches an incoming ACK/routing response.
@@ -288,7 +314,7 @@ void ackMsg(uint32_t reqId, uint8_t status, uint8_t err)
         if (g_msgs[i].id == reqId && g_msgs[i].id != 0 && g_msgs[i].status != MSG_IN) {
             g_msgs[i].status = status;
             g_msgs[i].err = err;
-            g_msgsDirty = true;
+            markMsgsDirty();
             return;
         }
 }
@@ -297,35 +323,91 @@ void ackMsg(uint32_t reqId, uint8_t status, uint8_t err)
 // A reaction is a TEXT_MESSAGE_APP packet with emoji=1 and reply_id = the target
 // message's packet id (same wire format the phone apps use). We keep them in their
 // own small ring, attached to messages by id at render time.
-struct Reaction {
+// AVS4 stored reactions before the target sender became part of their identity.
+// Keep the byte-exact record so existing saves can be widened on load.
+struct ReactionV4 {
     uint32_t msgId; // packet id of the message reacted to
     uint32_t from;
     char label[9]; // UTF-8 emoji sequence
 };
+static_assert(sizeof(ReactionV4) == 20, "legacy AVS4 Reaction layout must remain byte-exact");
+
+struct Reaction {
+    uint32_t msgId;      // packet id of the message reacted to
+    uint32_t from;       // node that sent the reaction
+    uint32_t targetFrom; // sender of the target message; 0 = ambiguous/legacy wildcard
+    char label[9];       // UTF-8 emoji sequence
+};
+static_assert(sizeof(Reaction) == 24, "AVS5 Reaction layout changed; bump the persistence format");
 constexpr int kMaxReacts = 32;
 Reaction g_reacts[kMaxReacts];
 int g_reactCount = 0;
 int g_reactNext = 0;
 
-void addReaction(uint32_t msgId, uint32_t from, const char *label)
+void markReactionsForMessage(uint32_t msgId, uint32_t targetFrom, bool *drop)
 {
-    LOG_INFO("advui: reaction msgId=0x%08x from=0x%08x %s", (unsigned)msgId, (unsigned)from, label);
+    if (!msgId || !drop)
+        return;
     for (int i = 0; i < g_reactCount; i++)
-        if (g_reacts[i].msgId == msgId && g_reacts[i].from == from) { // replace their previous one
-            strncpy(g_reacts[i].label, label, sizeof(g_reacts[i].label) - 1);
-            g_reacts[i].label[sizeof(g_reacts[i].label) - 1] = 0;
-            g_msgsDirty = true;
+        if (g_reacts[i].msgId == msgId && (!g_reacts[i].targetFrom || g_reacts[i].targetFrom == targetFrom))
+            drop[i] = true;
+}
+
+void preserveReactionsForMessage(uint32_t msgId, uint32_t targetFrom, bool *drop)
+{
+    if (!msgId || !drop)
+        return;
+    for (int i = 0; i < g_reactCount; i++)
+        if (g_reacts[i].msgId == msgId && (!g_reacts[i].targetFrom || g_reacts[i].targetFrom == targetFrom))
+            drop[i] = false;
+}
+
+void dropMarkedReactions(bool *drop)
+{
+    if (!drop)
+        return;
+    // A full reaction store is circular. Rotate it to chronological order before
+    // compacting, otherwise deleting anything also changes which surviving entry
+    // is considered oldest and gets overwritten next.
+    if (g_reactCount == kMaxReacts && g_reactNext) {
+        const int first = g_reactNext;
+        std::rotate(g_reacts, g_reacts + first, g_reacts + kMaxReacts);
+        bool orderedDrop[kMaxReacts];
+        for (int i = 0; i < kMaxReacts; i++)
+            orderedDrop[i] = drop[(first + i) % kMaxReacts];
+        memcpy(drop, orderedDrop, sizeof(orderedDrop));
+    }
+    int kept = 0;
+    for (int i = 0; i < g_reactCount; i++)
+        if (!drop[i]) {
+            if (kept != i)
+                g_reacts[kept] = g_reacts[i];
+            kept++;
+        }
+    g_reactCount = kept;
+    g_reactNext = kept % kMaxReacts;
+}
+
+void addReaction(uint32_t msgId, uint32_t from, const char *label, uint32_t targetFrom = 0)
+{
+    LOG_INFO("advui: reaction msgId=0x%08x targetFrom=0x%08x from=0x%08x %s", (unsigned)msgId,
+             (unsigned)targetFrom, (unsigned)from, label);
+    for (int i = 0; i < g_reactCount; i++)
+        if (g_reacts[i].msgId == msgId && g_reacts[i].targetFrom == targetFrom && g_reacts[i].from == from) {
+            // Replace this sender's previous reaction to this exact message.
+            utf8CopyValid(g_reacts[i].label, sizeof(g_reacts[i].label), label);
+            markMsgsDirty();
             return;
         }
     Reaction &r = g_reacts[g_reactNext];
     r.msgId = msgId;
     r.from = from;
-    strncpy(r.label, label, sizeof(r.label) - 1);
-    r.label[sizeof(r.label) - 1] = 0;
+    r.targetFrom = targetFrom;
+    utf8CopyValid(r.label, sizeof(r.label), label);
     g_reactNext = (g_reactNext + 1) % kMaxReacts;
     if (g_reactCount < kMaxReacts)
         g_reactCount++;
-    g_msgsDirty = true;
+    markMsgsDirty();
 }
 
 // The quick-reaction strip (labels must exist in graphics::emotes[]).
@@ -349,7 +431,7 @@ void markReadFrom(uint32_t nodeNum)
     for (int i = 0; i < g_msgCount; i++)
         if (g_msgs[i].from == nodeNum && g_msgs[i].to != NODENUM_BROADCAST && !g_msgs[i].read) {
             g_msgs[i].read = true;
-            g_msgsDirty = true;
+            markMsgsDirty();
         }
 }
 
@@ -385,8 +467,14 @@ uint8_t g_nameShort = 0;
 // the first panel built against this firmware came out mirrored with exactly that.
 uint8_t g_extRot = 0;
 AdvExtDisplay *g_ext = nullptr;
+#ifdef ADVUI_HIL
+const char *kUiCfgPath = "/advui_hil_ui.bin";
+#else
 const char *kUiCfgPath = "/advui_ui.bin";
+#endif
 int32_t g_screenOffSec = 300; // screen auto-off timeout; 0 = never
+bool g_uiCfgDirty = false;
+uint32_t g_lastUiCfgSaveMs = 0;
 
 // Transliterated Cyrillic input layer (Fn+L); persisted with the messages so the
 // chosen layout survives a reboot.
@@ -394,40 +482,62 @@ bool g_ruMode = false;
 
 // --- Radio mode (onboard / BLE companion), its own tiny file -------------------
 constexpr uint32_t kRadioMagic = 0x41565231; // "AVR1"
+#ifdef ADVUI_HIL
+const char *kRadioPath = "/advui_hil_radio.bin";
+#else
 const char *kRadioPath = "/advui_radio.bin";
+#endif
 bool g_radioCompanion = false;
 char g_peerAddr[18] = {0}; // paired companion node (empty = not chosen yet)
 char g_peerName[24] = {0};
 uint8_t g_peerType = 0;    // its BLE address type (public/random) — needed to connect
+bool g_radioCfgDirty = false;
+uint32_t g_lastRadioCfgSaveMs = 0;
 
-void saveRadioCfg()
+bool saveRadioCfg()
 {
-    auto f = FSCom.open(kRadioPath, FILE_O_WRITE);
-    if (!f)
-        return;
+    SafeFile f(kRadioPath, true);
     uint32_t magic = kRadioMagic;
     uint8_t mode = g_radioCompanion ? 1 : 0;
-    f.write((const uint8_t *)&magic, sizeof(magic));
-    f.write(&mode, 1);
-    f.write((const uint8_t *)g_peerAddr, sizeof(g_peerAddr));
-    f.write((const uint8_t *)g_peerName, sizeof(g_peerName));
-    f.write(&g_peerType, 1); // optional tail
-    f.close();
+    bool ok = f.write((const uint8_t *)&magic, sizeof(magic)) == sizeof(magic) && f.write(&mode, 1) == 1 &&
+              f.write((const uint8_t *)g_peerAddr, sizeof(g_peerAddr)) == sizeof(g_peerAddr) &&
+              f.write((const uint8_t *)g_peerName, sizeof(g_peerName)) == sizeof(g_peerName) &&
+              f.write(&g_peerType, 1) == 1;
+    if (!ok || !f.close()) {
+        LOG_ERROR("advui: radio config save failed; previous file kept");
+        return false;
+    }
+    return true;
+}
+
+bool persistRadioCfg()
+{
+    const bool saved = saveRadioCfg();
+    g_radioCfgDirty = !saved;
+    g_lastRadioCfgSaveMs = millis();
+    return saved;
 }
 
 // Crash guard for the companion link: the flag file exists while a connect attempt
 // is in flight. If we boot and it's still there, the last attempt took the device
 // down — skip the boot auto-connect so a crash can't loop, and go to the scan.
+#ifdef ADVUI_HIL
+const char *kBleAttemptPath = "/advui_hil_bleatt";
+#else
 const char *kBleAttemptPath = "/advui_bleatt";
+#endif
 
-void bleAttemptMark()
+bool bleAttemptMark()
 {
     auto f = FSCom.open(kBleAttemptPath, FILE_O_WRITE);
-    if (f) {
-        uint8_t one = 1;
-        f.write(&one, 1);
-        f.close();
+    if (!f) {
+        LOG_ERROR("advui: cannot arm BLE connect crash guard");
+        return false;
     }
+    uint8_t one = 1;
+    f.write(&one, 1); // file existence is the guard; its contents are immaterial
+    f.close();
+    return true;
 }
 
 void bleAttemptClear()
@@ -447,7 +557,7 @@ bool bleAttemptPending()
 
 // --- Mesh-state abstraction: local engine vs companion link ---------------------
 // In companion mode the radio lives in another node; the UI reads mesh state from
-// the BLE config stream (g_compNodes/g_compChans) instead of the local nodeDB.
+// the BLE config-stream snapshots instead of the local nodeDB.
 
 uint32_t myNodeNum()
 {
@@ -467,27 +577,25 @@ meshtastic_NodeInfoLite *compSynth(const CompNode &c)
     tmp.last_heard = c.lastHeard;
     tmp.has_hops_away = c.hops != 255;
     tmp.hops_away = c.hops == 255 ? 0 : c.hops;
-    snprintf(tmp.short_name, sizeof(tmp.short_name), "%s", c.shortName);
-    snprintf(tmp.long_name, sizeof(tmp.long_name), "%s", c.longName);
-    tmp.bitfield = 1 << 5; // NODEINFO_BITFIELD_HAS_USER: names are valid
+    nodeSetNames(&tmp, c.longName, c.shortName);
     return &tmp;
 }
 
 meshtastic_NodeInfoLite *nodeByNum(uint32_t num)
 {
     if (g_radioCompanion) {
-        for (int i = 0; i < g_compNodeCount; i++)
-            if (g_compNodes[i].num == num)
-                return compSynth(g_compNodes[i]);
-        return nullptr;
+        CompNode node;
+        return bleCopyCompNode(num, &node) ? compSynth(node) : nullptr;
     }
     return nodeDB ? nodeDB->getMeshNode(num) : nullptr;
 }
 
 meshtastic_NodeInfoLite *nodeAt(uint16_t idx) // idx from filtered[]
 {
-    if (g_radioCompanion)
-        return idx < (uint16_t)g_compNodeCount ? compSynth(g_compNodes[idx]) : nullptr;
+    if (g_radioCompanion) {
+        CompNode node;
+        return bleCopyCompNodeAt(idx, &node) ? compSynth(node) : nullptr;
+    }
     return nodeDB ? nodeDB->getMeshNodeByIndex(idx) : nullptr;
 }
 
@@ -496,11 +604,17 @@ const char *presetName(meshtastic_Config_LoRaConfig_ModemPreset p); // defined b
 const char *chanName(int i)
 {
     if (g_radioCompanion) {
-        if (g_compChans[i].has_settings && g_compChans[i].settings.name[0])
-            return g_compChans[i].settings.name;
+        static char name[32];
+        meshtastic_Channel channel = meshtastic_Channel_init_default;
+        if (!bleCopyCompChannel(i, &channel))
+            return "?";
+        if (channel.has_settings && channel.settings.name[0]) {
+            snprintf(name, sizeof(name), "%s", channel.settings.name);
+            return name;
+        }
         // blank primary channel displays the modem preset, like stock does
-        if (g_compChans[i].role == meshtastic_Channel_Role_PRIMARY)
-            return presetName((meshtastic_Config_LoRaConfig_ModemPreset)g_compPreset);
+        if (channel.role == meshtastic_Channel_Role_PRIMARY)
+            return presetName((meshtastic_Config_LoRaConfig_ModemPreset)g_compPreset.load());
         return "?";
     }
     return channels.getName(i);
@@ -508,8 +622,10 @@ const char *chanName(int i)
 
 bool chanEnabled(int i)
 {
-    if (g_radioCompanion)
-        return g_compChans[i].role != meshtastic_Channel_Role_DISABLED;
+    if (g_radioCompanion) {
+        meshtastic_Channel channel = meshtastic_Channel_init_default;
+        return bleCopyCompChannel(i, &channel) && channel.role != meshtastic_Channel_Role_DISABLED;
+    }
     return channels.getByIndex(i).role != meshtastic_Channel_Role_DISABLED;
 }
 
@@ -551,20 +667,31 @@ void loadRadioCfg()
         return;
     uint32_t magic = 0;
     uint8_t mode = 0;
-    f.read((uint8_t *)&magic, sizeof(magic));
-    f.read(&mode, 1);
-    f.read((uint8_t *)g_peerAddr, sizeof(g_peerAddr));
-    size_t n = f.read((uint8_t *)g_peerName, sizeof(g_peerName));
-    f.read(&g_peerType, 1); // optional tail (0 for older files)
+    char addr[sizeof(g_peerAddr)] = {0}, name[sizeof(g_peerName)] = {0};
+    uint8_t peerType = 0;
+    const size_t size = f.size();
+    bool ok = (size == 4 + 1 + sizeof(addr) + sizeof(name) || size == 4 + 1 + sizeof(addr) + sizeof(name) + 1) &&
+              f.read((uint8_t *)&magic, sizeof(magic)) == sizeof(magic) && f.read(&mode, 1) == 1 &&
+              f.read((uint8_t *)addr, sizeof(addr)) == sizeof(addr) &&
+              f.read((uint8_t *)name, sizeof(name)) == sizeof(name);
+    if (ok && size == 4 + 1 + sizeof(addr) + sizeof(name) + 1)
+        ok = f.read(&peerType, 1) == 1;
     f.close();
-    if (magic != kRadioMagic || n != sizeof(g_peerName)) {
+    const bool peerOk = !addr[0] || (validBleAddress(addr) && peerType <= 3);
+    if (!ok || magic != kRadioMagic || mode > 1 || !peerOk) {
+        g_radioCompanion = false;
         g_peerAddr[0] = 0;
         g_peerName[0] = 0;
+        g_peerType = 0;
         return;
     }
+    memcpy(g_peerAddr, addr, sizeof(g_peerAddr));
+    memcpy(g_peerName, name, sizeof(g_peerName));
+    g_peerType = peerType;
     g_radioCompanion = mode == 1;
     g_peerAddr[sizeof(g_peerAddr) - 1] = 0;
     g_peerName[sizeof(g_peerName) - 1] = 0;
+    utf8Sanitize(g_peerName, sizeof(g_peerName));
 }
 
 #ifdef HAS_I2S
@@ -583,13 +710,22 @@ void startBeep()
 
 #ifdef HAS_NEOPIXEL
 // Notification LED (single onboard RGB on NEOPIXEL_DATA). We drive it with the core's
-// stateless rgbLedWrite() (shares the core RMT manager with the stock ambient thread,
+// stateless RMT helper (shares the core RMT manager with the stock ambient thread,
 // so no begin()/channel conflict). A brief flash on incoming messages, cleared in runOnce.
 uint32_t g_ledOffMs = 0;
+void setLedRgb(uint8_t r, uint8_t g, uint8_t b)
+{
+#if ESP_ARDUINO_VERSION_MAJOR >= 3
+    rgbLedWrite(NEOPIXEL_DATA, r, g, b);
+#else
+    neopixelWrite(NEOPIXEL_DATA, r, g, b);
+#endif
+}
+
 void flashLed(uint8_t r, uint8_t g, uint8_t b)
 {
-    rgbLedWrite(NEOPIXEL_DATA, r, g, b);
-    g_ledOffMs = millis() + 400;
+    setLedRgb(r, g, b);
+    g_ledOffMs = armDeadline(millis(), 400);
 }
 #endif
 
@@ -607,13 +743,14 @@ void markReadChannel(int chIdx)
     for (int i = 0; i < g_msgCount; i++)
         if (g_msgs[i].to == NODENUM_BROADCAST && g_msgs[i].ch == chIdx && !g_msgs[i].read) {
             g_msgs[i].read = true;
-            g_msgsDirty = true;
+            markMsgsDirty();
         }
 }
 
 // Persist the message ring (with delivery status + read flags) to flash, so a
 // reboot keeps the conversation. Written debounced from runOnce.
-constexpr uint32_t kMsgMagic = 0x41565334;   // "AVS4" — count-based, independent of kMaxMsgs
+constexpr uint32_t kMsgMagic = 0x41565335;   // "AVS5" — reactions include their target sender
+constexpr uint32_t kMsgMagicV4 = 0x41565334; // "AVS4" — target-less reactions, widened on load
 constexpr uint32_t kMsgMagicV3 = 0x41565333; // "AVS3" — the 160-byte-text Msg layout, migrated on load
 
 // The pre-v0.4.8 Msg layout (text[160]); V3 files and V1 archives hold these.
@@ -628,9 +765,11 @@ struct MsgV3 {
     bool read;
     char text[160];
 };
+static_assert(sizeof(MsgV3) == 180, "legacy AVS3/AVH1 layout must remain byte-exact");
 
 void msgFromV3(Msg &out, const MsgV3 &in)
 {
+    out = {};
     out.from = in.from;
     out.to = in.to;
     out.rxTime = in.rxTime;
@@ -642,71 +781,89 @@ void msgFromV3(Msg &out, const MsgV3 &in)
     memcpy(out.text, in.text, sizeof(in.text));
     out.text[sizeof(in.text)] = 0;
 }
+
+bool normalizeStoredMsg(Msg &m)
+{
+    if (m.status > MSG_SENT || m.ch >= 8)
+        return false;
+    if (m.rxTime >= kValidEpoch && !validStoredEpoch(m.rxTime))
+        m.rxTime = 0;
+    m.text[sizeof(m.text) - 1] = 0;
+    utf8Sanitize(m.text, sizeof(m.text));
+    return true;
+}
+#ifdef ADVUI_HIL
+const char *kMsgPath = "/advui_hil_msgs.bin";
+#else
 const char *kMsgPath = "/advui_msgs.bin";
+#endif
 
 // The message ring is a circular buffer; iterate it oldest-first (matches the
 // chronological order the loaders write/read).
 static int ringIdx(int i, int count, int next, int cap) { return count == cap ? (next + i) % cap : i; }
 
-void saveMsgs()
+bool saveMsgs()
 {
-    auto f = FSCom.open(kMsgPath, FILE_O_WRITE);
-    if (!f)
-        return;
+    SafeFile f(kMsgPath, true);
     // Count-based layout: only the populated messages are written, oldest-first,
     // so the file size tracks history depth, not kMaxMsgs — growing the ring in a
     // future build keeps loading old saves (and vice-versa).
     uint32_t magic = kMsgMagic;
     int32_t cnt = g_msgCount;
     uint8_t ru = g_ruMode ? 1 : 0, rc = (uint8_t)g_reactCount;
-    f.write((const uint8_t *)&magic, sizeof(magic));
-    f.write((const uint8_t *)&cnt, sizeof(cnt));
-    f.write((const uint8_t *)&g_favChannels, sizeof(g_favChannels));
-    f.write((const uint8_t *)&g_utcOffsetMin, sizeof(g_utcOffsetMin));
-    f.write((const uint8_t *)&g_screenOffSec, sizeof(g_screenOffSec));
-    f.write(&ru, 1);
-    f.write(&rc, 1);
-    for (int i = 0; i < g_msgCount; i++) {
-        f.write((const uint8_t *)&g_msgs[i], sizeof(Msg));
-        f.write((const uint8_t *)&g_msgReply[i], sizeof(uint32_t));
+    bool ok = f.write((const uint8_t *)&magic, sizeof(magic)) == sizeof(magic) &&
+              f.write((const uint8_t *)&cnt, sizeof(cnt)) == sizeof(cnt) &&
+              f.write((const uint8_t *)&g_favChannels, sizeof(g_favChannels)) == sizeof(g_favChannels) &&
+              f.write((const uint8_t *)&g_utcOffsetMin, sizeof(g_utcOffsetMin)) == sizeof(g_utcOffsetMin) &&
+              f.write((const uint8_t *)&g_screenOffSec, sizeof(g_screenOffSec)) == sizeof(g_screenOffSec) &&
+              f.write(&ru, 1) == 1 && f.write(&rc, 1) == 1;
+    for (int i = 0; ok && i < g_msgCount; i++) {
+        ok = f.write((const uint8_t *)&g_msgs[i], sizeof(Msg)) == sizeof(Msg) &&
+             f.write((const uint8_t *)&g_msgReply[i], sizeof(uint32_t)) == sizeof(uint32_t);
     }
-    for (int i = 0; i < g_reactCount; i++) {
+    for (int i = 0; ok && i < g_reactCount; i++) {
         int idx = ringIdx(i, g_reactCount, g_reactNext, kMaxReacts);
-        f.write((const uint8_t *)&g_reacts[idx], sizeof(Reaction));
+        ok = f.write((const uint8_t *)&g_reacts[idx], sizeof(Reaction)) == sizeof(Reaction);
     }
-    f.close();
+    if (!ok || !f.close()) {
+        LOG_ERROR("advui: message save failed; previous file kept");
+        return false;
+    }
+    return true;
 }
 
-// AVS3: the current count-based format. Messages/reactions were written
+// AVS5/AVS4/AVS3: count-based formats. Messages/reactions were written
 // oldest-first; keep the newest kMaxMsgs / kMaxReacts if an older, bigger save
 // ever holds more than this build's ring.
-static bool loadMsgsV4(File &f, bool v3)
+static bool loadMsgsCounted(File &f, bool v3Messages, bool v4Reactions)
 {
     int32_t cnt = 0, off = 0, so = 0;
     uint8_t ru = 0, rc = 0;
     if (f.read((uint8_t *)&cnt, 4) != 4 || cnt < 0)
         return false;
-    f.read((uint8_t *)&g_favChannels, sizeof(g_favChannels));
-    f.read((uint8_t *)&off, 4);
-    f.read((uint8_t *)&so, 4);
-    f.read(&ru, 1);
-    f.read(&rc, 1);
+    uint8_t favChannels = 0;
+    if (f.read((uint8_t *)&favChannels, sizeof(favChannels)) != sizeof(favChannels) ||
+        f.read((uint8_t *)&off, 4) != 4 || f.read((uint8_t *)&so, 4) != 4 || f.read(&ru, 1) != 1 ||
+        f.read(&rc, 1) != 1 || !validUtcOffsetMinutes(off))
+        return false;
 
-    // Same count-based format either way; a V3 file just holds the smaller
-    // pre-v0.4.8 records, widened as they're read.
-    size_t msz = v3 ? sizeof(MsgV3) : sizeof(Msg);
+    // Same count-based envelope either way. V3 holds smaller pre-v0.4.8
+    // messages; V4 reactions do not yet identify the sender of their target.
+    size_t msz = v3Messages ? sizeof(MsgV3) : sizeof(Msg);
+    size_t rsz = v4Reactions ? sizeof(ReactionV4) : sizeof(Reaction);
+    const size_t pos = f.position(), size = f.size();
+    if (size < pos ||
+        !checkedRecordRegion((size_t)cnt, msz + sizeof(uint32_t), rc, rsz, size - pos, nullptr))
+        return false;
     int mskip = cnt > kMaxMsgs ? cnt - kMaxMsgs : 0;
-    for (int i = 0; i < mskip; i++) { // discard the oldest overflow
-        MsgV3 t;
-        uint32_t r;
-        if (f.read((uint8_t *)&t, msz) != (int)msz)
-            return false;
-        f.read((uint8_t *)&r, 4);
-    }
+    // Skip old overflow by offset, not by reading a variable-size record into
+    // MsgV3. The old code used sizeof(Msg) with a MsgV3 stack buffer here.
+    if (mskip && !f.seek(pos + (size_t)mskip * (msz + sizeof(uint32_t))))
+        return false;
     int mkeep = cnt - mskip;
     for (int i = 0; i < mkeep; i++) {
         bool ok;
-        if (v3) {
+        if (v3Messages) {
             MsgV3 t;
             ok = f.read((uint8_t *)&t, sizeof(t)) == (int)sizeof(t);
             if (ok)
@@ -717,22 +874,43 @@ static bool loadMsgsV4(File &f, bool v3)
         if (!ok)
             return false;
         if (f.read((uint8_t *)&g_msgReply[i], 4) != 4)
-            g_msgReply[i] = 0;
+            return false;
+        if (!normalizeStoredMsg(g_msgs[i]))
+            return false;
     }
-    g_msgCount = mkeep;
 
     int rkeep = rc > kMaxReacts ? kMaxReacts : rc;
     for (int i = 0; i < rc - rkeep; i++) {
-        Reaction t;
-        f.read((uint8_t *)&t, sizeof(Reaction));
+        if (v4Reactions) {
+            ReactionV4 t;
+            if (f.read((uint8_t *)&t, sizeof(t)) != (int)sizeof(t))
+                return false;
+        } else {
+            Reaction t;
+            if (f.read((uint8_t *)&t, sizeof(t)) != (int)sizeof(t))
+                return false;
+        }
     }
-    int got = 0;
-    for (int i = 0; i < rkeep; i++)
-        if (f.read((uint8_t *)&g_reacts[i], sizeof(Reaction)) == (int)sizeof(Reaction))
-            got++;
-    g_reactCount = got;
-    g_reactNext = got % kMaxReacts;
+    for (int i = 0; i < rkeep; i++) {
+        if (v4Reactions) {
+            ReactionV4 old;
+            if (f.read((uint8_t *)&old, sizeof(old)) != (int)sizeof(old))
+                return false;
+            g_reacts[i] = {};
+            g_reacts[i].msgId = old.msgId;
+            g_reacts[i].from = old.from;
+            memcpy(g_reacts[i].label, old.label, sizeof(old.label));
+        } else if (f.read((uint8_t *)&g_reacts[i], sizeof(Reaction)) != (int)sizeof(Reaction)) {
+            return false;
+        }
+        g_reacts[i].label[sizeof(g_reacts[i].label) - 1] = 0;
+        utf8Sanitize(g_reacts[i].label, sizeof(g_reacts[i].label));
+    }
 
+    g_msgCount = mkeep;
+    g_reactCount = rkeep;
+    g_reactNext = rkeep % kMaxReacts;
+    g_favChannels = favChannels;
     g_utcOffsetMin = off;
     g_ruMode = ru != 0;
     if (so == 0 || (so >= 15 && so <= 3600))
@@ -746,16 +924,27 @@ void loadMsgs()
     if (!f)
         return;
     uint32_t magic = 0;
-    f.read((uint8_t *)&magic, sizeof(magic));
+    bool ok = f.read((uint8_t *)&magic, sizeof(magic)) == sizeof(magic);
     if (magic == kMsgMagic)
-        loadMsgsV4(f, false);
+        ok = ok && loadMsgsCounted(f, false, false);
+    else if (magic == kMsgMagicV4)
+        ok = ok && loadMsgsCounted(f, false, true);
     else if (magic == kMsgMagicV3)
-        loadMsgsV4(f, true); // pre-v0.4.8 records widen on the way in
+        ok = ok && loadMsgsCounted(f, true, true); // pre-v0.4.8 records widen on the way in
+    else
+        ok = false;
     f.close();
+    if (!ok) {
+        g_msgCount = 0;
+        g_reactCount = 0;
+        g_reactNext = 0;
+        LOG_ERROR("advui: rejected corrupt message save");
+        return;
+    }
 
     uint32_t me = myNodeNum();
     for (int i = 0; i < g_msgCount; i++) {
-        // an outgoing DM still "sending" before the reboot can't get its ACK now
+        // an outgoing packet still "sending" before the reboot can't get its ACK now
         if (g_msgs[i].status == MSG_SENDING)
             g_msgs[i].status = MSG_FAILED;
         // upgrade our own channel sends saved before MSG_SENT existed
@@ -770,18 +959,22 @@ void loadMsgs()
 
 // Evicted-message archive on the internal LittleFS. The RAM ring stays the
 // small live window; eviction victims are appended here and the thread view
-// pages back into them (16 at a time, a static staging buffer). Fixed
-// 184-byte records — Msg + reply id — oldest first behind an "AVH1" magic;
+// pages back into them (8 at a time, a static staging buffer). Fixed
+// fixed-size records — Msg + reply id — oldest first behind an "AVH2" magic;
 // the newest kHistCap records are kept, compacting once the tail overgrows.
 // Internal flash shares no bus with the LoRa cap, so paging can't stall RX.
+#ifdef ADVUI_HIL
+const char *kHistPath = "/advui_hil_hist.bin";
+#else
 const char *kHistPath = "/advui_hist.bin";
-const char *kHistTmp = "/advui_hist.tmp";
+#endif
 constexpr uint32_t kHistMagic = 0x32485641;   // "AVH2"
 constexpr uint32_t kHistMagicV1 = 0x31485641; // "AVH1" — pre-v0.4.8 records, migrated in place
 struct HistRec {
     Msg m;
     uint32_t rid;
 };
+static_assert(sizeof(HistRec) == 260, "AVH2 archive layout changed; bump the persistence format");
 constexpr int kHistRec = (int)sizeof(HistRec); // Msg (256, no tail padding) + reply id
 constexpr int kHistCap = 256;
 constexpr int kHistSlack = 64;
@@ -810,7 +1003,34 @@ bool histStagingReady()
     return true;
 }
 
-void histMigrateV1(); // widen pre-v0.4.8 archive records once
+bool histRewriteCurrent(int skip, int keep)
+{
+    if (skip < 0 || keep < 0)
+        return false;
+    auto in = FSCom.open(kHistPath, FILE_O_READ);
+    if (!in)
+        return false;
+    uint32_t magic = 0;
+    const size_t first = 4 + (size_t)skip * kHistRec;
+    const size_t needed = first + (size_t)keep * kHistRec;
+    bool ok = in.read((uint8_t *)&magic, 4) == 4 && magic == kHistMagic && in.size() >= needed && in.seek(first);
+    SafeFile out(kHistPath, true);
+    ok = ok && out.write((const uint8_t *)&kHistMagic, 4) == 4;
+    HistRec rec;
+    for (int i = 0; ok && i < keep; i++) {
+        ok = in.read((uint8_t *)&rec, kHistRec) == kHistRec && normalizeStoredMsg(rec.m) &&
+             out.write((const uint8_t *)&rec, kHistRec) == kHistRec;
+    }
+    in.close();
+    if (!ok || !out.close()) {
+        LOG_ERROR("advui: history rewrite failed; previous archive kept");
+        return false;
+    }
+    g_histTotal = keep;
+    return true;
+}
+
+bool histMigrateV1(); // widen pre-v0.4.8 archive records once
 
 int histTotal()
 {
@@ -821,13 +1041,20 @@ int histTotal()
     if (f) {
         uint32_t magic = 0;
         bool got = f.read((uint8_t *)&magic, 4) == 4;
-        bool ok = got && magic == kHistMagic;
+        const size_t fileSize = f.size();
+        size_t records = 0;
+        bool ok = got && magic == kHistMagic && checkedFixedRecordFile(fileSize, 4, kHistRec, &records);
+        bool torn = got && magic == kHistMagic && !ok && fileSize >= 4;
         bool v1 = got && magic == kHistMagicV1;
-        if (ok)
-            g_histTotal = (int)((f.size() - 4) / kHistRec);
+        if (ok || torn)
+            g_histTotal = (int)((fileSize - 4) / kHistRec);
         f.close();
         if (v1)
             histMigrateV1(); // sets g_histTotal itself
+        else if (torn) {
+            LOG_WARN("advui: repairing torn history tail after %d records", g_histTotal);
+            histRewriteCurrent(0, g_histTotal);
+        }
         else if (!ok)
             FSCom.remove(kHistPath); // unknown leftovers: start clean
     }
@@ -835,34 +1062,46 @@ int histTotal()
 }
 
 // One-shot: rewrite an AVH1 archive (MsgV3-sized records) into the current layout.
-void histMigrateV1()
+bool histMigrateV1()
 {
     auto in = FSCom.open(kHistPath, FILE_O_READ);
     if (!in)
-        return;
-    auto out = FSCom.open(kHistTmp, FILE_O_WRITE);
-    if (!out) {
+        return false;
+    uint32_t magic = 0;
+    size_t total = 0;
+    const size_t oldRec = sizeof(MsgV3) + sizeof(uint32_t);
+    bool ok = in.read((uint8_t *)&magic, 4) == 4 && magic == kHistMagicV1 &&
+              checkedFixedRecordFile(in.size(), 4, oldRec, &total);
+    const size_t keep = std::min(total, (size_t)kHistCap);
+    const size_t skip = total - keep;
+    ok = ok && in.seek(4 + skip * oldRec);
+    if (!ok) {
         in.close();
-        return;
+        LOG_ERROR("advui: rejected corrupt legacy history archive");
+        return false;
     }
-    out.write((const uint8_t *)&kHistMagic, 4);
-    in.seek(4);
+    SafeFile out(kHistPath, true);
+    ok = out.write((const uint8_t *)&kHistMagic, 4) == 4;
     MsgV3 om;
     uint32_t rid;
     int kept = 0;
-    while (in.read((uint8_t *)&om, sizeof(om)) == (int)sizeof(om) && in.read((uint8_t *)&rid, 4) == 4 &&
-           kept < kHistCap) {
-        HistRec rec;
+    while (ok && kept < (int)keep) {
+        ok = in.read((uint8_t *)&om, sizeof(om)) == (int)sizeof(om) && in.read((uint8_t *)&rid, 4) == 4;
+        if (!ok)
+            break;
+        HistRec rec = {};
         msgFromV3(rec.m, om);
         rec.rid = rid;
-        out.write((const uint8_t *)&rec, sizeof(rec));
+        ok = ok && normalizeStoredMsg(rec.m) && out.write((const uint8_t *)&rec, sizeof(rec)) == sizeof(rec);
         kept++;
     }
     in.close();
-    out.close();
-    FSCom.remove(kHistPath);
-    renameFile(kHistTmp, kHistPath);
+    if (!ok || !out.close()) {
+        LOG_ERROR("advui: history migration failed; legacy archive kept");
+        return false;
+    }
     g_histTotal = kept;
+    return true;
 }
 
 bool histMatch(const Msg &m, bool isChan, uint8_t ch, uint32_t node)
@@ -873,44 +1112,59 @@ bool histMatch(const Msg &m, bool isChan, uint8_t ch, uint32_t node)
 
 void histCompact()
 {
-    auto in = FSCom.open(kHistPath, FILE_O_READ);
-    if (!in)
+    if (g_histTotal <= kHistCap)
         return;
-    auto out = FSCom.open(kHistTmp, FILE_O_WRITE);
-    if (!out) {
-        in.close();
-        return;
-    }
-    out.write((const uint8_t *)&kHistMagic, 4);
-    in.seek(4 + (uint32_t)(g_histTotal - kHistCap) * kHistRec);
-    HistRec rec;
-    int kept = 0;
-    while (in.read((uint8_t *)&rec, kHistRec) == kHistRec && kept < kHistCap) {
-        out.write((const uint8_t *)&rec, kHistRec);
-        kept++;
-    }
-    in.close();
-    out.close();
-    FSCom.remove(kHistPath);
-    renameFile(kHistTmp, kHistPath);
-    g_histTotal = kept;
+    histRewriteCurrent(g_histTotal - kHistCap, kHistCap);
 }
 
 void histAppend(const Msg &m, uint32_t replyId)
 {
     bool fresh = histTotal() == 0;
+    if (!fresh) {
+        auto check = FSCom.open(kHistPath, FILE_O_READ);
+        const size_t expected = 4 + (size_t)g_histTotal * kHistRec;
+        if (!check || check.size() != expected) {
+            if (check)
+                check.close();
+            LOG_ERROR("advui: refusing append to malformed history archive");
+            return;
+        }
+        check.close();
+    } else {
+        // A failed AVH1 migration deliberately leaves the legacy file intact.
+        // Do not mistake that preserved archive for a fresh AVH2 file and erase it.
+        auto check = FSCom.open(kHistPath, FILE_O_READ);
+        if (check) {
+            uint32_t magic = 0;
+            const bool current = check.read((uint8_t *)&magic, 4) == 4 && magic == kHistMagic && check.size() == 4;
+            check.close();
+            if (!current) {
+                LOG_ERROR("advui: refusing append while legacy history needs recovery");
+                return;
+            }
+        }
+    }
     auto f = FSCom.open(kHistPath, fresh ? FILE_O_WRITE : "a");
     if (!f)
         return;
-    if (fresh)
-        f.write((const uint8_t *)&kHistMagic, 4);
+    bool ok = !fresh || f.write((const uint8_t *)&kHistMagic, 4) == 4;
     Msg rec = m;
     rec.read = true; // history is read by definition
+    if (rec.status == MSG_SENDING) { // forced out of an all-pending RAM ring: no future ACK can reach this record
+        rec.status = MSG_FAILED;
+        rec.err = 3; // routing timeout
+    }
     if (rec.rxTime < kValidEpoch)
         rec.rxTime = 0; // an uptime stamp is meaningless once archived: honest blank
-    f.write((const uint8_t *)&rec, sizeof(rec));
-    f.write((const uint8_t *)&replyId, 4);
+    ok = ok && normalizeStoredMsg(rec) && f.write((const uint8_t *)&rec, sizeof(rec)) == sizeof(rec) &&
+         f.write((const uint8_t *)&replyId, 4) == 4;
     f.close();
+    if (!ok) {
+        LOG_ERROR("advui: history append failed");
+        g_histTotal = -1;
+        histTotal(); // trim a torn tail now so later evictions can append safely
+        return;
+    }
     if (++g_histTotal >= kHistCap + kHistSlack)
         histCompact();
 }
@@ -923,13 +1177,15 @@ int histCountFor(bool isChan, uint8_t ch, uint32_t node)
     auto f = FSCom.open(kHistPath, FILE_O_READ);
     if (!f)
         return 0;
-    f.seek(4);
-    Msg m;
+    if (!f.seek(4)) {
+        f.close();
+        return 0;
+    }
+    HistRec rec;
     for (int i = 0; i < total; i++) {
-        if (f.read((uint8_t *)&m, sizeof(m)) != (int)sizeof(m))
+        if (f.read((uint8_t *)&rec, sizeof(rec)) != (int)sizeof(rec))
             break;
-        f.seek(f.position() + 4);
-        if (histMatch(m, isChan, ch, node))
+        if (normalizeStoredMsg(rec.m) && histMatch(rec.m, isChan, ch, node))
             n++;
     }
     f.close();
@@ -937,7 +1193,7 @@ int histCountFor(bool isChan, uint8_t ch, uint32_t node)
 }
 
 // Stages into g_arch the `max` conversation messages that come right before the
-// newest `skipNewest` matches (i.e. page p = skipNewest p*16). Returns the count.
+// newest `skipNewest` matches. Returns the count.
 int histLoadSlice(bool isChan, uint8_t ch, uint32_t node, int skipNewest, int max)
 {
     if (!histStagingReady())
@@ -952,13 +1208,18 @@ int histLoadSlice(bool isChan, uint8_t ch, uint32_t node, int skipNewest, int ma
     auto f = FSCom.open(kHistPath, FILE_O_READ);
     if (!f)
         return 0;
-    f.seek(4);
+    if (!f.seek(4)) {
+        f.close();
+        return 0;
+    }
     Msg m;
     uint32_t rid;
     int seen = 0, got = 0, total = histTotal();
     for (int i = 0; i < total && got < end - start; i++) {
         if (f.read((uint8_t *)&m, sizeof(m)) != (int)sizeof(m) || f.read((uint8_t *)&rid, 4) != 4)
             break;
+        if (!normalizeStoredMsg(m))
+            continue;
         if (!histMatch(m, isChan, ch, node))
             continue;
         if (seen >= start) {
@@ -972,50 +1233,102 @@ int histLoadSlice(bool isChan, uint8_t ch, uint32_t node, int skipNewest, int ma
     return got;
 }
 
-void histPurge(bool isChan, uint8_t ch, uint32_t node)
+bool histPurge(bool isChan, uint8_t ch, uint32_t node, bool *dropReacts)
 {
     int total = histTotal();
     if (!total)
-        return;
+        return true;
     auto in = FSCom.open(kHistPath, FILE_O_READ);
     if (!in)
-        return;
-    auto out = FSCom.open(kHistTmp, FILE_O_WRITE);
-    if (!out) {
-        in.close();
-        return;
-    }
-    out.write((const uint8_t *)&kHistMagic, 4);
-    in.seek(4);
+        return false;
+    SafeFile out(kHistPath, true);
+    bool ok = out.write((const uint8_t *)&kHistMagic, 4) == 4 && in.seek(4);
     HistRec rec;
     int kept = 0;
-    for (int i = 0; i < total; i++) {
-        if (in.read((uint8_t *)&rec, kHistRec) != kHistRec)
+    for (int i = 0; ok && i < total; i++) {
+        ok = in.read((uint8_t *)&rec, kHistRec) == kHistRec && normalizeStoredMsg(rec.m);
+        if (!ok)
             break;
-        if (histMatch(rec.m, isChan, ch, node))
+        if (histMatch(rec.m, isChan, ch, node)) {
+            markReactionsForMessage(rec.m.id, rec.m.from, dropReacts);
             continue; // deleting the conversation drops its archive too
-        out.write((const uint8_t *)&rec, kHistRec);
+        }
+        ok = out.write((const uint8_t *)&rec, kHistRec) == kHistRec;
         kept++;
     }
     in.close();
-    out.close();
-    FSCom.remove(kHistPath);
-    renameFile(kHistTmp, kHistPath);
+    if (!ok || !out.close()) {
+        LOG_ERROR("advui: history purge failed; previous archive kept");
+        return false;
+    }
     g_histTotal = kept;
+    return true;
 }
 
-// Distinct-node ledger on flash: one {num, lastHeard} record per node ever
-// heard, reconciled against the hot store when the node list opens. The header
-// counts entries heard in the last 24 h — the size of the LIVING mesh — with
-// zero RAM per node, so it never saturates at the hot+warm identity caps
-// (those still bound stored DATA and PKI keys, not this number).
+// A reaction packet carries only reply_id, but packet IDs are unique per sender,
+// not globally. Recover the target sender from the reaction's conversation so a
+// phone/user may react independently to colliding IDs in different threads. A
+// genuinely ambiguous collision within one thread remains targetFrom=0 and gets
+// the conservative legacy/wildcard behaviour instead of guessing destructively.
+uint32_t reactionTargetFrom(const meshtastic_MeshPacket &p, uint32_t me)
+{
+    const bool isChan = p.to == NODENUM_BROADCAST;
+    const uint8_t ch = p.channel;
+    const uint32_t node = p.from == me ? p.to : p.from;
+    if (!p.decoded.reply_id || (!isChan && (!node || node == NODENUM_BROADCAST)))
+        return 0;
+
+    uint32_t targetFrom = 0;
+    bool found = false, ambiguous = false;
+    auto consider = [&](const Msg &m) {
+        if (m.id != p.decoded.reply_id || !histMatch(m, isChan, ch, node))
+            return;
+        if (!found) {
+            targetFrom = m.from;
+            found = true;
+        } else if (targetFrom != m.from) {
+            ambiguous = true;
+        }
+    };
+    for (int i = 0; i < g_msgCount; i++)
+        consider(g_msgs[i]);
+
+    const int total = histTotal();
+    auto history = total > 0 ? FSCom.open(kHistPath, FILE_O_READ) : File();
+    if (history && history.seek(4)) {
+        HistRec rec;
+        for (int i = 0; i < total; i++) {
+            if (history.read((uint8_t *)&rec, sizeof(rec)) != (int)sizeof(rec) || !normalizeStoredMsg(rec.m)) {
+                ambiguous = true; // do not claim exact identity from a partial/corrupt scan
+                break;
+            }
+            consider(rec.m);
+        }
+        history.close();
+    } else if (total > 0) {
+        ambiguous = true;
+    }
+    return found && !ambiguous ? targetFrom : 0;
+}
+
+// Distinct-node ledger on flash: one {num, lastHeard} record per recently heard
+// identity, reconciled against the hot store when the node list opens. The
+// header counts entries heard in the last 24 h — the size of the LIVING mesh —
+// with zero persistent RAM per node. At its much larger flash cap the oldest
+// identities absent from the current hot DB are recycled instead of freezing
+// the count forever.
+#ifdef ADVUI_HIL
+const char *kSeenPath = "/advui_hil_seen.bin";
+#else
 const char *kSeenPath = "/advui_seen.bin";
+#endif
 constexpr uint32_t kSeenMagic = 0x314E5641; // "AVN1"
 struct SeenRec {
     uint32_t num;
     uint32_t last;
 };
 constexpr int kSeenCap = 2048; // at most ~16 KB of LittleFS
+constexpr int kSeenReplaceCap = 32;
 int g_seen24 = -1;             // nodes heard in the last 24 h (-1 = not computed yet)
 
 // Hearings observed by US: the engine quality-gates last_heard to 0 after every
@@ -1025,29 +1338,36 @@ int g_seen24 = -1;             // nodes heard in the last 24 h (-1 = not compute
 struct SeenPend {
     uint32_t num, t;
 };
-SeenPend g_seenPend[16];
+constexpr int kSeenPendCap = 16;
+SeenPend g_seenPend[kSeenPendCap];
 int g_seenPendN = 0;
+uint8_t g_seenPendNext = 0;
 
 void seenNote(uint32_t num)
 {
     uint32_t now = getTime(false);
-    if (!num || num == NODENUM_BROADCAST || now < kValidEpoch)
+    if (!num || num == NODENUM_BROADCAST || !validStoredEpoch(now))
         return;
     for (int i = 0; i < g_seenPendN; i++)
         if (g_seenPend[i].num == num) {
             g_seenPend[i].t = now;
             return;
         }
-    if (g_seenPendN < (int)(sizeof(g_seenPend) / sizeof(g_seenPend[0])))
+    if (g_seenPendN < kSeenPendCap)
         g_seenPend[g_seenPendN++] = {num, now};
-    else
-        g_seenPend[0] = {num, now}; // full: recycle; a reconcile drains us soon anyway
+    else {
+        // Keep the most recent 16 distinct senders. Replacing slot zero forever
+        // retained 15 stale entries and lost every intermediate sender in a busy
+        // post-boot minute, which made the 24-hour live-node count under-report.
+        g_seenPend[g_seenPendNext] = {num, now};
+        g_seenPendNext = (uint8_t)((g_seenPendNext + 1) % kSeenPendCap);
+    }
 }
 
 void seenReconcile()
 {
     uint32_t now = getTime(false);
-    if (!nodeDB || now < kValidEpoch)
+    if (!nodeDB || !validStoredEpoch(now))
         return; // clockless: a 24 h window is meaningless right now
     int hotN = (int)nodeDB->getNumMeshNodes();
     if (hotN > 250)
@@ -1055,10 +1375,15 @@ void seenReconcile()
     uint32_t hotId[266]; // 250 hot slots + up to 16 pending self-observations
     uint32_t hotLast[266];
     bool inFile[266];
+    bool observed[266] = {}; // packet senders are admitted before passive DB entries at saturation
     for (int i = 0; i < hotN; i++) {
         meshtastic_NodeInfoLite *n = nodeDB->getMeshNodeByIndex(i);
         hotId[i] = n ? n->num : 0;
         hotLast[i] = n ? n->last_heard : 0;
+        if (hotLast[i] && !validStoredEpoch(hotLast[i]))
+            hotLast[i] = 0;
+        else if (hotLast[i] > now)
+            hotLast[i] = now; // the local clock was corrected backwards
         inFile[i] = false;
     }
     for (int i = 0; i < g_seenPendN; i++) { // our own stamps beat quality-gated zeros
@@ -1068,44 +1393,82 @@ void seenReconcile()
         if (h < hotN) {
             if (g_seenPend[i].t > hotLast[h])
                 hotLast[h] = g_seenPend[i].t;
+            observed[h] = true;
         } else {
             hotId[hotN] = g_seenPend[i].num;
             hotLast[hotN] = g_seenPend[i].t;
             inFile[hotN] = false;
+            observed[hotN] = true;
             hotN++;
         }
     }
-    g_seenPendN = 0;
     bool fresh = false;
     auto f = FSCom.open(kSeenPath, "r+");
     if (!f) {
         f = FSCom.open(kSeenPath, FILE_O_WRITE);
         if (!f)
             return;
-        f.write((const uint8_t *)&kSeenMagic, 4);
+        if (f.write((const uint8_t *)&kSeenMagic, 4) != 4) {
+            f.close();
+            FSCom.remove(kSeenPath);
+            return;
+        }
         fresh = true;
     } else {
         uint32_t magic = 0;
-        if (f.read((uint8_t *)&magic, 4) != 4 || magic != kSeenMagic) {
+        size_t records = 0;
+        if (f.read((uint8_t *)&magic, 4) != 4 || magic != kSeenMagic ||
+            !checkedFixedRecordFile(f.size(), 4, sizeof(SeenRec), &records) || records > kSeenCap) {
             f.close();
-            FSCom.remove(kSeenPath); // unknown leftovers: start clean next pass
-            return;
+            FSCom.remove(kSeenPath); // derived cache: rebuild it from the hot DB below
+            f = FSCom.open(kSeenPath, FILE_O_WRITE);
+            if (!f || f.write((const uint8_t *)&kSeenMagic, 4) != 4) {
+                if (f)
+                    f.close();
+                FSCom.remove(kSeenPath);
+                return;
+            }
+            fresh = true;
         }
     }
     int active = 0, total = 0;
+    bool ioOk = true;
     uint32_t dayAgo = now - 86400;
+    OldestSlot replace[kSeenReplaceCap];
+    size_t replaceN = 0;
     if (!fresh) {
         SeenRec chunk[32];
         uint32_t pos = 4;
         for (;;) {
-            f.seek(pos);
-            int got = (int)f.read((uint8_t *)chunk, sizeof(chunk)) / (int)sizeof(SeenRec);
+            if (!f.seek(pos)) {
+                ioOk = false;
+                break;
+            }
+            const int bytes = (int)f.read((uint8_t *)chunk, sizeof(chunk));
+            if (bytes % (int)sizeof(SeenRec)) {
+                ioOk = false;
+                break;
+            }
+            int got = bytes / (int)sizeof(SeenRec);
             if (got <= 0)
                 break;
             bool dirty = false;
             for (int i = 0; i < got; i++) {
+                if (!chunk[i].num || chunk[i].num == NODENUM_BROADCAST) {
+                    ioOk = false;
+                    break;
+                }
+                const uint32_t saneLast = !chunk[i].last || !validStoredEpoch(chunk[i].last)
+                                                  ? 0
+                                                  : std::min(chunk[i].last, now);
+                if (saneLast != chunk[i].last) {
+                    chunk[i].last = saneLast;
+                    dirty = true;
+                }
+                bool inHot = false;
                 for (int h = 0; h < hotN; h++)
                     if (hotId[h] && hotId[h] == chunk[i].num) {
+                        inHot = true;
                         inFile[h] = true;
                         if (hotLast[h] > chunk[i].last) {
                             chunk[i].last = hotLast[h];
@@ -1113,31 +1476,85 @@ void seenReconcile()
                         }
                         break;
                     }
+                if (!inHot)
+                    considerOldestSlot(replace, kSeenReplaceCap, &replaceN,
+                                       pos + (uint32_t)i * sizeof(SeenRec), chunk[i].last);
                 if (chunk[i].last >= dayAgo)
                     active++;
             }
+            if (!ioOk)
+                break;
             if (dirty) {
-                f.seek(pos);
-                f.write((const uint8_t *)chunk, got * sizeof(SeenRec));
+                ioOk = f.seek(pos) && f.write((const uint8_t *)chunk, got * sizeof(SeenRec)) ==
+                                                (size_t)got * sizeof(SeenRec);
+                if (!ioOk)
+                    break;
             }
             total += got;
             pos += got * sizeof(SeenRec);
         }
     }
-    // nodes the ledger has never met: append them (the file only ever grows by
-    // genuinely new identities, so entries stay distinct by construction)
-    f.seek(f.size());
-    for (int h = 0; h < hotN && total < kSeenCap; h++) {
-        if (!hotId[h] || inFile[h])
-            continue;
-        SeenRec r = {hotId[h], hotLast[h]};
-        f.write((const uint8_t *)&r, sizeof(r));
-        total++;
-        if (r.last >= dayAgo)
-            active++;
+    if (!ioOk) {
+        f.close();
+        FSCom.remove(kSeenPath); // derived cache will be rebuilt on the next reconciliation
+        g_seen24 = -1;
+        return;
     }
+    // nodes the ledger has never met: append them (the file only ever grows by
+    // genuinely new identities, so entries stay distinct by construction).
+    // Direct packet observations go first; a large passive node DB must not
+    // delay the sender that triggered this reconciliation.
+    ioOk = f.seek(f.size());
+    for (int pass = 0; pass < 2 && ioOk && total < kSeenCap; pass++)
+        for (int h = 0; h < hotN && total < kSeenCap; h++) {
+            if ((pass == 0) != observed[h] || !hotId[h] || !hotLast[h] || inFile[h])
+                continue;
+            SeenRec r = {hotId[h], hotLast[h]};
+            if (f.write((const uint8_t *)&r, sizeof(r)) != sizeof(r)) {
+                ioOk = false;
+                break;
+            }
+            inFile[h] = true;
+            total++;
+            if (r.last >= dayAgo)
+                active++;
+        }
+    // Once the cap is full, recycle the oldest identities that are no longer in
+    // the current hot DB. Work is deliberately bounded: later reconciliations
+    // admit further newcomers without a large stack allocation or a full-file
+    // rewrite. Zero-timestamp DB placeholders never evict an actually heard node.
+    for (int pass = 0; pass < 2 && ioOk && replaceN; pass++)
+        for (int h = 0; ioOk && h < hotN && replaceN; h++) {
+            if ((pass == 0) != observed[h] || !hotId[h] || !hotLast[h] || inFile[h])
+                continue;
+            size_t oldest = 0;
+            for (size_t i = 1; i < replaceN; i++)
+                if (replace[i].stamp < replace[oldest].stamp ||
+                    (replace[i].stamp == replace[oldest].stamp && replace[i].position < replace[oldest].position))
+                    oldest = i;
+            const bool wasActive = replace[oldest].stamp >= dayAgo;
+            SeenRec r = {hotId[h], hotLast[h]};
+            ioOk = f.seek(replace[oldest].position) && f.write((const uint8_t *)&r, sizeof(r)) == sizeof(r);
+            if (!ioOk)
+                break;
+            if (wasActive != (r.last >= dayAgo))
+                active += r.last >= dayAgo ? 1 : -1;
+            inFile[h] = true;
+            replace[oldest] = replace[--replaceN];
+        }
     f.close();
+    if (!ioOk) {
+        FSCom.remove(kSeenPath);
+        g_seen24 = -1;
+        return;
+    }
     g_seen24 = active;
+    // Consume observations only after the ledger is safely reconciled. A
+    // transient open/write failure must leave them available for the next
+    // attempt: these timestamps specifically cover nodes whose engine-owned
+    // last_heard was quality-gated to zero.
+    g_seenPendN = 0;
+    g_seenPendNext = 0;
 }
 
 // Default node ordering: favourites first, then nodes we have a conversation with,
@@ -1187,7 +1604,7 @@ bool nodeLess(uint16_t a, uint16_t b)
 void fitWidth(lgfx::LGFXBase *g, char *s, int budget)
 {
     while (s[0] && g->textWidth(s) > budget)
-        s[strlen(s) - 1] = 0;
+        utf8TrimLast(s);
 }
 
 // SNR -> 0..4 signal bars. 0 means no direct SNR (node heard only via relays).
@@ -1210,7 +1627,7 @@ int sigLevel(const meshtastic_NodeInfoLite *n)
 // router/late). Two chars leaves a column free for the unmessageable marker.
 const char *roleTag(const meshtastic_NodeInfoLite *n)
 {
-    switch (n->role) {
+    switch (nodeRole(n)) {
     case meshtastic_Config_DeviceConfig_Role_CLIENT_MUTE:
         return "CM";
     case meshtastic_Config_DeviceConfig_Role_CLIENT_HIDDEN:
@@ -1335,22 +1752,30 @@ constexpr int kSortCount = (int)(sizeof(kSortOpts) / sizeof(kSortOpts[0]));
 // boot on USB shows the last honest figure instead of a fresh lie. -1 = unknown.
 int g_battRest = -1;
 
-void saveUiCfg()
+bool saveUiCfg()
 {
-    auto f = FSCom.open(kUiCfgPath, FILE_O_WRITE);
-    if (!f)
-        return;
-    f.write(&g_nodeSort, 1);
+    SafeFile f(kUiCfgPath, true);
+    bool ok = f.write(&g_nodeSort, 1) == 1;
     int8_t b = (int8_t)g_battRest; // -1 when never sampled off-charge
-    f.write((uint8_t *)&b, 1);
-    f.write(&g_nameShort, 1);
+    ok = ok && f.write((uint8_t *)&b, 1) == 1;
+    ok = ok && f.write(&g_nameShort, 1) == 1;
     uint8_t on = g_extRot ? 1 : 0; // v0.5.0 wrote the pair; keep the shape, derive both
-    f.write(&on, 1);
-    f.write(&g_extRot, 1);
-    f.write(&g_favNodeCount, 1);
-    for (uint8_t i = 0; i < g_favNodeCount; i++)
-        f.write((uint8_t *)&g_favNodes[i], 4);
-    f.close();
+    ok = ok && f.write(&on, 1) == 1;
+    ok = ok && f.write(&g_extRot, 1) == 1;
+    ok = ok && f.write(&g_favNodeCount, 1) == 1;
+    for (uint8_t i = 0; ok && i < g_favNodeCount; i++)
+        ok = f.write((uint8_t *)&g_favNodes[i], 4) == 4;
+    if (!ok || !f.close()) {
+        LOG_ERROR("advui: UI config save failed; previous file kept");
+        return false;
+    }
+    return true;
+}
+
+void persistUiCfg()
+{
+    g_uiCfgDirty = !saveUiCfg();
+    g_lastUiCfgSaveMs = millis();
 }
 
 void loadUiCfg()
@@ -1601,30 +2026,33 @@ void drawNodeRow(lgfx::LGFXBase *g, const meshtastic_NodeInfoLite *n, int y, boo
     if (!n->last_heard) {
         strcpy(abuf, "?");
         acol = 0x630C;
-    } else if (getTime(false) < kValidEpoch || (uint32_t)getTime(false) < n->last_heard) {
-        // No valid clock (or it's behind the stored stamp): sinceLastSeen() clamps
-        // the negative delta to 0 and every flash-loaded node would lie "now".
-        // Field report: GPS on with no fix showed the whole list as "now" while
-        // Clock honestly said "not set". A dim "?" is the honest answer.
-        strcpy(abuf, "?");
-        acol = 0x630C;
     } else {
-        uint32_t s = sinceLastSeen(n);
-        if (s > 100u * 86400u) {
+        const uint32_t now = getTime(false);
+        if (!validStoredEpoch(now) || now < n->last_heard) {
+            // No valid clock (or it's behind the stored stamp): sinceLastSeen() clamps
+            // the negative delta to 0 and every flash-loaded node would lie "now".
+            // Field report: GPS on with no fix showed the whole list as "now" while
+            // Clock honestly said "not set". A dim "?" is the honest answer.
             strcpy(abuf, "?");
             acol = 0x630C;
-        } else if (s < 60) {
-            strcpy(abuf, "now");
-            acol = 0x07E0; // green: fresh
-        } else if (s < 3600) {
-            snprintf(abuf, sizeof(abuf), "%um", (unsigned)(s / 60));
-            acol = s < 300 ? 0x07E0 : 0xC618;
-        } else if (s < 86400) {
-            snprintf(abuf, sizeof(abuf), "%uh", (unsigned)(s / 3600));
-            acol = 0x8410;
         } else {
-            snprintf(abuf, sizeof(abuf), "%ud", (unsigned)(s / 86400));
-            acol = 0x630C; // dim: stale
+            uint32_t s = sinceLastSeen(n);
+            if (s > 100u * 86400u) {
+                strcpy(abuf, "?");
+                acol = 0x630C;
+            } else if (s < 60) {
+                strcpy(abuf, "now");
+                acol = 0x07E0; // green: fresh
+            } else if (s < 3600) {
+                snprintf(abuf, sizeof(abuf), "%um", (unsigned)(s / 60));
+                acol = s < 300 ? 0x07E0 : 0xC618;
+            } else if (s < 86400) {
+                snprintf(abuf, sizeof(abuf), "%uh", (unsigned)(s / 3600));
+                acol = 0x8410;
+            } else {
+                snprintf(abuf, sizeof(abuf), "%ud", (unsigned)(s / 86400));
+                acol = 0x630C; // dim: stale
+            }
         }
     }
     g->setTextColor(acol);
@@ -1634,7 +2062,7 @@ void drawNodeRow(lgfx::LGFXBase *g, const meshtastic_NodeInfoLite *n, int y, boo
     // Role code, with a red "x" in the column the two-letter tag freed when the
     // node can't be messaged (unmessagable) — you can't DM it, so the list says so.
     int roleX = xRole;
-    if (nodeInfoLiteIsUnmessagable(n)) {
+    if (nodeIsUnmessagable(n)) {
         g->setTextColor(0xF800); // red
         g->setCursor(roleX, metaY);
         g->print("x");
@@ -1779,31 +2207,36 @@ void drawMsgStatus(lgfx::LGFXBase *g, int x, int y, uint8_t status)
 // the last honestly-known DAY in flash (written at most once a day, spares the
 // flash) and base manual entry on it: right after the first real sync in the
 // device's life, the manual date is correct to within a day.
+#ifdef ADVUI_HIL
+const char *kEpochPath = "/advui_hil_epoch.bin";
+#else
 const char *kEpochPath = "/advui_epoch.bin";
+#endif
 
 void epochNote()
 {
     uint32_t now = getTime(false);
-    if (now < kValidEpoch)
+    if (!validStoredEpoch(now))
         return;
     static uint32_t savedDay = 0;
     if (!savedDay) { // first call this boot: don't rewrite a same-day record
         auto f = FSCom.open(kEpochPath, FILE_O_READ);
         if (f) {
             uint32_t v = 0;
-            f.read((uint8_t *)&v, sizeof(v));
+            const bool ok = f.size() == sizeof(v) && f.read((uint8_t *)&v, sizeof(v)) == sizeof(v) &&
+                            validStoredEpoch(v);
             f.close();
-            savedDay = v / 86400;
+            if (ok)
+                savedDay = v / 86400;
         }
     }
     if (now / 86400 == savedDay)
         return;
-    auto f = FSCom.open(kEpochPath, FILE_O_WRITE);
-    if (f) {
-        f.write((uint8_t *)&now, sizeof(now));
-        f.close();
+    SafeFile f(kEpochPath, true);
+    if (f.write((uint8_t *)&now, sizeof(now)) == sizeof(now) && f.close()) {
         savedDay = now / 86400;
-    }
+    } else
+        LOG_ERROR("advui: epoch save failed; previous file kept");
 }
 
 uint32_t savedDateEpoch()
@@ -1812,9 +2245,9 @@ uint32_t savedDateEpoch()
     if (!f)
         return 0;
     uint32_t v = 0;
-    f.read((uint8_t *)&v, sizeof(v));
+    const bool ok = f.size() == sizeof(v) && f.read((uint8_t *)&v, sizeof(v)) == sizeof(v);
     f.close();
-    return v >= kValidEpoch ? (v / 86400) * 86400 : 0; // midnight of the last known day
+    return ok && validStoredEpoch(v) ? (v / 86400) * 86400 : 0; // midnight of the last known day
 }
 
 // Compact "HH:MM " prefix for a message's epoch time (local), or "" when the clock
@@ -1839,12 +2272,12 @@ uint32_t buildDateEpoch()
 
 void msgTimePrefix(uint32_t rxTime, int32_t tzOff, char *out, int cap)
 {
-    if (rxTime < kValidEpoch) { // no valid RTC at stamp time (see kValidEpoch)
+    if (!validStoredEpoch(rxTime)) { // no valid RTC at stamp time (see kValidEpoch)
         out[0] = 0;
         return;
     }
-    uint32_t local = rxTime + tzOff;
-    snprintf(out, cap, "%02u:%02u ", (unsigned)((local / 3600u) % 24u), (unsigned)((local / 60u) % 60u));
+    const int64_t local = (int64_t)rxTime + tzOff;
+    snprintf(out, cap, "%02u:%02u ", (unsigned)((local / 3600) % 24), (unsigned)((local / 60) % 60));
 }
 
 // --- Transliterated Cyrillic input (Fn+L) --------------------------------------
@@ -1952,20 +2385,6 @@ const char *kEmojiPalette[] = {
     "\U00002753", "\U0000203C\U0000FE0F", "\U00002705", "\U00002600\U0000FE0F", "\U00002744\U0000FE0F", "\U0001F4A9"};
 constexpr int kEmojiCount = sizeof(kEmojiPalette) / sizeof(kEmojiPalette[0]);
 
-// Byte length of the UTF-8 sequence starting at lead byte c.
-int utf8Len(unsigned char c)
-{
-    if (c < 0x80)
-        return 1;
-    if ((c >> 5) == 0x06)
-        return 2;
-    if ((c >> 4) == 0x0E)
-        return 3;
-    if ((c >> 3) == 0x1E)
-        return 4;
-    return 1;
-}
-
 // Longest emote label that is a prefix of s; returns its byte length (0 = none) and,
 // via *em, the matching table entry. Emote labels all start with 0xE2 or 0xF0, so we
 // only scan the table for those lead bytes (ASCII and Cyrillic never match).
@@ -1989,7 +2408,6 @@ int emoteMatch(const char *s, const graphics::Emote **em)
     return bestLen;
 }
 
-uint32_t utf8Cp(const char *s, int len);
 bool cpInvisible(uint32_t cp);
 
 // Copies the leading run of `s` that fits `maxW` px in the current font into `out`
@@ -2002,17 +2420,21 @@ int wrapLine(lgfx::LGFXBase *g, const char *s, int maxW, char *out, int outCap)
     while (s[consumed]) {
         const graphics::Emote *em = nullptr;
         int elen = emoteMatch(s + consumed, &em);
-        int tlen = elen > 0 ? elen : utf8Len((unsigned char)s[consumed]);
+        Utf8Rune rune = utf8Decode(s + consumed);
+        int tlen = elen > 0 ? elen : rune.bytes;
         int tw;
         if (elen > 0) {
             tw = em->width + 2;
         } else {
             char cb[5];
-            int k = 0;
-            for (; k < tlen && s[consumed + k]; k++)
-                cb[k] = s[consumed + k];
-            cb[k] = 0;
-            tw = cpInvisible(utf8Cp(cb, k)) ? 0 : g->textWidth(cb);
+            if (rune.valid) {
+                memcpy(cb, s + consumed, rune.bytes);
+                cb[rune.bytes] = 0;
+            } else {
+                cb[0] = '?';
+                cb[1] = 0;
+            }
+            tw = cpInvisible(rune.codepoint) ? 0 : g->textWidth(cb);
         }
         if (consumed > 0 && w + tw > maxW)
             break; // doesn't fit -> wrap here
@@ -2030,20 +2452,6 @@ int wrapLine(lgfx::LGFXBase *g, const char *s, int maxW, char *out, int outCap)
     memcpy(out, s, dispLen);
     out[dispLen] = 0;
     return cut > 0 ? cut : 1;
-}
-
-// Pixel width of a string with inline emoji (each emoji counts as its glyph advance).
-// Decodes one UTF-8 sequence of known length into a codepoint.
-uint32_t utf8Cp(const char *s, int len)
-{
-    unsigned char c = (unsigned char)s[0];
-    if (len == 2)
-        return ((c & 0x1F) << 6) | (s[1] & 0x3F);
-    if (len == 3)
-        return ((c & 0x0F) << 12) | ((s[1] & 0x3F) << 6) | (s[2] & 0x3F);
-    if (len == 4)
-        return ((c & 0x07) << 18) | ((s[1] & 0x3F) << 12) | ((s[2] & 0x3F) << 6) | (s[3] & 0x3F);
-    return c;
 }
 
 // What the embedded 9x15 font actually has: ASCII plus Cyrillic. Everything
@@ -2073,18 +2481,20 @@ int lineWidthEmotes(lgfx::LGFXBase *g, const char *s)
             w += em->width + 2;
             s += elen;
         } else {
-            int tlen = utf8Len((unsigned char)s[0]);
+            Utf8Rune rune = utf8Decode(s);
             char cb[5];
-            int k = 0;
-            for (; k < tlen && s[k]; k++)
-                cb[k] = s[k];
-            cb[k] = 0;
-            uint32_t cp = utf8Cp(cb, k);
-            if (!cpInvisible(cp)) {
-                int gw = !flashFontCovers(cp) ? sdGlyphWidth(cp) : 0;
+            if (rune.valid) {
+                memcpy(cb, s, rune.bytes);
+                cb[rune.bytes] = 0;
+            } else {
+                cb[0] = '?';
+                cb[1] = 0;
+            }
+            if (!cpInvisible(rune.codepoint)) {
+                int gw = !flashFontCovers(rune.codepoint) ? sdGlyphWidth(rune.codepoint) : 0;
                 w += gw ? gw + 1 : g->textWidth(cb);
             }
-            s += k;
+            s += rune.bytes;
         }
     }
     return w;
@@ -2107,19 +2517,21 @@ int printLineEmotes(lgfx::LGFXBase *g, int x, int y, const char *s, uint16_t col
             cx += em->width + 2;
             s += elen;
         } else { // one non-emote UTF-8 char
-            int tlen = utf8Len((unsigned char)s[0]);
+            Utf8Rune rune = utf8Decode(s);
             char cb[5];
-            int k = 0;
-            for (; k < tlen && s[k]; k++)
-                cb[k] = s[k];
-            cb[k] = 0;
-            uint32_t cp = utf8Cp(cb, k);
-            if (cpInvisible(cp)) {
-                s += k;
+            if (rune.valid) {
+                memcpy(cb, s, rune.bytes);
+                cb[rune.bytes] = 0;
+            } else {
+                cb[0] = '?';
+                cb[1] = 0;
+            }
+            if (cpInvisible(rune.codepoint)) {
+                s += rune.bytes;
                 continue;
             }
             uint8_t bits[32];
-            int gw = !flashFontCovers(cp) ? sdGlyph(cp, bits) : 0;
+            int gw = !flashFontCovers(rune.codepoint) ? sdGlyph(rune.codepoint, bits) : 0;
             if (gw) { // unicode glyph, aligned onto the emoji band
                 g->drawBitmap(cx, y + (17 - 16) / 2 + emojiDy, bits, gw, 16, color);
                 cx += gw + 1;
@@ -2129,7 +2541,7 @@ int printLineEmotes(lgfx::LGFXBase *g, int x, int y, const char *s, uint16_t col
                 g->print(cb);
                 cx += g->textWidth(cb);
             }
-            s += k;
+            s += rune.bytes;
         }
     }
     return cx;
@@ -2138,15 +2550,7 @@ int printLineEmotes(lgfx::LGFXBase *g, int x, int y, const char *s, uint16_t col
 // Copies at most `maxBytes` of s into out without splitting a UTF-8 sequence.
 void utf8Copy(char *out, const char *s, int maxBytes)
 {
-    int n = 0;
-    while (s[n]) {
-        int l = utf8Len((unsigned char)s[n]);
-        if (n + l > maxBytes)
-            break;
-        n += l;
-    }
-    memcpy(out, s, n);
-    out[n] = 0;
+    utf8CopyValid(out, (size_t)maxBytes + 1, s);
 }
 
 // Strips codepoints we can't actually draw (anything beyond ASCII, Cyrillic and the
@@ -2166,13 +2570,13 @@ void sanitizeDisplay(char *s)
             p += el;
             continue;
         }
-        int len = utf8Len((unsigned char)*p);
+        Utf8Rune rune = utf8Decode(p);
+        int len = rune.bytes;
         bool ok = false;
-        if (len == 1) {
+        if (rune.valid && len == 1) {
             ok = (unsigned char)*p >= 0x20 && (unsigned char)*p < 0x7F;
-        } else if (len == 2) { // the font also covers Cyrillic
-            uint32_t cp = (((unsigned char)p[0] & 0x1F) << 6) | ((unsigned char)p[1] & 0x3F);
-            ok = cp >= 0x400 && cp <= 0x45F;
+        } else if (rune.valid && len == 2) { // the font also covers Cyrillic
+            ok = rune.codepoint >= 0x400 && rune.codepoint <= 0x45F;
         }
         if (ok) {
             memcpy(out + o, p, len);
@@ -2189,8 +2593,8 @@ void sanitizeDisplay(char *s)
 void shortNameOf(uint32_t num, char *out, size_t cap)
 {
     meshtastic_NodeInfoLite *n = nodeByNum(num);
-    if (n && n->short_name[0]) {
-        snprintf(out, cap, "%s", n->short_name);
+    if (n && nodeShortName(n)[0]) {
+        snprintf(out, cap, "%s", nodeShortName(n));
         sanitizeDisplay(out);
         if (out[0])
             return;
@@ -2267,13 +2671,13 @@ void AdvUI::initHardware()
 
 #ifdef HAS_NEOPIXEL
     // Boot self-test: cycle red -> green -> blue so it's unmistakable the LED works.
-    rgbLedWrite(NEOPIXEL_DATA, 90, 0, 0);
+    setLedRgb(90, 0, 0);
     delay(250);
-    rgbLedWrite(NEOPIXEL_DATA, 0, 90, 0);
+    setLedRgb(0, 90, 0);
     delay(250);
-    rgbLedWrite(NEOPIXEL_DATA, 0, 0, 90);
+    setLedRgb(0, 0, 90);
     delay(250);
-    rgbLedWrite(NEOPIXEL_DATA, 0, 0, 0);
+    setLedRgb(0, 0, 0);
 #endif
 
     loadRadioCfg();
@@ -2403,18 +2807,21 @@ void AdvUI::handleFromRadio(const meshtastic_FromRadio &fr)
         n = sizeof(text) - 1;
     memcpy(text, p.decoded.payload.bytes, n);
     text[n] = 0;
+    utf8Sanitize(text, sizeof(text));
 
     uint32_t me = myNodeNum();
 
     // A tapback: attach to the target message instead of adding a bubble. Quiet by
     // design (no unread/beep) — just a LED blink so it isn't missed entirely.
     if (p.decoded.emoji && p.decoded.reply_id) {
-        if (p.from != me) {
-            addReaction(p.decoded.reply_id, p.from, text);
+        // Keep self echoes too: a reaction sent from the phone has our node id,
+        // and must appear on the Cardputer. sendReaction() may also add the same
+        // tuple locally, but addReaction is idempotent per (message, sender).
+        addReaction(p.decoded.reply_id, p.from, text, reactionTargetFrom(p, me));
 #ifdef HAS_NEOPIXEL
+        if (p.from != me)
             flashLed(60, 40, 90); // soft violet: a reaction, not a message
 #endif
-        }
         return;
     }
 
@@ -2464,7 +2871,11 @@ static uint32_t sendTextPacket(uint32_t to, const char *text, int chIdx = 0, uin
         if (!p.id)
             p.id = 1;
         p.to = to;
-        p.want_ack = to != NODENUM_BROADCAST;
+        // Ask the companion node to track broadcasts too.  Meshtastic reports an
+        // implicit result after hearing a neighbour rebroadcast (or exhausting
+        // retries), giving channel sends the same terminal state as local-radio
+        // sends instead of leaving them on the yellow "sending" dot forever.
+        p.want_ack = true;
         if (to == NODENUM_BROADCAST)
             p.channel = chIdx;
         p.which_payload_variant = meshtastic_MeshPacket_decoded_tag;
@@ -2480,12 +2891,11 @@ static uint32_t sendTextPacket(uint32_t to, const char *text, int chIdx = 0, uin
                 p.decoded.emoji = 1;
         }
         if (to != NODENUM_BROADCAST) { // a DM to a key-capable node must be marked PKI
-            for (int i = 0; i < g_compNodeCount; i++)
-                if (g_compNodes[i].num == to && g_compNodes[i].hasKey) {
-                    p.pki_encrypted = true;
-                    p.channel = 0;
-                    break;
-                }
+            CompNode node;
+            if (bleCopyCompNode(to, &node) && node.hasKey) {
+                p.pki_encrypted = true;
+                p.channel = 0;
+            }
         }
         uint8_t buf[320];
         size_t len = pb_encode_to_bytes(buf, sizeof(buf), &meshtastic_ToRadio_msg, &t);
@@ -2526,7 +2936,7 @@ static uint32_t sendTextPacket(uint32_t to, const char *text, int chIdx = 0, uin
         // A DM to a key-capable node must be PKI-encrypted (stock forces this); without
         // it the recipient on a modern mesh won't accept/ack the message.
         meshtastic_NodeInfoLite *node = nodeDB ? nodeDB->getMeshNode(to) : nullptr;
-        if (node && node->public_key.size == 32) {
+        if (nodeHasPublicKey(node)) {
             p->pki_encrypted = true;
             p->channel = 0;
         }
@@ -2581,7 +2991,7 @@ void AdvUI::sendChannel(int chIdx, const char *text, uint32_t replyId)
     if (!id)
         return;
     uint32_t me = myNodeNum();
-    addMsg(me, NODENUM_BROADCAST, chIdx, getTime(false), false, text, id, MSG_SENT, replyId); // no ack for broadcast
+    addMsg(me, NODENUM_BROADCAST, chIdx, getTime(false), false, text, id, MSG_SENDING, replyId);
 }
 
 // Sends a tapback on the message at ring index msgIdx and records it locally.
@@ -2599,7 +3009,7 @@ void AdvUI::sendReaction(int msgIdx, const char *label)
     if (!id)
         return;
     uint32_t me = myNodeNum();
-    addReaction(m.id, me, label);
+    addReaction(m.id, me, label, m.from);
 }
 
 // Fills out[] with node-DB indices matching query (all if query is null/empty),
@@ -2610,8 +3020,16 @@ int AdvUI::buildNodeList(uint16_t *out, int max, const char *query)
     uint32_t me = myNodeNum();
 
     if (g_radioCompanion) { // companion: nodes come from the BLE config stream
-        for (int i = 0; i < g_compNodeCount && count < max; i++) {
-            const CompNode &c = g_compNodes[i];
+        struct SortKey {
+            uint16_t index;
+            bool unread;
+            uint32_t lastHeard;
+        } keys[kMaxCompNodes];
+        const int total = g_compNodeCount.load();
+        for (int i = 0; i < total && count < max; i++) {
+            CompNode c;
+            if (!bleCopyCompNodeAt(i, &c))
+                continue;
             if (c.num == me)
                 continue;
             if (query && query[0]) {
@@ -2619,14 +3037,15 @@ int AdvUI::buildNodeList(uint16_t *out, int max, const char *query)
                 if (!ciContains(name[0] ? name : "", query))
                     continue;
             }
-            out[count++] = (uint16_t)i;
+            keys[count++] = {(uint16_t)i, hasUnreadFrom(c.num), c.lastHeard};
         }
-        std::sort(out, out + count, [](uint16_t a, uint16_t b) { // unread first, then freshest
-            bool ua = hasUnreadFrom(g_compNodes[a].num), ub = hasUnreadFrom(g_compNodes[b].num);
-            if (ua != ub)
-                return ua;
-            return g_compNodes[a].lastHeard > g_compNodes[b].lastHeard;
+        std::sort(keys, keys + count, [](const SortKey &a, const SortKey &b) { // unread first, then freshest
+            if (a.unread != b.unread)
+                return a.unread;
+            return a.lastHeard > b.lastHeard;
         });
+        for (int i = 0; i < count; i++)
+            out[i] = keys[i].index;
         return count;
     }
 
@@ -2726,7 +3145,7 @@ int AdvUI::matchedFromNewest(int back)
 }
 
 // Stage the archive slice for `depth` archived messages above the seam. The
-// staged window is the oldest-most 16 of those; the gap up to the seam (if
+// staged window is the oldest-most 8 of those; the gap up to the seam (if
 // any) stays unrendered, and the live ring renders only when the slice
 // touches the seam — one continuous timeline either way. The view anchor
 // keeps the screen position stable across restagings, so sliding the window
@@ -2795,12 +3214,15 @@ void AdvUI::openEntry(int s)
 void AdvUI::deleteConversation(const Conv &c)
 {
     int w = 0;
+    bool dropReacts[kMaxReacts] = {};
     for (int r = 0; r < g_msgCount; r++) {
         Msg &m = g_msgs[r];
         bool mine = c.isChan ? (m.to == NODENUM_BROADCAST && m.ch == c.ch)
                              : (m.to != NODENUM_BROADCAST && (m.from == c.node || m.to == c.node));
-        if (mine)
+        if (mine) {
+            markReactionsForMessage(m.id, m.from, dropReacts);
             continue; // drop it
+        }
         if (w != r) {
             g_msgs[w] = m;
             g_msgReply[w] = g_msgReply[r];
@@ -2808,26 +3230,39 @@ void AdvUI::deleteConversation(const Conv &c)
         w++;
     }
     g_msgCount = w;
-    // drop reactions whose target message no longer exists
-    int rw = 0;
-    for (int r = 0; r < g_reactCount; r++) {
-        bool live = false;
-        for (int i = 0; i < g_msgCount; i++)
-            if (g_msgs[i].id && g_msgs[i].id == g_reacts[r].msgId) {
-                live = true;
-                break;
+    markMsgsDirty();
+    bool historyPurged = histPurge(c.isChan, c.ch, c.node, dropReacts); // erase means erase: archive too
+
+    // Packet IDs are only per-sender unique, while a reaction carries just the
+    // target ID. If another conversation still has the same ID, the reaction is
+    // ambiguous but not orphaned: preserving it avoids deleting valid metadata.
+    // Re-check both surviving stores after the purge so archive/live collisions
+    // cannot erase each other's reactions.
+    for (int i = 0; i < g_msgCount; i++)
+        preserveReactionsForMessage(g_msgs[i].id, g_msgs[i].from, dropReacts);
+    bool archiveChecked = historyPurged && g_histTotal == 0;
+    auto hist = historyPurged && g_histTotal > 0 ? FSCom.open(kHistPath, FILE_O_READ) : File();
+    if (hist && historyPurged) {
+        uint32_t magic = 0;
+        HistRec rec;
+        bool valid = hist.read((uint8_t *)&magic, 4) == 4 && magic == kHistMagic;
+        int records = 0;
+        while (valid && records < g_histTotal && hist.read((uint8_t *)&rec, sizeof(rec)) == (int)sizeof(rec)) {
+            if (normalizeStoredMsg(rec.m)) {
+                preserveReactionsForMessage(rec.m.id, rec.m.from, dropReacts);
+                records++;
+            } else {
+                valid = false;
             }
-        if (live) {
-            if (rw != r)
-                g_reacts[rw] = g_reacts[r];
-            rw++;
         }
+        archiveChecked = valid && records == g_histTotal;
+        hist.close();
     }
-    g_reactCount = rw;
-    g_reactNext = rw % kMaxReacts;
-    g_msgsDirty = true;
-    saveMsgs();
-    histPurge(c.isChan, c.ch, c.node); // erase means erase: the flash archive too
+    if (!archiveChecked)
+        memset(dropReacts, 0, sizeof(dropReacts)); // fail safe: uncertain metadata is never destroyed
+    dropMarkedReactions(dropReacts);
+    if (saveMsgs())
+        g_msgsDirty = false;
 }
 
 // One node, favourited or not, wherever the user pressed the arrow. Both the chats
@@ -2842,7 +3277,7 @@ void AdvUI::favNode(uint32_t num, bool on)
     if (nodeDB && !g_radioCompanion)
         nodeDB->set_favorite(on, num);
     else if (setFavNodeLocal(num, on))
-        saveUiCfg();
+        persistUiCfg();
 }
 
 // Node number at a position in the filtered list, or 0 when there is nothing there.
@@ -2862,7 +3297,7 @@ void AdvUI::favEntry(int s, bool on)
             g_favChannels |= (1u << ci);
         else
             g_favChannels &= ~(1u << ci);
-        g_msgsDirty = true; // persisted alongside the messages
+        markMsgsDirty(); // persisted alongside the messages
     } else {
         meshtastic_NodeInfoLite *node = nodeAt(filtered[s - chanCount]);
         if (node)
@@ -3091,7 +3526,8 @@ void AdvUI::drawNodeList()
     size_t total, cap = SIZE_MAX;
     bool day = false;
     if (g_radioCompanion) {
-        total = (size_t)(g_compNodesSeen > g_compNodeCount ? g_compNodesSeen : (int)g_compNodeCount);
+        const int seen = g_compNodesSeen.load(), mirrored = g_compNodeCount.load();
+        total = (size_t)(seen > mirrored ? seen : mirrored);
     } else {
         static uint32_t lastRecon = 0;
         if (g_seen24 < 0 || millis() - lastRecon > 60000) {
@@ -3328,14 +3764,17 @@ void AdvUI::drawNode()
                               // a typical backlog window rarely overflows (the unread anchor
                               // lives or dies with its lines staying in this ring)
         int dlCount = 0;
+        int dlHead = 0;
         int anchorLine = -1;       // dl index of the first unread message's first line (on open)
         bool anchorDropped = false; // its lines got evicted: land at the top of what's left
         int anchorNewLine = -1;     // dl index where the view-anchor message starts this frame
         int selMsgIdx = reactSel >= 0 ? matchedFromNewest(reactSel) : -1;
         int selFirst = -1, selLast = -1; // dl range of the react-selected message
+        const int dlCapacity = (int)(sizeof(dl) / sizeof(dl[0]));
+        auto lineAt = [&](int index) -> DLine & { return dl[(dlHead + index) % dlCapacity]; };
         auto pushLine = [&]() -> DLine & {
-            if (dlCount >= (int)(sizeof(dl) / sizeof(dl[0]))) { // drop the oldest line
-                memmove(dl, dl + 1, sizeof(dl) - sizeof(dl[0]));
+            if (dlCount >= dlCapacity) { // drop the oldest line without copying the whole 5.3 KiB ring
+                dlHead = (dlHead + 1) % dlCapacity;
                 dlCount--;
                 if (anchorLine == 0)
                     anchorDropped = true; // the anchor's first line is the one being dropped
@@ -3348,7 +3787,9 @@ void AdvUI::drawNode()
                 if (selLast >= 0)
                     selLast--;
             }
-            return dl[dlCount++];
+            DLine &line = lineAt(dlCount);
+            dlCount++;
+            return line;
         };
         for (int i = 0; i < mc; i++) {
             const Msg &m = *srcs[i].m;
@@ -3392,13 +3833,8 @@ void AdvUI::drawNode()
                     char snip[24];
                     utf8Copy(snip, om->text, (int)sizeof(snip) - 1);
                     snprintf(d.text, sizeof(d.text), "%s%s%s", qt, qs, snip);
-                    while (lineWidthEmotes(g, d.text) > 204) { // keep the text inside the frame
-                        int L = (int)strlen(d.text);
-                        do {
-                            L--;
-                        } while (L > 0 && (d.text[L] & 0xC0) == 0x80); // drop whole UTF-8 char
-                        d.text[L] = 0;
-                    }
+                    while (lineWidthEmotes(g, d.text) > 204) // keep the text inside the frame
+                        utf8TrimLast(d.text);
                     d.color = 0x8410; // readable, but subordinate to its frame
                     d.msgIdx = -1;
                     d.out = false;
@@ -3446,7 +3882,8 @@ void AdvUI::drawNode()
                 char rl[38];
                 int rp = 0;
                 for (int r = 0; r < g_reactCount && rp < (int)sizeof(rl) - 14; r++) {
-                    if (g_reacts[r].msgId != m.id)
+                    if (g_reacts[r].msgId != m.id ||
+                        (g_reacts[r].targetFrom && g_reacts[r].targetFrom != m.from))
                         continue;
                     char sn[8];
                     shortNameOf(g_reacts[r].from, sn, sizeof(sn));
@@ -3552,21 +3989,21 @@ void AdvUI::drawNode()
         // bottom is an archive message, not the newest).
         if (chatScroll > 0 || (histDepth > 0 && !histSeam)) {
             for (int i = startL; i < dlCount; i++)
-                if (dl[i].msgId) {
+                if (lineAt(i).msgId) {
                     int a = i;
-                    while (a > 0 && dl[a - 1].msgId == dl[i].msgId)
+                    while (a > 0 && lineAt(a - 1).msgId == lineAt(i).msgId)
                         a--; // back up to the message's first line
-                    viewAnchorId = dl[i].msgId;
+                    viewAnchorId = lineAt(i).msgId;
                     viewAnchorOff = startL - a;
                     break;
                 }
         }
         int y = fy0;
         for (int i = startL; i < startL + maxLines && i < dlCount; i++) {
-            DLine &d = dl[i];
+            DLine &d = lineAt(i);
             if (d.msgIdx >= 0 && !g_msgs[d.msgIdx].read) { // it's on screen now: that's "read"
                 g_msgs[d.msgIdx].read = true;
-                g_msgsDirty = true;
+                markMsgsDirty();
             }
             if (selFirst >= 0 && i >= selFirst && i <= selLast)
                 g->fillRect(0, y - 1, 236, lh, 0x2945); // react-mode selection band
@@ -3667,7 +4104,7 @@ void AdvUI::drawNode()
         while (lineWidthEmotes(g, shown) > 212) { // leave room for the RU/EN badge
             const graphics::Emote *em = nullptr;
             int el = emoteMatch(shown, &em);
-            shown += el > 0 ? el : utf8Len((unsigned char)*shown);
+            shown += el > 0 ? el : utf8Decode(shown).bytes;
         }
         printLineEmotes(g, 4, 118, shown, 0xFFE0); // yellow, emoji inline
         g->fillRect(216, 116, 24, 13, 0x0000); // input-mode badge (Fn+L toggles)
@@ -3745,7 +4182,7 @@ void AdvUI::drawSetName()
     g->setCursor(6, 74);
     g->printf("%u / %u", (unsigned)nameLen, editMax(editTarget));
 
-    drawFooter(g, "type   ENTER save   ESC cancel");
+    drawFooter(g, editTarget == 2 ? "blank = auto   ENTER save" : "type   ENTER save   ESC cancel");
 
     if (haveCanvas)
         pushFrame();
@@ -3761,23 +4198,27 @@ bool AdvUI::applyName()
         return false;
     }
     if (editTarget == 2) { // frequency (MHz) -> override_frequency; radio restart to apply
+        float frequency = 0.0f;
+        if (!parseFrequencyOverride(nameBuf, &frequency))
+            return false;
         if (g_radioCompanion) { // remote admin: the node saves and reboots itself
-            if (!g_compLoraValid)
+            meshtastic_Config_LoRaConfig lora = meshtastic_Config_LoRaConfig_init_default;
+            if (!bleCopyCompLora(&lora))
                 return false;
             meshtastic_AdminMessage adm = meshtastic_AdminMessage_init_default;
             adm.which_payload_variant = meshtastic_AdminMessage_set_config_tag;
             adm.set_config.which_payload_variant = meshtastic_Config_lora_tag;
-            adm.set_config.payload_variant.lora = g_compLora;
-            adm.set_config.payload_variant.lora.override_frequency = strtof(nameBuf, nullptr);
+            adm.set_config.payload_variant.lora = lora;
+            adm.set_config.payload_variant.lora.override_frequency = frequency;
             if (!sendAdminToNode(adm))
                 return false; // link down: just fall back to Settings
             mode = MODE_BLELINK; // watch the node reboot + the link come back
             return true;
         }
-        config.lora.override_frequency = strtof(nameBuf, nullptr);
+        config.lora.override_frequency = frequency;
         if (nodeDB)
             nodeDB->saveToDisk(SEGMENT_CONFIG);
-        rebootAtMsec = millis() + 1500;
+        rebootAtMsec = armDeadline(millis(), 1500);
         mode = MODE_REBOOT;
         return true;
     }
@@ -3786,11 +4227,12 @@ bool AdvUI::applyName()
                                 // PSK included, so set_channel can't wipe the key
             meshtastic_AdminMessage adm = meshtastic_AdminMessage_init_default;
             adm.which_payload_variant = meshtastic_AdminMessage_set_channel_tag;
-            adm.set_channel = g_compChans[0];
+            if (!bleCopyCompChannel(0, &adm.set_channel))
+                return false;
             strncpy(adm.set_channel.settings.name, nameBuf, sizeof(adm.set_channel.settings.name));
             adm.set_channel.settings.name[sizeof(adm.set_channel.settings.name) - 1] = 0;
             if (sendAdminToNode(adm)) // applied live on the node (no reboot); mirror it
-                g_compChans[0] = adm.set_channel;
+                bleUpdateCompChannel(0, adm.set_channel);
             return false;
         }
         meshtastic_Channel ch = channels.getByIndex(0);
@@ -3800,19 +4242,14 @@ bool AdvUI::applyName()
         channels.onConfigChanged();
         if (nodeDB)
             nodeDB->saveToDisk(SEGMENT_CHANNELS);
-        rebootAtMsec = millis() + 1500;
+        rebootAtMsec = armDeadline(millis(), 1500);
         mode = MODE_REBOOT;
         return true;
     }
 
     if (editTarget == 4) { // manual clock: HH:MM local -> RTC, for meshes with no time source
         int hh = -1, mm = -1;
-        if (sscanf(nameBuf, "%d:%d", &hh, &mm) != 2 && strlen(nameBuf) == 4 &&
-            strspn(nameBuf, "0123456789") == 4) { // bare HHMM, no colon
-            hh = (nameBuf[0] - '0') * 10 + nameBuf[1] - '0';
-            mm = (nameBuf[2] - '0') * 10 + nameBuf[3] - '0';
-        }
-        if (hh < 0 || hh > 23 || mm < 0 || mm > 59)
+        if (!parseClockHm(nameBuf, &hh, &mm))
             return false; // unparsable: back to Settings, row still shows "not set"
         // Date base: the last honestly-known day if we ever had one (survives
         // reboots via flash), else the build date — see epochNote().
@@ -3840,20 +4277,17 @@ bool AdvUI::applyName()
         meshtastic_AdminMessage adm = meshtastic_AdminMessage_init_default;
         adm.which_payload_variant = meshtastic_AdminMessage_set_owner_tag;
         meshtastic_User &u = adm.set_owner;
-        for (int i = 0; i < g_compNodeCount; i++) // start from the node's current names
-            if (g_compNodes[i].num == g_linkMyNode) {
-                snprintf(u.long_name, sizeof(u.long_name), "%s", g_compNodes[i].longName);
-                snprintf(u.short_name, sizeof(u.short_name), "%s", g_compNodes[i].shortName);
-                if (editTarget == 1)
-                    snprintf(u.short_name, sizeof(u.short_name), "%s", nameBuf);
-                else
-                    snprintf(u.long_name, sizeof(u.long_name), "%s", nameBuf);
-                if (sendAdminToNode(adm)) { // mirror locally so Settings shows it at once
-                    snprintf(g_compNodes[i].longName, sizeof(g_compNodes[i].longName), "%s", u.long_name);
-                    snprintf(g_compNodes[i].shortName, sizeof(g_compNodes[i].shortName), "%s", u.short_name);
-                }
-                break;
-            }
+        CompNode node;
+        if (!bleCopyCompNode(g_linkMyNode.load(), &node))
+            return false;
+        snprintf(u.long_name, sizeof(u.long_name), "%s", node.longName);
+        snprintf(u.short_name, sizeof(u.short_name), "%s", node.shortName);
+        if (editTarget == 1)
+            snprintf(u.short_name, sizeof(u.short_name), "%s", nameBuf);
+        else
+            snprintf(u.long_name, sizeof(u.long_name), "%s", nameBuf);
+        if (sendAdminToNode(adm)) // mirror locally so Settings shows it at once
+            bleUpdateCompNodeNames(node.num, u.long_name, u.short_name);
         return false;
     }
     if (editTarget == 1) {
@@ -4021,19 +4455,23 @@ void AdvUI::drawSettings()
                                         "Font",    "Clock",    "GPS",    "Sort",  "Names",
                                         "2nd screen"};
     char vals[kNumSettings][24];
+    meshtastic_Config_LoRaConfig compLora = meshtastic_Config_LoRaConfig_init_default;
+    meshtastic_Config_DeviceConfig compDevice = meshtastic_Config_DeviceConfig_init_default;
+    const bool compLoraValid = g_radioCompanion && bleCopyCompLora(&compLora);
+    const bool compDeviceValid = g_radioCompanion && bleCopyCompDevice(&compDevice);
     if (g_radioCompanion) { // rows 0-5 show (and remote-admin edit) the linked node
         meshtastic_NodeInfoLite *me = g_linkMyNode ? nodeByNum(g_linkMyNode) : nullptr;
-        snprintf(vals[0], sizeof(vals[0]), "%s", me && me->long_name[0] ? me->long_name : "?");
-        snprintf(vals[1], sizeof(vals[1]), "%s", me && me->short_name[0] ? me->short_name : "?");
-        snprintf(vals[2], sizeof(vals[2]), "%s", g_compLoraValid ? regionName(g_compLora.region) : "?");
-        if (g_compLoraValid)
-            snprintf(vals[3], sizeof(vals[3]), "%s", g_compLora.use_preset ? presetName(g_compLora.modem_preset) : "custom");
+        snprintf(vals[0], sizeof(vals[0]), "%s", me && nodeLongName(me)[0] ? nodeLongName(me) : "?");
+        snprintf(vals[1], sizeof(vals[1]), "%s", me && nodeShortName(me)[0] ? nodeShortName(me) : "?");
+        snprintf(vals[2], sizeof(vals[2]), "%s", compLoraValid ? regionName(compLora.region) : "?");
+        if (compLoraValid)
+            snprintf(vals[3], sizeof(vals[3]), "%s", compLora.use_preset ? presetName(compLora.modem_preset) : "custom");
         else
             strcpy(vals[3], "?");
-        if (g_compLoraValid && g_compLora.override_frequency > 0)
-            snprintf(vals[4], sizeof(vals[4]), "%.3f", (double)g_compLora.override_frequency);
+        if (compLoraValid && compLora.override_frequency > 0)
+            snprintf(vals[4], sizeof(vals[4]), "%.3f", (double)compLora.override_frequency);
         else
-            strcpy(vals[4], g_compLoraValid ? "auto" : "?");
+            strcpy(vals[4], compLoraValid ? "auto" : "?");
         snprintf(vals[5], sizeof(vals[5]), "%s", chanName(0));
     } else {
         snprintf(vals[0], sizeof(vals[0]), "%s", owner.long_name[0] ? owner.long_name : "(unset)");
@@ -4053,17 +4491,17 @@ void AdvUI::drawSettings()
     }
     if (g_radioCompanion) { // LoRa/device rows mirror the linked node too
         snprintf(vals[6], sizeof(vals[6]), "%s",
-                 g_compDeviceValid ? optName(kRoleOpts2, kRoleCount, (int)g_compDevice.role) : "?");
-        if (g_compLoraValid)
-            snprintf(vals[7], sizeof(vals[7]), "%u", (unsigned)g_compLora.hop_limit);
+                 compDeviceValid ? optName(kRoleOpts2, kRoleCount, (int)compDevice.role) : "?");
+        if (compLoraValid)
+            snprintf(vals[7], sizeof(vals[7]), "%u", (unsigned)compLora.hop_limit);
         else
             strcpy(vals[7], "?");
-        if (g_compLoraValid)
-            snprintf(vals[8], sizeof(vals[8]), "%s", g_compLora.tx_power ? optName(kPowerOpts, kPowerCount, g_compLora.tx_power) : "max");
+        if (compLoraValid)
+            snprintf(vals[8], sizeof(vals[8]), "%s", compLora.tx_power ? optName(kPowerOpts, kPowerCount, compLora.tx_power) : "max");
         else
             strcpy(vals[8], "?");
         snprintf(vals[9], sizeof(vals[9]), "%s",
-                 g_compDeviceValid ? optName(kRebroadOpts, kRebroadCount, (int)g_compDevice.rebroadcast_mode) : "?");
+                 compDeviceValid ? optName(kRebroadOpts, kRebroadCount, (int)compDevice.rebroadcast_mode) : "?");
     } else {
         snprintf(vals[6], sizeof(vals[6]), "%s", optName(kRoleOpts2, kRoleCount, (int)config.device.role));
         snprintf(vals[7], sizeof(vals[7]), "%u", (unsigned)config.lora.hop_limit);
@@ -4099,10 +4537,10 @@ void AdvUI::drawSettings()
         snprintf(vals[15], sizeof(vals[15]), "%s", sdFontState());
     {
         uint32_t now = getTime(false); // device clock: the row doubles as the RTC status
-        if (now >= kValidEpoch) {
-            uint32_t loc = now + g_utcOffsetMin * 60;
-            snprintf(vals[16], sizeof(vals[16]), "%02u:%02u", (unsigned)((loc / 3600u) % 24u),
-                     (unsigned)((loc / 60u) % 60u));
+        if (validStoredEpoch(now)) {
+            const int64_t loc = (int64_t)now + (int64_t)g_utcOffsetMin * 60;
+            snprintf(vals[16], sizeof(vals[16]), "%02u:%02u", (unsigned)((loc / 3600) % 24),
+                     (unsigned)((loc / 60) % 60));
         } else
             strcpy(vals[16], "not set");
     }
@@ -4336,6 +4774,9 @@ void AdvUI::drawNetPage()
 void AdvUI::drawBleScan()
 {
     lgfx::LGFXBase *g = haveCanvas ? static_cast<lgfx::LGFXBase *>(&canvas) : static_cast<lgfx::LGFXBase *>(&display);
+    BleScanHit hits[kMaxScanHits];
+    bool scanning = false;
+    const int scanCount = bleScanSnapshot(hits, kMaxScanHits, &scanning);
 
     g->fillScreen(0x0000);
     g->setFont(&lgfx::fonts::Font0);
@@ -4343,47 +4784,47 @@ void AdvUI::drawBleScan()
     g->setTextColor(0x07FF);
     g->setCursor(4, 3);
     g->print("Find node");
-    g->setTextColor(g_scanning ? 0xFFE0 : 0x8410);
+    g->setTextColor(scanning ? 0xFFE0 : 0x8410);
     char st[20];
-    if (g_scanning)
+    if (scanning)
         strcpy(st, "scanning...");
     else
-        snprintf(st, sizeof(st), "%d found", g_scanCount);
+        snprintf(st, sizeof(st), "%d found", scanCount);
     g->setCursor(238 - g->textWidth(st), 3);
     g->print(st);
     g->drawFastHLine(0, 13, 240, 0x39C7);
 
-    if (bleSel >= g_scanCount)
-        bleSel = g_scanCount ? g_scanCount - 1 : 0;
+    if (bleSel >= scanCount)
+        bleSel = scanCount ? scanCount - 1 : 0;
     const int rowH = 18, top = 15;
-    if (g_scanCount == 0) {
+    if (scanCount == 0) {
         g->setFont(&lgfx::fonts::FreeSansBold9pt7b);
         g->setTextColor(0x630C);
         g->setCursor(6, 50);
-        g->print(g_bleUnsupported ? "Companion image needed" : g_scanning ? "Listening..." : "No nodes found");
+        g->print(g_bleUnsupported ? "Companion image needed" : scanning ? "Listening..." : "No nodes found");
         g->setFont(&lgfx::fonts::Font0);
         g->setTextColor(0x8410);
         g->setCursor(6, 70);
         g->print(g_bleUnsupported ? "flash the companion firmware from the installer"
                                   : "node powered + BT on, phone app closed");
     }
-    for (int i = 0; i < g_scanCount && i < 5; i++) {
+    for (int i = 0; i < scanCount && i < 5; i++) {
         int y = top + i * rowH;
         if (i == bleSel)
             g->fillRect(0, y - 1, 240, rowH, 0x2945);
         g->setFont(&lgfx::fonts::FreeSansBold9pt7b);
         g->setTextSize(1);
         char nm[24];
-        snprintf(nm, sizeof(nm), "%s", g_scanHits[i].name[0] ? g_scanHits[i].name : g_scanHits[i].addr);
+        snprintf(nm, sizeof(nm), "%s", hits[i].name[0] ? hits[i].name : hits[i].addr);
         fitWidth(g, nm, 180);
-        bool saved = g_peerAddr[0] && !strcmp(g_peerAddr, g_scanHits[i].addr);
+        bool saved = g_peerAddr[0] && !strcmp(g_peerAddr, hits[i].addr);
         g->setTextColor(saved ? 0xFFE0 : 0xFFFF); // the saved peer shows yellow
         g->setCursor(6, y + 1);
         g->print(nm);
         char rb[10];
-        snprintf(rb, sizeof(rb), "%ddB", g_scanHits[i].rssi);
+        snprintf(rb, sizeof(rb), "%ddB", hits[i].rssi);
         g->setFont(&lgfx::fonts::Font0);
-        g->setTextColor(g_scanHits[i].rssi > -70 ? 0x07E0 : 0x8410);
+        g->setTextColor(hits[i].rssi > -70 ? 0x07E0 : 0x8410);
         g->setCursor(236 - g->textWidth(rb), y + 5);
         g->print(rb);
     }
@@ -4478,6 +4919,15 @@ void AdvUI::drawBtPin()
 void AdvUI::drawBleLink()
 {
     lgfx::LGFXBase *g = haveCanvas ? static_cast<lgfx::LGFXBase *>(&canvas) : static_cast<lgfx::LGFXBase *>(&display);
+    const BleLinkState linkState = g_linkState.load();
+    const uint32_t linkRxPkts = g_linkRxPkts.load();
+    const uint32_t linkMyNode = g_linkMyNode.load();
+    const int linkRssi = g_linkRssi.load();
+    const int linkNodeBatt = g_linkNodeBatt.load();
+    const bool configDone = g_linkConfigDone.load();
+    const int nodeCount = g_compNodeCount.load();
+    char linkError[kBleLinkErrorSize];
+    bleCopyLinkError(linkError, sizeof(linkError));
 
     g->fillScreen(0x0000);
     g->setFont(&lgfx::fonts::Font0);
@@ -4498,11 +4948,11 @@ void AdvUI::drawBleLink()
 
     const char *st;
     uint16_t sc;
-    switch (g_linkState) {
+    switch (linkState) {
     case BLE_CONNECTING: st = "connecting..."; sc = 0xFFE0; break;
     case BLE_PAIRING:    st = "pairing: PIN on the node"; sc = 0xFFE0; break;
     case BLE_CONNECTED:  st = "connected"; sc = 0x07E0; break;
-    case BLE_FAILED:     st = g_linkErr[0] ? g_linkErr : "failed"; sc = 0xF800; break;
+    case BLE_FAILED:     st = linkError[0] ? linkError : "failed"; sc = 0xF800; break;
     default:             st = "idle"; sc = 0x8410; break;
     }
     g->setCursor(6, 48);
@@ -4512,27 +4962,27 @@ void AdvUI::drawBleLink()
     g->setFont(&lgfx::fonts::Font0);
     g->setTextColor(0x9CD3);
     g->setCursor(6, 72);
-    g->printf("packets rx: %u", (unsigned)g_linkRxPkts);
-    if (g_linkMyNode) {
+    g->printf("packets rx: %u", (unsigned)linkRxPkts);
+    if (linkMyNode) {
         g->setCursor(6, 84);
-        g->printf("node id: !%08x", (unsigned)g_linkMyNode);
+        g->printf("node id: !%08x", (unsigned)linkMyNode);
     }
-    if (g_linkRssi) {
+    if (linkRssi) {
         g->setCursor(130, 72);
-        g->printf("link: %ddB", (int)g_linkRssi);
+        g->printf("link: %ddB", linkRssi);
     }
-    if (g_linkNodeBatt >= 0) {
+    if (linkNodeBatt >= 0) {
         g->setCursor(130, 84);
-        g->printf("node batt: %d%%", (int)g_linkNodeBatt);
+        g->printf("node batt: %d%%", linkNodeBatt);
     }
-    if (g_linkState == BLE_CONNECTED && g_linkConfigDone) {
+    if (linkState == BLE_CONNECTED && configDone) {
         g->setTextColor(0x07E0);
         g->setCursor(6, 102);
-        g->printf("link OK - %d nodes synced", (int)g_compNodeCount);
+        g->printf("link OK - %d nodes synced", nodeCount);
     }
 
-    drawFooter(g, g_linkState == BLE_FAILED ? "auto-retry  R now  F forget  ESC"
-                                            : "R reconnect  F forget  ESC scan");
+    drawFooter(g, linkState == BLE_FAILED ? "auto-retry  R now  F forget  ESC"
+                                          : "R reconnect  F forget  ESC scan");
 
     if (haveCanvas)
         pushFrame();
@@ -4653,6 +5103,340 @@ void AdvUI::drawEmoji()
 
 #ifdef ADVUI_SCREENSHOT
 static bool shotLive = false; // 'L' over serial: dump the frame right after the next render
+#ifdef ADVUI_HIL
+static bool hilDigestPending = false;
+static bool hilHistorySeeded = false;
+static uint32_t hilBootNonce = 0;
+
+uint32_t hilBootId()
+{
+    if (!hilBootNonce) {
+        hilBootNonce = esp_random();
+        if (!hilBootNonce)
+            hilBootNonce = micros() | 1U;
+    }
+    return hilBootNonce;
+}
+
+const char *AdvUI::hilModeName() const
+{
+    static const char *names[] = {"chats",   "nodes",   "picker", "node",    "compose",
+                                  "setname", "settings", "picklist", "reboot", "emoji",
+                                  "netpage", "blescan", "blepin", "blelink", "btpin"};
+    const unsigned index = static_cast<unsigned>(mode);
+    return index < sizeof(names) / sizeof(names[0]) ? names[index] : "unknown";
+}
+
+void AdvUI::hilState()
+{
+    // Native USB CDC defaults to a zero TX timeout. A response longer than its
+    // current endpoint capacity is then silently truncated, so keep each record
+    // short as well as enabling bounded blocking for the dev-only protocol.
+    Serial.setTxTimeoutMs(1000);
+    Serial.printf("@@STATE v=2 boot=%08x reset=%d mode=%s splash=%u screen=%u keyboard=%u canvas=%u node=%08x selected=%08x channel=%d "
+                  "compose=%u query=%u set_section=%d set_sel=%d net_page=%d backend=%s\n",
+                  (unsigned)hilBootId(), (int)esp_reset_reason(), hilModeName(), splashDone ? 1U : 0U,
+                  screenOn ? 1U : 0U, kbMissing ? 0U : 1U,
+                  haveCanvas ? 1U : 0U, (unsigned)myNodeNum(), (unsigned)selectedNum, selectedChannel, (unsigned)msgLen,
+                  (unsigned)queryLen, setSection, setSel, netPage, g_radioCompanion ? "companion" : "onboard");
+    Serial.printf("@@STATS v=2 messages=%d hist=%d unread=%d reactions=%d conversations=%d filtered=%d heap=%u "
+                  "min_heap=%u link=%u rx_drop=%u tx_drop=%u radio_tx=%u rf_region=%d rf_power=%d sort=%u names=%u\n",
+                  g_msgCount, histTotal(), unreadCount(), g_reactCount, convCount, filteredCount, (unsigned)ESP.getFreeHeap(),
+                  (unsigned)ESP.getMinFreeHeap(),
+                  (unsigned)g_linkState.load(), (unsigned)bleRxDrops(), (unsigned)bleTxDrops(),
+                  config.lora.tx_enabled ? 1U : 0U, (int)config.lora.region, (int)config.lora.tx_power,
+                  (unsigned)g_nodeSort, (unsigned)g_nameShort);
+    unsigned statuses[5] = {};
+    for (int i = 0; i < g_msgCount; i++)
+        if (g_msgs[i].status < 5)
+            statuses[g_msgs[i].status]++;
+    const int last = g_msgCount ? g_msgCount - 1 : -1;
+    const Msg empty = {};
+    const Msg &m = last >= 0 ? g_msgs[last] : empty;
+    uint32_t textFnv = 2166136261U;
+    for (const unsigned char *p = (const unsigned char *)m.text; *p; p++)
+        textFnv = (textFnv ^ *p) * 16777619U;
+    Serial.printf("@@LAST v=2 incoming=%u sending=%u delivered=%u failed=%u sent=%u id=%08x from=%08x to=%08x "
+                  "ch=%u status=%u err=%u reply=%08x read=%u text_len=%u text_fnv=%08x\n",
+                  statuses[MSG_IN], statuses[MSG_SENDING], statuses[MSG_DELIVERED], statuses[MSG_FAILED],
+                  statuses[MSG_SENT], (unsigned)m.id, (unsigned)m.from, (unsigned)m.to, (unsigned)m.ch,
+                  (unsigned)m.status, (unsigned)m.err, (unsigned)(last >= 0 ? g_msgReply[last] : 0),
+                  m.read ? 1U : 0U, (unsigned)strlen(m.text), (unsigned)textFnv);
+
+    CompNode comp = {};
+    const int compNodes = g_compNodeCount.load();
+    const bool haveComp = compNodes > 0 && bleCopyCompNodeAt(compNodes - 1, &comp);
+    uint32_t compNameFnv = 2166136261U;
+    for (const unsigned char *p = (const unsigned char *)comp.longName; haveComp && *p; p++)
+        compNameFnv = (compNameFnv ^ *p) * 16777619U;
+    meshtastic_Channel compCh = meshtastic_Channel_init_default;
+    const bool haveCh = bleCopyCompChannel(0, &compCh) &&
+                        (compCh.has_settings || compCh.role != meshtastic_Channel_Role_DISABLED);
+    uint32_t chNameFnv = 2166136261U;
+    for (const unsigned char *p = (const unsigned char *)compCh.settings.name; haveCh && compCh.has_settings && *p; p++)
+        chNameFnv = (chNameFnv ^ *p) * 16777619U;
+    meshtastic_Config_LoRaConfig compLora = meshtastic_Config_LoRaConfig_init_default;
+    meshtastic_Config_DeviceConfig compDevice = meshtastic_Config_DeviceConfig_init_default;
+    const bool haveLora = bleCopyCompLora(&compLora), haveDevice = bleCopyCompDevice(&compDevice);
+    Serial.printf("@@COMP my=%08x nodes=%d seen=%d done=%u batt=%d last=%08x hops=%u key=%u name_fnv=%08x "
+                  "channel_present=%u channel_fnv=%08x lora=%u preset=%d region=%d tx=%d device=%u role=%d "
+                  "\n",
+                  (unsigned)g_linkMyNode.load(), compNodes, (int)g_compNodesSeen.load(),
+                  g_linkConfigDone.load() ? 1U : 0U, (int)g_linkNodeBatt.load(),
+                  haveComp ? (unsigned)comp.num : 0U, haveComp ? (unsigned)comp.hops : 0U,
+                  haveComp && comp.hasKey ? 1U : 0U, (unsigned)compNameFnv, haveCh ? 1U : 0U,
+                  (unsigned)chNameFnv, haveLora ? 1U : 0U, haveLora ? (int)compLora.modem_preset : 0,
+                  haveLora ? (int)compLora.region : 0, haveLora ? (int)compLora.tx_power : 0,
+                  haveDevice ? 1U : 0U, haveDevice ? (int)compDevice.role : 0);
+    // Keep diagnostics on their own bounded CDC record. Extending @@COMP past
+    // the native-USB TX buffer's comfortable line size made query-heavy HIL
+    // runs retain transport buffers and eventually starve the companion arena.
+    Serial.printf("@@CHEAP buffers=%u ingress_first=%u ingress_last=%u ingress_count=%u ingress_pre=%u "
+                  "ingress_direct=%d ingress_max=%u\n",
+                  bleHilBuffersReady() ? 1U : 0U,
+                  (unsigned)bleHilIngressFirstHeap(), (unsigned)bleHilIngressLastHeap(),
+                  (unsigned)bleHilIngressCount(), (unsigned)bleHilIngressLastBeforeHeap(),
+                  (int)bleHilIngressDirectDelta(), (unsigned)bleHilIngressMaxDrop());
+    Serial.flush();
+}
+
+void AdvUI::hilReactionState()
+{
+    unsigned exact = 0;
+    for (int i = 0; i < g_reactCount; i++)
+        if (g_reacts[i].targetFrom)
+            exact++;
+    const int last = g_reactCount ? ringIdx(g_reactCount - 1, g_reactCount, g_reactNext, kMaxReacts) : -1;
+    // This deliberately has its own on-demand command. Adding another record to
+    // every query retained a native-USB TX buffer until the first archive write,
+    // producing an artificial 2 KiB minimum-heap trough in an otherwise steady run.
+    Serial.printf("@@REACT v=1 react_exact=%u react_ambiguous=%u react_last_target=%08x\n", exact,
+                  (unsigned)(g_reactCount - (int)exact),
+                  last >= 0 ? (unsigned)g_reacts[last].targetFrom : 0U);
+    Serial.flush();
+}
+
+void AdvUI::hilFrameDigest()
+{
+    if (!haveCanvas) {
+        Serial.println("@@FRAME v=1 error=no_canvas");
+        Serial.flush();
+        return;
+    }
+    const uint8_t *buf = static_cast<const uint8_t *>(canvas.getBuffer());
+    const int w = display.width(), h = display.height();
+    const int stride = static_cast<int>(canvas.bufferLength() / h);
+    uint32_t fnv = 2166136261U;
+    bool seen[256] = {};
+    unsigned colors = 0;
+    for (int y = 0; y < h; y++)
+        for (int x = 0; x < w; x++) {
+            const uint8_t value = buf[y * stride + x];
+            fnv = (fnv ^ value) * 16777619U;
+            if (!seen[value]) {
+                seen[value] = true;
+                colors++;
+            }
+        }
+    Serial.printf("@@FRAME v=1 mode=%s w=%d h=%d bytes=%u fnv=%08x colors=%u\n", hilModeName(), w, h,
+                  (unsigned)(w * h), (unsigned)fnv, colors);
+    Serial.flush();
+}
+
+void AdvUI::hilHome()
+{
+    histExit();
+    mode = MODE_CHATS;
+    query[0] = 0;
+    queryLen = 0;
+    sel = 0;
+    scrollTop = 0;
+    msgBuf[0] = 0;
+    msgLen = 0;
+    pendingLat = 0;
+    pendingReplyId = 0;
+    reactSel = -1;
+    reactStrip = false;
+    confirmDel = false;
+    setSection = -1;
+    setSel = 0;
+    setScroll = 0;
+    uiDirty = true;
+    Serial.println("@@ACK home");
+    Serial.flush();
+}
+
+void AdvUI::hilInject(const uint8_t *bytes, uint16_t len)
+{
+    static meshtastic_FromRadio fr;
+    fr = meshtastic_FromRadio_init_default;
+    const bool ok = bytes && len && pb_decode_from_bytes(bytes, len, &meshtastic_FromRadio_msg, &fr);
+    if (ok) {
+        handleFromRadio(fr); // identical ingress to radio/BLE traffic
+        uiDirty = true;
+    }
+    Serial.printf("@@INJECT v=1 ok=%u bytes=%u variant=%u\n", ok ? 1U : 0U, (unsigned)len,
+                  ok ? (unsigned)fr.which_payload_variant : 0U);
+    Serial.flush();
+}
+
+void AdvUI::hilInjectCompanion(const uint8_t *bytes, uint16_t len)
+{
+    const bool ok = bleHilInjectFromRadio(bytes, len);
+    if (ok) {
+        // Companion mesh packets normally cross the fixed pump->UI queue. Drain
+        // it here as runOnce would after a real BLE read, retaining that boundary.
+        BleFrame frame;
+        while (bleNextPacket(&frame)) {
+            meshtastic_FromRadio fr = meshtastic_FromRadio_init_default;
+            if (pb_decode_from_bytes(frame.data, frame.len, &meshtastic_FromRadio_msg, &fr))
+                handleFromRadio(fr);
+        }
+        uiDirty = true;
+    }
+    Serial.printf("@@CINJECT v=1 ok=%u bytes=%u\n", ok ? 1U : 0U, (unsigned)len);
+    Serial.flush();
+}
+
+void AdvUI::hilClearData()
+{
+    histExit();
+    g_msgCount = 0;
+    memset(g_msgs, 0, sizeof(g_msgs));
+    memset(g_msgReply, 0, sizeof(g_msgReply));
+    g_reactCount = 0;
+    g_reactNext = 0;
+    memset(g_reacts, 0, sizeof(g_reacts));
+    g_msgsDirty = false;
+    g_histTotal = -1;
+    g_seen24 = -1;
+    g_seenPendN = 0;
+    g_seenPendNext = 0;
+    hilHistorySeeded = false;
+    FSCom.remove(kMsgPath);
+    FSCom.remove(kHistPath);
+    FSCom.remove(kSeenPath);
+    FSCom.remove(kEpochPath);
+    FSCom.remove(kUiCfgPath);
+    FSCom.remove(kRadioPath);
+    FSCom.remove(kBleAttemptPath);
+    g_uiCfgDirty = false;
+    g_radioCfgDirty = false;
+    bleAttemptArmed = false;
+    bleHilClearState();
+    uiDirty = true;
+    Serial.println("@@ACK clear");
+    Serial.flush();
+}
+
+void AdvUI::hilPersist()
+{
+    const bool saved = saveMsgs();
+    if (saved)
+        g_msgsDirty = false;
+    Serial.printf("@@ACK persist ok=%u messages=%d\n", saved ? 1U : 0U, g_msgCount);
+    Serial.flush();
+}
+
+void AdvUI::hilLoadLegacyStore()
+{
+    // Isolated, synthetic AVS4 record: prove the current loader widens its
+    // target-less ReactionV4 without touching any production-namespaced file.
+    SafeFile f(kMsgPath, true);
+    const uint32_t magic = kMsgMagicV4;
+    const int32_t count = 1;
+    const uint8_t ru = g_ruMode ? 1 : 0, reactCount = 1;
+    Msg message = {};
+    message.from = 0x000BEEF1;
+    message.to = 0x00A11CE1;
+    message.rxTime = 1750000000U;
+    message.id = 0x41565334U;
+    message.status = MSG_IN;
+    message.read = true;
+    utf8CopyValid(message.text, sizeof(message.text), "legacy AVS4 fixture");
+    const uint32_t replyId = 0;
+    ReactionV4 reaction = {};
+    reaction.msgId = message.id;
+    reaction.from = 0x000BEEF2;
+    utf8CopyValid(reaction.label, sizeof(reaction.label), "\U0001F44D");
+    bool ok = f.write((const uint8_t *)&magic, sizeof(magic)) == sizeof(magic) &&
+              f.write((const uint8_t *)&count, sizeof(count)) == sizeof(count) &&
+              f.write((const uint8_t *)&g_favChannels, sizeof(g_favChannels)) == sizeof(g_favChannels) &&
+              f.write((const uint8_t *)&g_utcOffsetMin, sizeof(g_utcOffsetMin)) == sizeof(g_utcOffsetMin) &&
+              f.write((const uint8_t *)&g_screenOffSec, sizeof(g_screenOffSec)) == sizeof(g_screenOffSec) &&
+              f.write(&ru, 1) == 1 && f.write(&reactCount, 1) == 1 &&
+              f.write((const uint8_t *)&message, sizeof(message)) == sizeof(message) &&
+              f.write((const uint8_t *)&replyId, sizeof(replyId)) == sizeof(replyId) &&
+              f.write((const uint8_t *)&reaction, sizeof(reaction)) == sizeof(reaction);
+    const bool closed = f.close();
+    ok = ok && closed;
+    if (ok) {
+        g_msgCount = 0;
+        g_reactCount = 0;
+        g_reactNext = 0;
+        loadMsgs();
+        ok = g_msgCount == 1 && g_reactCount == 1 && g_reacts[0].targetFrom == 0;
+    }
+    Serial.printf("@@LEGACY v=1 ok=%u messages=%d reactions=%d\n", ok ? 1U : 0U, g_msgCount, g_reactCount);
+    Serial.flush();
+}
+
+void AdvUI::hilSeenSaturation()
+{
+    constexpr uint32_t freshId = 0x7FFEF001;
+    const uint32_t now = getTime(false);
+    bool ok = validStoredEpoch(now);
+    FSCom.remove(kSeenPath);
+    String tempPath = String(kSeenPath) + ".tmp";
+    FSCom.remove(tempPath.c_str());
+
+    SafeFile out(kSeenPath, true);
+    ok = ok && out.write((const uint8_t *)&kSeenMagic, sizeof(kSeenMagic)) == sizeof(kSeenMagic);
+    for (int i = 0; ok && i < kSeenCap; i++) {
+        SeenRec rec = {0x60000000U + (uint32_t)i, now - 2U * 86400U - (uint32_t)i};
+        ok = out.write((const uint8_t *)&rec, sizeof(rec)) == sizeof(rec);
+    }
+    const bool committed = out.close();
+    ok = ok && committed;
+
+    if (ok) {
+        g_seenPendN = 0;
+        g_seenPendNext = 0;
+        seenNote(freshId);
+        seenReconcile();
+    }
+
+    bool found = false;
+    size_t records = 0;
+    auto check = FSCom.open(kSeenPath, FILE_O_READ);
+    uint32_t magic = 0;
+    ok = ok && check && check.read((uint8_t *)&magic, sizeof(magic)) == sizeof(magic) && magic == kSeenMagic &&
+         checkedFixedRecordFile(check.size(), sizeof(magic), sizeof(SeenRec), &records) && records == kSeenCap;
+    SeenRec rec;
+    for (size_t i = 0; ok && i < records; i++) {
+        if (check.read((uint8_t *)&rec, sizeof(rec)) != (int)sizeof(rec)) {
+            ok = false;
+            break;
+        }
+        found = found || rec.num == freshId;
+    }
+    if (check)
+        check.close();
+    ok = ok && found;
+    const int active = g_seen24;
+
+    // Leave no synthetic state behind; HIL paths are separate from production,
+    // but each case must still be independently repeatable.
+    FSCom.remove(kSeenPath);
+    FSCom.remove(tempPath.c_str());
+    g_seen24 = -1;
+    g_seenPendN = 0;
+    g_seenPendNext = 0;
+    Serial.printf("@@SEEN v=1 ok=%u records=%u found=%u active=%d\n", ok ? 1U : 0U, (unsigned)records,
+                  found ? 1U : 0U, active);
+    Serial.flush();
+}
+#endif
 
 // Dumps the current canvas (rgb332) as hex over serial, framed by markers, so a host
 // script can rebuild a PNG. Dev-only: gated out of the release build.
@@ -4677,6 +5461,8 @@ void AdvUI::screenshot(const char *name)
         line[p] = 0;
         Serial.println(line);
         Serial.flush(); // one row at a time so nothing is dropped
+        if ((y & 7) == 7)
+            delay(1); // let the idle task feed the watchdog during a full demo dump
     }
     Serial.println("@@END");
     Serial.flush();
@@ -4684,23 +5470,13 @@ void AdvUI::screenshot(const char *name)
     delay(30);
 }
 
-// Renders each screen with sample data and dumps it, then restores all state in RAM
-// (nothing is persisted — saveMsgs is never called, and the message ring is snapshotted
-// and put back). No reboot, so the USB CDC stays up for the host to read.
+// Renders each screen with controlled RAM-only data and then soft-reboots. Nothing is
+// persisted: runOnce cannot reach saveMsgs while this function owns the UI thread, so
+// rebooting transactionally restores the real messages/config without a fragile manual
+// snapshot of every UI field.
 void AdvUI::runDemoDump()
 {
     uint32_t me = myNodeNum();
-
-    static Msg backup[kMaxMsgs];
-    memcpy(backup, g_msgs, sizeof(g_msgs));
-    static Reaction rBackup[kMaxReacts];
-    memcpy(rBackup, g_reacts, sizeof(g_reacts));
-    int brC = g_reactCount, brN = g_reactNext;
-    int bCount = g_msgCount;
-    bool bDirty = g_msgsDirty;
-    Mode bMode = mode;
-    uint32_t bSel = selectedNum;
-    int bChan = selectedChannel, bScroll = chatScroll;
 
     drawSplash();
     screenshot("splash");
@@ -4715,8 +5491,10 @@ void AdvUI::runDemoDump()
     // Controlled demo history: clear the real ring (restored from backup on exit) so
     // screenshots show only our sample data, not real (possibly non-English) chats.
     g_msgCount = 0;
-    uint32_t peer = (filteredCount > 0 && nodeDB) ? nodeDB->getMeshNodeByIndex(filtered[0])->num : me;
-    uint32_t other = (filteredCount > 1 && nodeDB) ? nodeDB->getMeshNodeByIndex(filtered[1])->num : peer + 1;
+    meshtastic_NodeInfoLite *demoNode = filteredCount > 0 ? nodeAt(filtered[0]) : nullptr;
+    uint32_t peer = demoNode ? demoNode->num : me;
+    demoNode = filteredCount > 1 ? nodeAt(filtered[1]) : nullptr;
+    uint32_t other = demoNode ? demoNode->num : peer + 1;
     uint32_t t = 1751720400;
     // a channel conversation from a different node, left unread -> envelope in the chats list
     addMsg(other, NODENUM_BROADCAST, 0, t - 200, true, "Anyone up for a mesh test? \U0001F440", 0, MSG_IN);
@@ -4727,7 +5505,7 @@ void AdvUI::runDemoDump()
     addMsg(me, peer, 0, t + 180, false, "On my way \U0001F642", 2, MSG_SENDING);
     g_reactCount = 0;
     g_reactNext = 0;
-    addReaction(1, peer, "\U0001F44D"); // their tapback on our "Yep, 5/5"
+    addReaction(1, peer, "\U0001F44D", me); // their tapback on our "Yep, 5/5"
     selectedChannel = -1;
     selectedNum = peer;
     chatScroll = 0;
@@ -4775,9 +5553,7 @@ void AdvUI::runDemoDump()
     drawPickList();
     screenshot("utc");
 
-    // WiFi / MQTT pages with sample values (restored right after — never saved)
-    meshtastic_Config_NetworkConfig bnet = config.network;
-    meshtastic_ModuleConfig_MQTTConfig bmqtt = moduleConfig.mqtt;
+    // WiFi / MQTT pages with sample values (RAM-only; rebooted without a save)
     config.network.wifi_enabled = true;
     strcpy(config.network.wifi_ssid, "HomeWiFi");
     strcpy(config.network.wifi_psk, "s3cret-pass");
@@ -4793,8 +5569,6 @@ void AdvUI::runDemoDump()
     netPage = 1;
     drawNetPage();
     screenshot("mqtt");
-    config.network = bnet;
-    moduleConfig.mqtt = bmqtt;
 
     // Unicode showcase: several scripts in one thread (needs the font partition/SD)
     g_msgCount = 0;
@@ -4811,18 +5585,40 @@ void AdvUI::runDemoDump()
     drawNode();
     screenshot("unicode");
 
+    // Worst-case wrapping: 32 long messages produce far more than the 96-line
+    // display ring. This exercises its eviction/anchor path on every release
+    // HIL run and catches both blank frames and watchdog-level render regressions.
+    g_msgCount = 0;
+    g_reactCount = 0;
+    g_reactNext = 0;
+    for (int i = 0; i < kMaxMsgs; i++) {
+        char dense[160];
+        snprintf(dense, sizeof(dense),
+                 "%02d Long wrapped message checks the fixed display ring without moving five kilobytes per line. "
+                 "Cyrillic: проверка. Emoji: \U0001F44D \U0001F525. Tail: abcdefghijklmnopqrstuvwxyz.",
+                 i + 1);
+        addMsg((i & 1) ? me : peer, (i & 1) ? peer : me, 0, t + i, false, dense, 100 + i,
+               (i & 1) ? MSG_DELIVERED : MSG_IN);
+    }
+    selectedChannel = -1;
+    selectedNum = peer;
+    chatScroll = 0;
+    mode = MODE_NODE;
+    drawNode();
+    screenshot("stress");
+
     // Companion screens (sample link state; these globals only matter in companion mode)
-    g_scanCount = 3;
-    g_scanning = false;
-    snprintf(g_scanHits[0].name, sizeof(g_scanHits[0].name), "Heltec-V3 mesh");
-    snprintf(g_scanHits[0].addr, sizeof(g_scanHits[0].addr), "a1:b2:c3:d4:e5:f6");
-    g_scanHits[0].rssi = -52;
-    snprintf(g_scanHits[1].name, sizeof(g_scanHits[1].name), "T-Beam Garden");
-    snprintf(g_scanHits[1].addr, sizeof(g_scanHits[1].addr), "11:22:33:44:55:66");
-    g_scanHits[1].rssi = -74;
-    snprintf(g_scanHits[2].name, sizeof(g_scanHits[2].name), "RAK-Roof");
-    snprintf(g_scanHits[2].addr, sizeof(g_scanHits[2].addr), "aa:bb:cc:dd:ee:ff");
-    g_scanHits[2].rssi = -81;
+    BleScanHit demoHits[3] = {};
+    snprintf(demoHits[0].name, sizeof(demoHits[0].name), "Heltec-V3 mesh");
+    snprintf(demoHits[0].addr, sizeof(demoHits[0].addr), "a1:b2:c3:d4:e5:f6");
+    demoHits[0].rssi = -52;
+    snprintf(demoHits[1].name, sizeof(demoHits[1].name), "T-Beam Garden");
+    snprintf(demoHits[1].addr, sizeof(demoHits[1].addr), "11:22:33:44:55:66");
+    demoHits[1].rssi = -74;
+    snprintf(demoHits[2].name, sizeof(demoHits[2].name), "RAK-Roof");
+    snprintf(demoHits[2].addr, sizeof(demoHits[2].addr), "aa:bb:cc:dd:ee:ff");
+    demoHits[2].rssi = -81;
+    bleSetScanSnapshot(demoHits, 3, false);
     bleSel = 0;
     mode = MODE_BLESCAN;
     drawBleScan();
@@ -4847,14 +5643,13 @@ void AdvUI::runDemoDump()
     screenshot("blink");
     g_linkState = BLE_IDLE;
     g_linkConfigDone = false;
-    g_scanCount = 0;
+    bleSetScanSnapshot(nullptr, 0, false);
     g_peerName[0] = 0;
     pinLen = 0;
     pinBuf[0] = 0;
 
     // --- Usage-scenario frames (a01..) for the animated hero: pick the chat,
     // type, send, get the delivery check, receive the reply, scroll the history.
-    bool bRu = g_ruMode;
     g_ruMode = false;
     g_msgCount = 0;
     g_reactCount = 0;
@@ -4913,24 +5708,12 @@ void AdvUI::runDemoDump()
     chatScroll = 0;
     drawNode();
     screenshot("a13"); // back at the newest message
-    g_ruMode = bRu;
-
     Serial.println("@@DONE");
     Serial.flush();
-
-    memcpy(g_msgs, backup, sizeof(g_msgs)); // put the real conversation ring back
-    memcpy(g_reacts, rBackup, sizeof(g_reacts));
-    g_reactCount = brC;
-    g_reactNext = brN;
-    g_msgCount = bCount;
-    g_msgsDirty = bDirty;
-    mode = bMode;
-    selectedNum = bSel;
-    selectedChannel = bChan;
-    chatScroll = bScroll;
-    rebuildFiltered();
-    while (Serial.available())
-        Serial.read(); // drop any buffered triggers so we don't dump again in a burst
+    delay(200); // give the host time to consume @@DONE before USB resets
+    ESP.restart();
+    for (;;)
+        delay(1000); // ESP.restart() is not expected to return
 }
 #endif
 
@@ -4943,27 +5726,27 @@ void AdvUI::applyLoRa(int target, int value)
     bool devCfg = target == 5 || target == 8; // role / rebroadcast live in DeviceConfig
 
     if (g_radioCompanion) {
-        if (devCfg ? !g_compDeviceValid : !g_compLoraValid)
-            return;
         meshtastic_AdminMessage adm = meshtastic_AdminMessage_init_default;
         adm.which_payload_variant = meshtastic_AdminMessage_set_config_tag;
         if (devCfg) {
             adm.set_config.which_payload_variant = meshtastic_Config_device_tag;
             meshtastic_Config_DeviceConfig &dc = adm.set_config.payload_variant.device;
-            dc = g_compDevice;
+            if (!bleCopyCompDevice(&dc))
+                return;
             if (target == 5)
                 dc.role = (meshtastic_Config_DeviceConfig_Role)value;
             else
                 dc.rebroadcast_mode = (meshtastic_Config_DeviceConfig_RebroadcastMode)value;
             if (sendAdminToNode(adm)) {
-                g_compDevice = dc; // optimistically ours; the reconnect config stream confirms
+                bleUpdateCompDevice(dc); // optimistically ours; the reconnect config stream confirms
                 mode = MODE_BLELINK;
             }
             return;
         }
         adm.set_config.which_payload_variant = meshtastic_Config_lora_tag;
         meshtastic_Config_LoRaConfig &lc = adm.set_config.payload_variant.lora;
-        lc = g_compLora;
+        if (!bleCopyCompLora(&lc))
+            return;
         switch (target) {
         case 0: lc.region = (meshtastic_Config_LoRaConfig_RegionCode)value; break;
         case 6: lc.hop_limit = (uint32_t)value; break;
@@ -4973,8 +5756,7 @@ void AdvUI::applyLoRa(int target, int value)
             lc.modem_preset = (meshtastic_Config_LoRaConfig_ModemPreset)value;
         }
         if (sendAdminToNode(adm)) {
-            g_compLora = lc;
-            g_compPreset = (int)lc.modem_preset;
+            bleUpdateCompLora(lc);
             mode = MODE_BLELINK; // watch the node reboot + the link come back
         }
         return;
@@ -4992,19 +5774,25 @@ void AdvUI::applyLoRa(int target, int value)
     }
     if (nodeDB)
         nodeDB->saveToDisk(SEGMENT_CONFIG);
-    rebootAtMsec = millis() + 1500;
+    rebootAtMsec = armDeadline(millis(), 1500);
     mode = MODE_REBOOT;
 }
 
 // Opens the editor/picker for one flat settings item (see the labels table).
 void AdvUI::openSetting(int item)
 {
+    meshtastic_Config_LoRaConfig compLora = meshtastic_Config_LoRaConfig_init_default;
+    meshtastic_Config_DeviceConfig compDevice = meshtastic_Config_DeviceConfig_init_default;
+    meshtastic_Channel compPrimary = meshtastic_Channel_init_default;
+    const bool compLoraValid = g_radioCompanion && bleCopyCompLora(&compLora);
+    const bool compDeviceValid = g_radioCompanion && bleCopyCompDevice(&compDevice);
+    const bool compPrimaryValid = g_radioCompanion && bleCopyCompChannel(0, &compPrimary);
     if (item <= 1) { // 0 = long name, 1 = short name
         editTarget = item;
         const char *cur;
         if (g_radioCompanion) { // editing the linked node's names (remote admin)
             meshtastic_NodeInfoLite *lm = g_linkMyNode ? nodeByNum(g_linkMyNode) : nullptr;
-            cur = lm ? (item == 1 ? lm->short_name : lm->long_name) : "";
+            cur = lm ? (item == 1 ? nodeShortName(lm) : nodeLongName(lm)) : "";
         } else {
             cur = (item == 1) ? owner.short_name : owner.long_name;
         }
@@ -5014,25 +5802,25 @@ void AdvUI::openSetting(int item)
         nameReturn = MODE_SETTINGS;
         mode = MODE_SETNAME;
     } else if (item == 2) { // Region
-        if (g_radioCompanion && !g_compLoraValid)
+        if (g_radioCompanion && !compLoraValid)
             return; // config not synced yet: nothing to edit against
         pickTarget = 0;
-        pickSel = optIndex(kRegionOpts, kRegionCount, (int)(g_radioCompanion ? g_compLora.region : config.lora.region));
+        pickSel = optIndex(kRegionOpts, kRegionCount, (int)(g_radioCompanion ? compLora.region : config.lora.region));
         pickScroll = 0;
         mode = MODE_PICKLIST;
     } else if (item == 3) { // Preset
-        if (g_radioCompanion && !g_compLoraValid)
+        if (g_radioCompanion && !compLoraValid)
             return;
         pickTarget = 1;
         pickSel =
-            optIndex(kPresetOpts, kPresetCount, (int)(g_radioCompanion ? g_compLora.modem_preset : config.lora.modem_preset));
+            optIndex(kPresetOpts, kPresetCount, (int)(g_radioCompanion ? compLora.modem_preset : config.lora.modem_preset));
         pickScroll = 0;
         mode = MODE_PICKLIST;
     } else if (item == 4) { // Frequency (MHz)
-        if (g_radioCompanion && !g_compLoraValid)
+        if (g_radioCompanion && !compLoraValid)
             return;
         editTarget = 2;
-        float ovr = g_radioCompanion ? g_compLora.override_frequency : config.lora.override_frequency;
+        float ovr = g_radioCompanion ? compLora.override_frequency : config.lora.override_frequency;
         if (ovr > 0)
             snprintf(nameBuf, sizeof(nameBuf), "%.3f", (double)ovr);
         else
@@ -5041,42 +5829,42 @@ void AdvUI::openSetting(int item)
         nameReturn = MODE_SETTINGS;
         mode = MODE_SETNAME;
     } else if (item == 5) { // Channel name
-        if (g_radioCompanion && !g_compChans[0].has_settings)
+        if (g_radioCompanion && (!compPrimaryValid || !compPrimary.has_settings))
             return; // channel not synced yet: nothing to round-trip
         editTarget = 3;
-        strncpy(nameBuf, g_radioCompanion ? g_compChans[0].settings.name : channels.getByIndex(0).settings.name,
+        strncpy(nameBuf, g_radioCompanion ? compPrimary.settings.name : channels.getByIndex(0).settings.name,
                 sizeof(nameBuf));
         nameBuf[sizeof(nameBuf) - 1] = 0;
         nameLen = strlen(nameBuf);
         nameReturn = MODE_SETTINGS;
         mode = MODE_SETNAME;
     } else if (item == 6) { // Role
-        if (g_radioCompanion && !g_compDeviceValid)
+        if (g_radioCompanion && !compDeviceValid)
             return;
         pickTarget = 5;
-        pickSel = optIndex(kRoleOpts2, kRoleCount, (int)(g_radioCompanion ? g_compDevice.role : config.device.role));
+        pickSel = optIndex(kRoleOpts2, kRoleCount, (int)(g_radioCompanion ? compDevice.role : config.device.role));
         pickScroll = 0;
         mode = MODE_PICKLIST;
     } else if (item == 7) { // Hop limit
-        if (g_radioCompanion && !g_compLoraValid)
+        if (g_radioCompanion && !compLoraValid)
             return;
         pickTarget = 6;
-        pickSel = optIndex(kHopOpts, kHopCount, (int)(g_radioCompanion ? g_compLora.hop_limit : config.lora.hop_limit));
+        pickSel = optIndex(kHopOpts, kHopCount, (int)(g_radioCompanion ? compLora.hop_limit : config.lora.hop_limit));
         pickScroll = 0;
         mode = MODE_PICKLIST;
     } else if (item == 8) { // TX power
-        if (g_radioCompanion && !g_compLoraValid)
+        if (g_radioCompanion && !compLoraValid)
             return;
         pickTarget = 7;
-        pickSel = optIndex(kPowerOpts, kPowerCount, (int)(g_radioCompanion ? g_compLora.tx_power : config.lora.tx_power));
+        pickSel = optIndex(kPowerOpts, kPowerCount, (int)(g_radioCompanion ? compLora.tx_power : config.lora.tx_power));
         pickScroll = 0;
         mode = MODE_PICKLIST;
     } else if (item == 9) { // Rebroadcast mode
-        if (g_radioCompanion && !g_compDeviceValid)
+        if (g_radioCompanion && !compDeviceValid)
             return;
         pickTarget = 8;
         pickSel = optIndex(kRebroadOpts, kRebroadCount,
-                           (int)(g_radioCompanion ? g_compDevice.rebroadcast_mode : config.device.rebroadcast_mode));
+                           (int)(g_radioCompanion ? compDevice.rebroadcast_mode : config.device.rebroadcast_mode));
         pickScroll = 0;
         mode = MODE_PICKLIST;
     } else if (item == 10) { // UTC offset -> city/offset picker
@@ -5163,7 +5951,7 @@ void AdvUI::handleKey(char ch)
     if (c == AdvKeyboard::kLang) { // Fn+L: toggle transliterated Cyrillic input
         g_ruMode = !g_ruMode;
         pendingLat = 0;
-        g_msgsDirty = true; // the layout choice is persisted with the message file
+        markMsgsDirty(); // the layout choice is persisted with the message file
         return;
     }
 
@@ -5175,9 +5963,9 @@ void AdvUI::handleKey(char ch)
         if (esc) {
             mode = nameReturn;
         } else if (enter) {
-            // A blank channel name is legitimate (it means "the preset default"), so the
-            // channel editor applies even when emptied; the other editors need text.
-            bool rebooting = (nameLen || editTarget == 3) && applyName();
+            // Blank channel/frequency values are legitimate: the preset supplies
+            // the channel name and a zero override restores automatic frequency.
+            bool rebooting = (nameLen || editTarget == 2 || editTarget == 3) && applyName();
             if (!rebooting)
                 mode = nameReturn;
         } else if (bksp) {
@@ -5262,7 +6050,7 @@ void AdvUI::handleKey(char ch)
                 config.has_network = true; // ensure the optional submessages serialise
                 moduleConfig.has_mqtt = true;
                 nodeDB->saveToDisk(SEGMENT_CONFIG | SEGMENT_MODULECONFIG);
-                rebootAtMsec = millis() + 1500;
+                rebootAtMsec = armDeadline(millis(), 1500);
                 mode = MODE_REBOOT;
             } else {
                 mode = MODE_SETTINGS;
@@ -5290,6 +6078,8 @@ void AdvUI::handleKey(char ch)
     }
 
     if (mode == MODE_BLESCAN) {
+        BleScanHit hit;
+        const bool haveHit = bleScanHit(bleSel, &hit);
         if (esc) {
             bleScanStop();
             setSel = 0;
@@ -5298,17 +6088,16 @@ void AdvUI::handleKey(char ch)
             if (bleSel > 0)
                 bleSel--;
         } else if (down) {
-            if (bleSel < g_scanCount - 1)
+            BleScanHit next;
+            if (bleScanHit(bleSel + 1, &next))
                 bleSel++;
         } else if (enter) {
-            if (bleSel < g_scanCount) { // remember the node and connect to it
-                snprintf(g_peerAddr, sizeof(g_peerAddr), "%s", g_scanHits[bleSel].addr);
-                snprintf(g_peerName, sizeof(g_peerName), "%s",
-                         g_scanHits[bleSel].name[0] ? g_scanHits[bleSel].name : g_scanHits[bleSel].addr);
-                g_peerType = g_scanHits[bleSel].type;
-                saveRadioCfg();
-                bleAttemptMark();
-                bleAttemptArmed = true;
+            if (haveHit) { // remember the node and connect to it
+                snprintf(g_peerAddr, sizeof(g_peerAddr), "%s", hit.addr);
+                snprintf(g_peerName, sizeof(g_peerName), "%s", hit.name[0] ? hit.name : hit.addr);
+                g_peerType = hit.type;
+                persistRadioCfg();
+                bleAttemptArmed = bleAttemptMark();
                 bleConnectAsync(g_peerAddr, g_peerType);
                 mode = MODE_BLELINK;
             }
@@ -5344,16 +6133,18 @@ void AdvUI::handleKey(char ch)
             mode = MODE_CHATS;
         } else if (c == 'r' || c == 'R') {
             if (g_linkState != BLE_CONNECTING && g_linkState != BLE_PAIRING) {
-                bleAttemptMark();
-                bleAttemptArmed = true;
+                bleAttemptArmed = bleAttemptMark();
                 bleConnectAsync(g_peerAddr, g_peerType);
             }
         } else if (c == 'f' || c == 'F') { // forget the node -> back to the scan
-            bleDisconnect();
+            if (g_linkState == BLE_CONNECTING || g_linkState == BLE_PAIRING)
+                return; // let the single transport worker finish before replacing it with a scan
+            if (!bleDisconnect())
+                return;
             g_peerAddr[0] = 0;
             g_peerName[0] = 0;
             g_peerType = 0;
-            saveRadioCfg();
+            persistRadioCfg();
             bleSel = 0;
             mode = MODE_BLESCAN;
             bleScanStart();
@@ -5374,15 +6165,15 @@ void AdvUI::handleKey(char ch)
         } else if (enter) {
             if (pickTarget == 10) { // node-list sort: applied live, own tiny file
                 g_nodeSort = (uint8_t)kSortOpts[pickSel].value;
-                saveUiCfg();
+                persistUiCfg();
                 mode = MODE_SETTINGS;
             } else if (pickTarget == 11) { // long vs short names: live, same tiny file
                 g_nameShort = (uint8_t)kNameOpts[pickSel].value;
-                saveUiCfg();
+                persistUiCfg();
                 mode = MODE_SETTINGS;
             } else if (pickTarget == 13) { // second screen: off, or mounted this way round
                 g_extRot = (uint8_t)kExtOpts[pickSel].value;
-                saveUiCfg();
+                persistUiCfg();
                 if (!g_extRot) {
                     extStop();
                 } else if (g_ext) { // already up: just turn the picture round
@@ -5401,19 +6192,27 @@ void AdvUI::handleKey(char ch)
                 mode = MODE_SETTINGS;
             } else if (pickTarget == 4) { // screen auto-off: applied live, persisted with msgs
                 g_screenOffSec = kScreenOpts[pickSel].value;
-                g_msgsDirty = true;
+                markMsgsDirty();
                 mode = MODE_SETTINGS;
             } else if (pickTarget == 2) { // UTC offset: applied live, persisted with msgs
                 g_utcOffsetMin = kUtcOpts[pickSel].value;
-                g_msgsDirty = true;
+                markMsgsDirty();
                 mode = MODE_SETTINGS;
             } else if (pickTarget == 3) { // radio backend: persist + reboot into the new role
                 bool comp = kRadioOpts[pickSel].value == 1;
                 if (comp != g_radioCompanion) {
+                    const bool oldCompanion = g_radioCompanion;
                     g_radioCompanion = comp;
-                    saveRadioCfg();
-                    rebootAtMsec = millis() + 1500;
-                    mode = MODE_REBOOT;
+                    if (persistRadioCfg()) {
+                        rebootAtMsec = armDeadline(millis(), 1500);
+                        mode = MODE_REBOOT;
+                    } else {
+                        // The old atomic file is still authoritative. Do not
+                        // reboot into a role the user did not actually persist.
+                        g_radioCompanion = oldCompanion;
+                        g_radioCfgDirty = false;
+                        mode = MODE_SETTINGS;
+                    }
                 } else if (comp) { // already companion: open the link status (F there re-scans)
                     if (g_peerAddr[0]) {
                         mode = MODE_BLELINK;
@@ -5432,7 +6231,7 @@ void AdvUI::handleKey(char ch)
                 config.has_position = true;
                 if (nodeDB)
                     nodeDB->saveToDisk(SEGMENT_CONFIG);
-                rebootAtMsec = millis() + 1500;
+                rebootAtMsec = armDeadline(millis(), 1500);
                 mode = MODE_REBOOT;
             } else {
                 // Region/Preset/Role/Hops/Power/Rebroadcast: radio config, needs a
@@ -5501,9 +6300,10 @@ void AdvUI::handleKey(char ch)
         if (esc || bksp) {
             histExit(); // one press leaves the chat from anywhere, history included
             if (g_msgsDirty) { // flush read-state now — a reset right after would lose it
-                saveMsgs();
-                g_msgsDirty = false;
-                g_lastSaveMs = millis();
+                if (saveMsgs()) {
+                    g_msgsDirty = false;
+                    g_lastMsgChangeMs = millis();
+                }
             }
             mode = nodeReturn;
         } else if (up) {
@@ -5547,8 +6347,9 @@ void AdvUI::handleKey(char ch)
                         m.id = id; // the new ACK will find it by this id
                         m.status = MSG_SENDING;
                         m.err = 0;
-                        m.rxTime = getTime(false);
-                        g_msgsDirty = true;
+                        const uint32_t now = getTime(false);
+                        m.rxTime = validStoredEpoch(now) ? now : millis() / 1000 + 1;
+                        markMsgsDirty();
                     }
                     break;
                 }
@@ -5679,7 +6480,7 @@ void AdvUI::handleKey(char ch)
                         g_favChannels |= (1u << c.ch);
                     else
                         g_favChannels &= ~(1u << c.ch);
-                    g_msgsDirty = true;
+                    markMsgsDirty();
                 } else {
                     favNode(c.node, left);
                 }
@@ -5813,7 +6614,16 @@ int32_t AdvUI::runOnce()
         initHardware();
         inited = true;
     }
+#ifdef ADVUI_HIL
+    static bool hilAnnounced = false;
+    if (!hilAnnounced) {
+        hilAnnounced = true;
+        Serial.printf("@@READY hil=1 protocol=2 version=%s engine=%s\n", ADVUI_VERSION, optstr(APP_VERSION_SHORT));
+        hilState();
+    }
+#endif
 
+#ifndef ADVUI_HIL
     { // Heap watchdog: log ONLY on a fresh all-time low (>=1 KB below the last), so a
       // stable device stays silent — no periodic spam, nothing to grow an SD log. A
       // leak shows as a stepping descent; steady operation prints nothing after warmup.
@@ -5825,6 +6635,7 @@ int32_t AdvUI::runOnce()
                      (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_8BIT));
         }
     }
+#endif
 
     { // Sample the honest (off-charge) battery % every 30 s and persist it when it
       // moves, so the header can show a real figure while USB hides the true charge.
@@ -5839,7 +6650,7 @@ int32_t AdvUI::runOnce()
             bool trustworthy = !batteryCharging() || (g_battRest >= 0 && p < g_battRest);
             if (trustworthy && p >= 0 && p <= 100 && p != g_battRest) {
                 g_battRest = p;
-                saveUiCfg();
+                persistUiCfg();
             }
         }
     }
@@ -5857,7 +6668,7 @@ int32_t AdvUI::runOnce()
       // real = now - (uptime_now - uptime_then). One-shot per boot.
         static bool clockSeen = false;
         uint32_t now = getTime(false);
-        if (!clockSeen && now >= kValidEpoch) {
+        if (!clockSeen && validStoredEpoch(now)) {
             clockSeen = true;
             uint32_t up = millis() / 1000;
             int fixed = 0;
@@ -5865,7 +6676,7 @@ int32_t AdvUI::runOnce()
                 uint32_t rt = g_msgs[i].rxTime;
                 if (rt && rt < kValidEpoch) {
                     g_msgs[i].rxTime = now - (up > rt ? up - rt : 0);
-                    g_msgsDirty = true;
+                    markMsgsDirty();
                     uiDirty = true;
                     fixed++;
                 }
@@ -5879,11 +6690,48 @@ int32_t AdvUI::runOnce()
     // 'L' = live screenshot, 'K'+byte = inject a key ('^'=ESC '~'=ENTER
     // 'U'/'D'/'<'/'>'=arrows '!'=long-ESC, anything else = the char itself).
     static bool shotPendingKey = false;
+#ifdef ADVUI_HIL
+    // `I` + uint16 little-endian length + raw FromRadio protobuf. The persistent
+    // state lets USB deliver a frame over multiple UI ticks without interpreting
+    // payload bytes as commands. kBleFrameMax also bounds companion ingress.
+    static uint8_t hilInjectPhase = 0;
+    static bool hilInjectToCompanion = false;
+    static uint8_t hilInjectLenLo = 0;
+    static uint16_t hilInjectExpected = 0, hilInjectUsed = 0;
+    static uint8_t hilInjectBuf[kBleFrameMax];
+#endif
     while (Serial.available()) {
         int sc = Serial.read();
         if (!screenOn)
             screenWake(); // remote session must survive the screen auto-off: the
                           // render (and so the 'L' dump) is gated on a lit screen
+#ifdef ADVUI_HIL
+        if (hilInjectPhase) {
+            if (hilInjectPhase == 1) {
+                hilInjectLenLo = (uint8_t)sc;
+                hilInjectPhase = 2;
+            } else if (hilInjectPhase == 2) {
+                hilInjectExpected = (uint16_t)(hilInjectLenLo | ((uint16_t)(uint8_t)sc << 8));
+                hilInjectUsed = 0;
+                if (!hilInjectExpected || hilInjectExpected > sizeof(hilInjectBuf)) {
+                    Serial.printf("@@INJECT v=1 ok=0 error=size bytes=%u\n", (unsigned)hilInjectExpected);
+                    Serial.flush();
+                    hilInjectPhase = 0;
+                } else {
+                    hilInjectPhase = 3;
+                }
+            } else {
+                hilInjectBuf[hilInjectUsed++] = (uint8_t)sc;
+                if (hilInjectUsed == hilInjectExpected) {
+                    if (hilInjectToCompanion)
+                        this->hilInjectCompanion(hilInjectBuf, hilInjectExpected);
+                    else
+                        hilInject(hilInjectBuf, hilInjectExpected);
+                    hilInjectPhase = 0;
+                }
+            }
+        } else
+#endif
         if (shotPendingKey) {
             shotPendingKey = false;
             unsigned char k = (unsigned char)sc;
@@ -5913,30 +6761,84 @@ int32_t AdvUI::runOnce()
         else if (sc == 'G') { // ghost DM: SMP emoji + a 191-byte Cyrillic text (render/width tests)
             addMsg(0x000BEEF1, myNodeNum(), 0, 0, true, "SMP: \U0001F480\U0001F923\U0001F970 sel: ❤️ ok", 777,
                    MSG_IN);
-            addReaction(777, 0x000BEEF1, "\U0001F480");
+            addReaction(777, 0x000BEEF1, "\U0001F480", 0x000BEEF1);
             addMsg(0x000BEEF1, myNodeNum(), 0, 0, true,
                    "Погода огонь, как и пробки на каде. Кому с юга на север гоу по ЗСД. От зуздальского уже час до "
                    "мурино стоим.",
                    778, MSG_IN);
             uiDirty = true;
         } else if (sc == 'H') { // 48 numbered ghost DMs: overflows the ring into the archive
+#ifdef ADVUI_HIL
+            if (!hilHistorySeeded) {
+#endif
             char t[40];
             for (int i = 1; i <= 48; i++) {
                 snprintf(t, sizeof(t), "hist test %d/48", i);
                 addMsg(0x000BEEF1, myNodeNum(), 0, 0, i > 40, t, 7000 + i, MSG_IN);
             }
             uiDirty = true;
+#ifdef ADVUI_HIL
+                hilHistorySeeded = true;
+            }
+            Serial.println("@@ACK history");
+            Serial.flush();
+#endif
+#ifdef ADVUI_HIL
+        } else if (sc == 'I') {
+            hilInjectToCompanion = false;
+            hilInjectPhase = 1;
+            hilInjectExpected = hilInjectUsed = 0;
+        } else if (sc == 'J') {
+            hilInjectToCompanion = true;
+            hilInjectPhase = 1;
+            hilInjectExpected = hilInjectUsed = 0;
+        } else if (sc == 'P') {
+            hilPersist();
+        } else if (sc == 'M') {
+            hilLoadLegacyStore();
+        } else if (sc == 'V') {
+            hilSeenSaturation();
+        } else if (sc == 'E') {
+            hilClearData();
+        } else if (sc == 'B') {
+            Serial.println("@@ACK reboot");
+            Serial.flush();
+            delay(200);
+            ESP.restart();
+        } else if (sc == 'Q') {
+            hilState();
+        } else if (sc == 'R') {
+            hilReactionState();
+        } else if (sc == 'Y') {
+            const uint32_t before = ESP.getFreeHeap();
+            bleHilReleaseState();
+            const uint32_t after = ESP.getFreeHeap();
+            Serial.printf("@@BRELEASE v=1 ok=%u before=%u after=%u freed=%u\n", after > before ? 1U : 0U,
+                          (unsigned)before, (unsigned)after, after > before ? (unsigned)(after - before) : 0U);
+            Serial.flush();
+        } else if (sc == 'C') {
+            hilDigestPending = true;
+            uiDirty = true; // digest the frame for the current state after a fresh render
+        } else if (sc == 'X') {
+            hilHome();
+#endif
         }
+#ifdef ADVUI_HIL
+        // One complete request per UI tick. A host that immediately follows each
+        // response with another query must not starve keyboard polling, splash
+        // expiry, mesh pumping or rendering inside this Serial.available() loop.
+        if (!shotPendingKey && !hilInjectPhase)
+            break;
+#endif
     }
 #endif
 
     if (g_radioCompanion) { // companion: mesh packets arrive from the BLE pump's ring
-        uint8_t pbuf[512];
-        uint16_t plen;
+        BleFrame frame;
         static meshtastic_FromRadio fr; // large struct: keep off the stack
-        while (bleNextPacket(pbuf, &plen)) {
+        while (bleNextPacket(&frame)) {
             fr = meshtastic_FromRadio_init_default;
-            if (pb_decode_from_bytes(pbuf, plen, &meshtastic_FromRadio_msg, &fr)) {
+            if (pb_decode_from_bytes(frame.data, frame.len, &meshtastic_FromRadio_msg, &fr)) {
                 handleFromRadio(fr); // same pipeline: messages, reactions, delivery ACKs
                 uiDirty = true;
             }
@@ -5954,14 +6856,16 @@ int32_t AdvUI::runOnce()
     }
 #endif
 #ifdef HAS_NEOPIXEL
-    if (g_ledOffMs && millis() > g_ledOffMs) { // clear the notification flash
-        rgbLedWrite(NEOPIXEL_DATA, 0, 0, 0);
+    if (deadlineReached(millis(), g_ledOffMs)) { // clear the notification flash, including across millis() rollover
+        setLedRgb(0, 0, 0);
         g_ledOffMs = 0;
     }
 #endif
 
-    kb.setNavKeys(mode != MODE_SETNAME && mode != MODE_COMPOSE); // symbols while typing, arrows otherwise
-    kb.trigger();
+    if (!kbMissing) {
+        kb.setNavKeys(mode != MODE_SETNAME && mode != MODE_COMPOSE); // symbols while typing, arrows otherwise
+        kb.trigger();
+    }
     bool keyDuringSplash = false;
     bool wakeOnly = !screenOn; // keys pressed on a dark screen only wake it
     bool sawKey = false;
@@ -5982,15 +6886,23 @@ int32_t AdvUI::runOnce()
     }
     if (wakeOnly && sawKey)
         screenWake();
-    kb.clearInt(); // re-arm the TCA8418 interrupt, else it stops reporting after the first event
+    if (!kbMissing)
+        kb.clearInt(); // re-arm the TCA8418 interrupt, else it stops reporting after the first event
 
     if (!splashDone && (keyDuringSplash || millis() - bootMs > 2000))
         splashDone = true;
 
     // Announce ourselves early so neighbours see us right away — stock waits ~30s.
     if (splashDone && !announced && nodeInfoModule) {
+#ifdef ADVUI_HIL
+        // The HIL build is radio-silent by contract. The compile-time
+        // USERPREFS_LORA_TX_DISABLED guard also blocks every engine-owned
+        // periodic send; skip this eager ADV announcement before it is queued.
+        announced = true;
+#else
         nodeInfoModule->sendOurNodeInfo(NODENUM_BROADCAST, false);
         announced = true;
+#endif
     }
 
     // Nameless-node healing. On a busy mesh the periodic NodeInfo broadcast
@@ -6009,7 +6921,7 @@ int32_t AdvUI::runOnce()
             uint32_t me = myNodeNum();
             for (int i = 0; i < (int)nodeDB->getNumMeshNodes(); i++) {
                 meshtastic_NodeInfoLite *n = nodeDB->getMeshNodeByIndex(i);
-                if (!n || n->num == me || n->short_name[0] || n->long_name[0])
+                if (!n || n->num == me || nodeHasName(n))
                     continue;
                 if (sinceLastSeen(n) > 2 * 60 * 60)
                     continue; // not around: don't spend airtime on it
@@ -6051,9 +6963,7 @@ int32_t AdvUI::runOnce()
     if (splashDone && g_radioCompanion && !companionEntered) {
         companionEntered = true;
         bleSel = 0;
-        if (g_peerAddr[0] && !bleAttemptPending()) {
-            bleAttemptMark();
-            bleAttemptArmed = true;
+        if (g_peerAddr[0] && !bleAttemptPending() && (bleAttemptArmed = bleAttemptMark())) {
             bleConnectAsync(g_peerAddr, g_peerType);
             mode = MODE_BLELINK;
         } else {
@@ -6089,9 +6999,9 @@ int32_t AdvUI::runOnce()
     if (g_radioCompanion && (g_linkState == BLE_FAILED || g_linkState == BLE_IDLE) && g_peerAddr[0] &&
         companionEntered && mode != MODE_BLESCAN && mode != MODE_BLEPIN && millis() - bleRetryMs > 7000) {
         bleRetryMs = millis();
-        bleAttemptMark();
-        bleAttemptArmed = true;
-        bleConnectAsync(g_peerAddr, g_peerType);
+        bleAttemptArmed = bleAttemptMark();
+        if (bleAttemptArmed)
+            bleConnectAsync(g_peerAddr, g_peerType);
     }
 
     // A phone is pairing with us (local mode): pop the passkey screen, waking the
@@ -6116,11 +7026,26 @@ int32_t AdvUI::runOnce()
     }
     blePump(); // drain the companion link's FromRadio stream (no-op when not connected)
 
-    // Persist the conversation, debounced, so we don't hammer the flash.
-    if (g_msgsDirty && millis() - g_lastSaveMs > 3000) {
-        saveMsgs();
-        g_msgsDirty = false;
-        g_lastSaveMs = millis();
+    // Atomic config writes can fail transiently (full/torn LittleFS, interrupted
+    // readback). Keep the in-RAM choice dirty and retry at a bounded cadence;
+    // otherwise a successful-looking setting silently rolls back after reboot.
+    if (g_uiCfgDirty && millis() - g_lastUiCfgSaveMs > 3000)
+        persistUiCfg();
+    if (g_radioCfgDirty && millis() - g_lastRadioCfgSaveMs > 3000)
+        persistRadioCfg();
+
+    // Persist after three quiet seconds. The previous fixed-cadence throttle
+    // could launch a full atomic ring rewrite in the middle of a receive burst,
+    // overlapping LittleFS archive appends and briefly exhausting this
+    // no-PSRAM board's heap. A new mutation restarts the debounce. Under a
+    // continuous stream, evictions are already durable in the append-only
+    // archive and only the bounded 32-record live tail waits for a quiet gap.
+    // Explicit thread exit and HIL persist flush synchronously when required.
+    const uint32_t saveNow = millis();
+    if (g_msgsDirty && dirtyWriteDue(saveNow, g_lastMsgChangeMs, 3000)) {
+        if (saveMsgs())
+            g_msgsDirty = false;
+        g_lastMsgChangeMs = saveNow; // bound retries after a transient failure
     }
 
     // Screen auto-off: no input for the configured time cuts the display rail.
@@ -6193,6 +7118,12 @@ int32_t AdvUI::runOnce()
         shotLive = false;
         screenshot("live"); // whatever just rendered — real state, not demo data
     }
+#ifdef ADVUI_HIL
+    if (hilDigestPending) {
+        hilDigestPending = false;
+        hilFrameDigest();
+    }
+#endif
 #endif
 
 #ifdef HAS_I2S
@@ -6220,12 +7151,20 @@ class AdvRxModule : public MeshModule
   protected:
     bool wantPacket(const meshtastic_MeshPacket *p) override
     {
+#ifdef ADVUI_HIL
+        // Deterministic release tests consume only host-injected FromRadio
+        // frames. Live RF may still be received by the embedded engine, but it
+        // must not race the isolated ADV message/history assertions.
+        (void)p;
+        return false;
+#else
         if (g_radioCompanion) // companion feeds the UI over BLE; the local engine is idle
             return false;
         if (p->which_payload_variant != meshtastic_MeshPacket_decoded_tag)
             return false;
         return p->decoded.portnum == meshtastic_PortNum_TEXT_MESSAGE_APP ||
                (p->decoded.portnum == meshtastic_PortNum_ROUTING_APP && p->decoded.request_id);
+#endif
     }
 
     ProcessMessage handleReceived(const meshtastic_MeshPacket &mp) override

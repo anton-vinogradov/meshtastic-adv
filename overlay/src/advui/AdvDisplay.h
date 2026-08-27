@@ -4,7 +4,9 @@
 // stock graphics::Screen (compiled out via MESHTASTIC_EXCLUDE_SCREEN).
 // Pins from variants/esp32s3/m5stack_cardputer_adv/variant.h.
 
+#ifndef LGFX_USE_V1
 #define LGFX_USE_V1
+#endif
 #include <LovyanGFX.hpp>
 
 namespace advui

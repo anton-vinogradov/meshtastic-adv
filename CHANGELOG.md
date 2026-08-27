@@ -5,7 +5,17 @@ release notes remain available on the [GitHub Releases page](https://github.com/
 
 ## [Unreleased]
 
-No user-visible changes are pending after 1.0.3.
+No user-visible changes are pending after 1.0.4.
+
+## [1.0.4] - 2026-08-28
+
+### Changed
+
+- Stable GitHub Releases now publish the reviewed, version-specific section from
+  `CHANGELOG.md` instead of an empty generated-notes page containing only a
+  comparison link. The notes are staged from the exact tag before the installer
+  checkout moves to `main`, and a safe release rerun repairs both assets and
+  notes.
 
 ## [1.0.3] - 2026-08-28
 
@@ -109,6 +119,7 @@ The 1.0 release line delivered the following product and release-engineering sco
   cannot reuse stale output, and prereleases cannot enter stable distribution
   channels.
 
-[Unreleased]: https://github.com/anton-vinogradov/meshtastic-adv/compare/v1.0.3...HEAD
+[Unreleased]: https://github.com/anton-vinogradov/meshtastic-adv/compare/v1.0.4...HEAD
+[1.0.4]: https://github.com/anton-vinogradov/meshtastic-adv/compare/v1.0.3...v1.0.4
 [1.0.3]: https://github.com/anton-vinogradov/meshtastic-adv/compare/v1.0.2...v1.0.3
 [1.0.2]: https://github.com/anton-vinogradov/meshtastic-adv/compare/v0.5.2...v1.0.2

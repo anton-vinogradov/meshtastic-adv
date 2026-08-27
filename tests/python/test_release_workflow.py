@@ -103,6 +103,10 @@ class ReleaseWorkflowTests(unittest.TestCase):
         self.assertIn("cp scripts/mkm5burner.sh /tmp/mkm5burner.sh", block[:checkout_main])
         self.assertIn("cp scripts/verify_web_publish.py /tmp/verify_web_publish.py", block[:checkout_main])
         self.assertIn("cp requirements/release.txt /tmp/release-requirements.txt", block[:checkout_main])
+        self.assertIn(
+            'python scripts/release_notes.py "$GITHUB_REF_NAME" --output /tmp/release-notes.md',
+            block[:checkout_main],
+        )
         self.assertIn("pip install --require-hashes -r /tmp/release-requirements.txt", block[:checkout_main])
         self.assertIn('echo "engine=$engine" >> "$GITHUB_OUTPUT"', block[:checkout_main])
         self.assertIn('python scripts/release_tag.py "$GITHUB_REF_NAME" >> "$GITHUB_OUTPUT"', block[:checkout_main])
@@ -115,6 +119,18 @@ class ReleaseWorkflowTests(unittest.TestCase):
         self.assertIn("--font /tmp/unifont.bin", block[checkout_main:publish])
         self.assertIn("MESHTASTIC_FONT=/tmp/unifont.bin", block[publish:])
         self.assertIn("python /tmp/m5burner_publish.py", block[publish:])
+
+    def test_stable_release_uses_exact_tag_changelog_notes_and_reruns_repair_them(self):
+        block = job("release")
+        staging = block.index("- name: Stage exact tagged release inputs")
+        checkout_main = block.index("git checkout -B main origin/main")
+        publish = block.index("- name: Create the GitHub release")
+        self.assertLess(staging, checkout_main)
+        self.assertLess(checkout_main, publish)
+        self.assertIn("notes_flags=(--generate-notes)", block[publish:])
+        self.assertIn("notes_flags=(--notes-file /tmp/release-notes.md)", block[publish:])
+        self.assertIn('gh release edit "${GITHUB_REF_NAME}" --notes-file /tmp/release-notes.md', block[publish:])
+        self.assertNotIn("--generate-notes \\", block[publish:])
 
     def test_prerelease_cannot_replace_stable_distribution_channels(self):
         block = job("release")

@@ -214,6 +214,9 @@ jobs:
           cp scripts/m5burner_publish.py /tmp/m5burner_publish.py
           cp scripts/verify_web_publish.py /tmp/verify_web_publish.py
           cp requirements/release.txt /tmp/release-requirements.txt
+          # Stable notes are rendered before checking out main, so a concurrent
+          # docs commit cannot change what the exact tag says was released.
+          python scripts/release_notes.py "$GITHUB_REF_NAME" --output /tmp/release-notes.md
           engine=$(python -c 'import configparser; c=configparser.ConfigParser(); c.read("firmware/version.properties"); v=c["VERSION"]; print("{}.{}.{}".format(v["major"], v["minor"], v["build"]))')
           echo "engine=$engine" >> "$GITHUB_OUTPUT"
 
@@ -270,6 +273,10 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           release_flags=(--verify-tag)
+          notes_flags=(--generate-notes)
+          if [ -f /tmp/release-notes.md ]; then
+            notes_flags=(--notes-file /tmp/release-notes.md)
+          fi
           if [ "${{ steps.tagged.outputs.prerelease }}" = true ]; then
             release_flags+=(--prerelease --latest=false)
           else
@@ -286,10 +293,14 @@ jobs:
             bash /tmp/mkm5burner.sh "${{ steps.tagged.outputs.version }}"
           if gh release view "${GITHUB_REF_NAME}" >/dev/null 2>&1; then
             gh release upload "${GITHUB_REF_NAME}" "meshtastic-adv-${GITHUB_REF_NAME}.factory.bin" /tmp/unifont.bin meshtastic-adv-cardputer-adv-merged.bin --clobber
+            if [ -f /tmp/release-notes.md ]; then
+              # A safe rerun must repair stale notes as well as stale assets.
+              gh release edit "${GITHUB_REF_NAME}" --notes-file /tmp/release-notes.md
+            fi
           else
             gh release create "${GITHUB_REF_NAME}" \
               --title "Meshtastic ADV ${GITHUB_REF_NAME}" \
-              --generate-notes \
+              "${notes_flags[@]}" \
               "${release_flags[@]}" \
               "meshtastic-adv-${GITHUB_REF_NAME}.factory.bin" /tmp/unifont.bin meshtastic-adv-cardputer-adv-merged.bin
           fi

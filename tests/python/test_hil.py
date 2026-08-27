@@ -264,6 +264,23 @@ class HilRunnerTests(unittest.TestCase):
                 with self.assertRaisesRegex(hil.HilError, "was not stable"):
                     hil.capture_config_fingerprint({}, Path(directory), "after")
 
+    def test_config_fingerprint_ignores_only_live_top_level_location(self):
+        first = b"""channel_url: secret\nconfig:\n  lora:\n    region: US\nlocation:\n  lat: 1.0\n  lon: 2.0\n  alt: 3\nmodule_config:\n  mqtt:\n    enabled: false\nowner: fixture\n"""
+        moved = first.replace(
+            b"location:\n  lat: 1.0\n  lon: 2.0\n  alt: 3\n",
+            b"location:\n  lat: 4.0\n  lon: 5.0\n  alt: 6\n",
+        )
+        changed_config = moved.replace(b"region: US", b"region: EU_868")
+        nested_location = moved.replace(
+            b"    enabled: false", b"    enabled: false\n    location: configured"
+        )
+
+        baseline = hil.stable_config_payload(first)
+        self.assertEqual(baseline, hil.stable_config_payload(moved))
+        self.assertNotEqual(baseline, hil.stable_config_payload(changed_config))
+        self.assertNotEqual(baseline, hil.stable_config_payload(nested_location))
+        self.assertNotIn(b"\nlocation:\n", b"\n" + baseline)
+
     def test_fromradio_text_fixture_matches_wire_schema(self):
         frame = hil.make_text_frame(0x01020304, 0xA0B0C0D0, 0x11223344, b"hi", channel=2, reply_id=9)
         self.assertEqual(

@@ -132,10 +132,13 @@ firmware in a `finally` block even when a test fails. Before flashing HIL, the e
 app is hash-verified and copied with owner-only permissions outside the mutable
 PlatformIO build tree, so a concurrent clean/rebuild cannot remove the bytes
 needed by that `finally` block. The runner then captures the configuration again
-and requires the before/after fingerprints to be byte-for-byte equivalent. Each
-fingerprint is accepted only after two consecutive complete exports match, so a
-single truncated-but-plausible CLI response cannot masquerade as configuration
-drift. Secret exports live only in an owner-readable system temporary directory
+and requires the before/after configuration fingerprints to be equivalent. The
+fingerprint keeps identity, channels, config, module config and owner bytes exact,
+but excludes the top-level live `location` reported by Meshtastic: GPS movement is
+runtime state, not restorable configuration. Each fingerprint is accepted only
+after two consecutive complete normalized exports match, so a single
+truncated-but-plausible CLI response cannot masquerade as configuration drift.
+Secret exports live only in an owner-readable system temporary directory
 and are deleted before the runner exits; HIL evidence records only the comparison
 result and error type.
 Use `--skip-build` only during local runner development when both images already

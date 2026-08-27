@@ -685,12 +685,36 @@ def capture_config_fingerprint(
         if not payload:
             raise HilError("verified node configuration export is empty")
 
-        digest = hashlib.sha256(payload).digest()
+        digest = hashlib.sha256(stable_config_payload(payload)).digest()
         if digest == previous:
             return digest
         previous = digest
 
     raise HilError("verified node configuration export was not stable")
+
+
+def stable_config_payload(payload: bytes) -> bytes:
+    """Remove Meshtastic's live position from an otherwise exact config export.
+
+    ``--export-config`` places the latest GPS position in a top-level ``location``
+    mapping. It can move while the node configuration remains unchanged, so it
+    is neither restorable configuration nor a safe input to a pre/post HIL
+    fingerprint. Keep every other byte exact, including identity, channel,
+    config, module_config and owner fields.
+    """
+    retained: list[bytes] = []
+    skipping_location = False
+    for line in payload.splitlines(keepends=True):
+        content = line.rstrip(b"\r\n")
+        top_level = bool(content) and content[:1] not in (b" ", b"\t", b"#")
+        if top_level:
+            if content == b"location:" or content.startswith(b"location: "):
+                skipping_location = True
+                continue
+            skipping_location = False
+        if not skipping_location:
+            retained.append(line)
+    return b"".join(retained)
 
 
 @dataclass

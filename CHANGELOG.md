@@ -53,7 +53,8 @@ This is the planned scope of the Meshtastic ADV 1.0 release candidate.
   from ADV memory checkpoints instead of allocating packets that TX will reject.
 - Production firmware and the original configuration are restored and verified
   even after a failed test stage; configuration fingerprints require two
-  consecutive complete, byte-identical exports.
+  consecutive complete exports with identical restorable settings while ignoring
+  only the live GPS position reported alongside them.
 - Local fixtures and configuration backups are owner-only; uploaded evidence
   redacts USB, serial, node and local-network identities.
 - Release publication is serialized, malformed tags fail closed, merged images

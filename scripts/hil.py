@@ -639,50 +639,58 @@ def flash(
 def capture_config_fingerprint(
     fixture: dict[str, object], temporary_root: Path, label: str
 ) -> bytes:
-    """Export and fingerprint the DUT config without retaining secret material."""
+    """Export a stable DUT config fingerprint without retaining secret material."""
     device = resolve_role(fixture, "dut")
-    destination = temporary_root / label
     environment = dict(os.environ)
     # Match backup-node.sh's field-proven retry policy. A self-hosted runner can
     # tune either value downward, but the outer timeout remains an absolute cap.
     environment.setdefault("MESHTASTIC_BACKUP_ATTEMPTS", "4")
     environment.setdefault("MESHTASTIC_BACKUP_TIMEOUT", "90")
-    try:
-        result = subprocess.run(
-            [
-                "bash",
-                str(ROOT / "scripts/backup-node.sh"),
-                "--port",
-                str(device["port"]),
-                "--out",
-                str(destination),
-            ],
-            cwd=ROOT,
-            env=environment,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-            check=False,
-            timeout=480,
-        )
-    except subprocess.TimeoutExpired as exc:
-        raise HilError("verified node configuration export timed out") from exc
-    except OSError as exc:
-        raise HilError("verified node configuration export could not start") from exc
+    previous: bytes | None = None
+    for sample in range(1, 4):
+        destination = temporary_root / f"{label}-{sample}"
+        try:
+            result = subprocess.run(
+                [
+                    "bash",
+                    str(ROOT / "scripts/backup-node.sh"),
+                    "--port",
+                    str(device["port"]),
+                    "--out",
+                    str(destination),
+                ],
+                cwd=ROOT,
+                env=environment,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                check=False,
+                timeout=480,
+            )
+        except subprocess.TimeoutExpired as exc:
+            raise HilError("verified node configuration export timed out") from exc
+        except OSError as exc:
+            raise HilError("verified node configuration export could not start") from exc
 
-    exports = sorted(destination.glob("config-*.yaml"))
-    if result.returncode != 0 or len(exports) != 1:
-        raise HilError("verified node configuration export failed")
-    exported = exports[0]
-    try:
-        mode = stat.S_IMODE(exported.stat().st_mode)
-        payload = exported.read_bytes()
-    except OSError as exc:
-        raise HilError("verified node configuration export could not be read") from exc
-    if mode & 0o077:
-        raise HilError("verified node configuration export has unsafe permissions")
-    if not payload:
-        raise HilError("verified node configuration export is empty")
-    return hashlib.sha256(payload).digest()
+        exports = sorted(destination.glob("config-*.yaml"))
+        if result.returncode != 0 or len(exports) != 1:
+            raise HilError("verified node configuration export failed")
+        exported = exports[0]
+        try:
+            mode = stat.S_IMODE(exported.stat().st_mode)
+            payload = exported.read_bytes()
+        except OSError as exc:
+            raise HilError("verified node configuration export could not be read") from exc
+        if mode & 0o077:
+            raise HilError("verified node configuration export has unsafe permissions")
+        if not payload:
+            raise HilError("verified node configuration export is empty")
+
+        digest = hashlib.sha256(payload).digest()
+        if digest == previous:
+            return digest
+        previous = digest
+
+    raise HilError("verified node configuration export was not stable")
 
 
 @dataclass
@@ -944,6 +952,9 @@ class HilSession:
 
     def reaction_state(self) -> dict[str, str]:
         return parse_fields(self.exchange(b"R", "@@REACT"), "@@REACT")
+
+    def memory_state(self) -> dict[str, str]:
+        return parse_fields(self.exchange(b"T", "@@MEM"), "@@MEM")
 
     def release_companion_state(self) -> dict[str, str]:
         result = parse_fields(self.exchange(b"Y", "@@BRELEASE"), "@@BRELEASE")
@@ -1566,6 +1577,7 @@ def message_flow(fixture: dict[str, object], artifacts: Path) -> Report:
             # produce and making the heap watermark describe the harness rather
             # than the firmware's reachable runtime behavior.
             checkpoints = []
+            state: dict[str, str] = {}
             for index in range(1, 49):
                 session.inject(
                     make_text_frame(
@@ -1577,7 +1589,7 @@ def message_flow(fixture: dict[str, object], artifacts: Path) -> Report:
                     )
                 )
                 if index % 8 == 0:
-                    checkpoint = session.query()
+                    checkpoint = session.memory_state()
                     checkpoints.append(
                         {
                             "after": index,
@@ -1586,15 +1598,17 @@ def message_flow(fixture: dict[str, object], artifacts: Path) -> Report:
                             "hist": int(checkpoint.get("hist", "-1")),
                         }
                     )
+                    state = checkpoint
             state = require_fields(
-                session.wait_state({"messages": "32", "hist": "24", "sending": "1"}, timeout=15),
-                {"incoming": "31"},
+                state,
+                {"messages": "32", "hist": "24", "sending": "1", "incoming": "31"},
             )
+            memory = state
             try:
                 require_heap_headroom(state)
             except HilError as exc:
-                raise HilError(f"{exc}; overflow checkpoints={checkpoints}") from exc
-            return {"state": state, "checkpoints": checkpoints}
+                raise HilError(f"{exc}; overflow checkpoints={checkpoints}; persistence={memory}") from exc
+            return {"state": state, "checkpoints": checkpoints, "persistence": memory}
 
         report.check("storage/live-ring-to-flash-archive", history_overflow_case)
 

@@ -93,6 +93,7 @@ class AdvUI : public concurrency::OSThread
     const char *hilModeName() const;
     void hilState();       // machine-readable state for host assertions
     void hilReactionState(); // on-demand reaction identity diagnostics (kept out of hot Q path)
+    void hilMemoryState(); // on-demand persistence/heap diagnostics
     void hilFrameDigest(); // cheap visual assertion without transferring a full frame
     void hilHome();        // deterministic, non-persistent navigation reset
     void hilInject(const uint8_t *bytes, uint16_t len); // real FromRadio protobuf ingress

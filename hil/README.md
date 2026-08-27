@@ -132,9 +132,12 @@ firmware in a `finally` block even when a test fails. Before flashing HIL, the e
 app is hash-verified and copied with owner-only permissions outside the mutable
 PlatformIO build tree, so a concurrent clean/rebuild cannot remove the bytes
 needed by that `finally` block. The runner then captures the configuration again
-and requires the two secret exports to be byte-for-byte equivalent. Both exports
-live only in an owner-readable system temporary directory and are deleted before
-the runner exits; HIL evidence records only the comparison result and error type.
+and requires the before/after fingerprints to be byte-for-byte equivalent. Each
+fingerprint is accepted only after two consecutive complete exports match, so a
+single truncated-but-plausible CLI response cannot masquerade as configuration
+drift. Secret exports live only in an owner-readable system temporary directory
+and are deleted before the runner exits; HIL evidence records only the comparison
+result and error type.
 Use `--skip-build` only during local runner development when both images already
 exist. A summary and the four sub-suite reports share one timestamped artifact
 directory.
@@ -180,8 +183,10 @@ ledger before admitting a fresh sender by bounded oldest-entry replacement. The 
 node sort and name style, commits their atomic UI configuration and proves both
 values and exact reaction targets survive the same reboot. A synthetic isolated
 `AVS4` save also proves old target-less reactions migrate conservatively into
-the current format. The 12 KiB heap floor is
-reapplied after this reachable storage workload. The suite uses
+the current format. Lightweight single-record memory checkpoints keep the
+diagnostic USB protocol itself out of the watermark, and engine-owned NodeInfo
+sends are omitted from the radio-silent build because they are not ADV receive/UI
+behavior. The 12 KiB heap floor is reapplied after this reachable storage workload. The suite uses
 isolated `/advui_hil_*` files for messages, seen nodes, UI/radio preferences and
 the BLE crash guard, and clears them at both boundaries; their production
 counterparts are never opened or replaced. A second in-memory ingress replays the stock BLE

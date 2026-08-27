@@ -794,6 +794,11 @@ bool normalizeStoredMsg(Msg &m)
 }
 #ifdef ADVUI_HIL
 const char *kMsgPath = "/advui_hil_msgs.bin";
+uint32_t g_hilSaveCount = 0;
+uint32_t g_hilSaveHeapBefore = 0;
+uint32_t g_hilSaveHeapAfter = 0;
+uint32_t g_hilSaveMinBefore = 0;
+uint32_t g_hilSaveMinAfter = 0;
 #else
 const char *kMsgPath = "/advui_msgs.bin";
 #endif
@@ -804,6 +809,11 @@ static int ringIdx(int i, int count, int next, int cap) { return count == cap ? 
 
 bool saveMsgs()
 {
+#ifdef ADVUI_HIL
+    g_hilSaveCount++;
+    g_hilSaveHeapBefore = ESP.getFreeHeap();
+    g_hilSaveMinBefore = ESP.getMinFreeHeap();
+#endif
     SafeFile f(kMsgPath, true);
     // Count-based layout: only the populated messages are written, oldest-first,
     // so the file size tracks history depth, not kMaxMsgs — growing the ring in a
@@ -825,7 +835,12 @@ bool saveMsgs()
         int idx = ringIdx(i, g_reactCount, g_reactNext, kMaxReacts);
         ok = f.write((const uint8_t *)&g_reacts[idx], sizeof(Reaction)) == sizeof(Reaction);
     }
-    if (!ok || !f.close()) {
+    const bool committed = ok && f.close();
+#ifdef ADVUI_HIL
+    g_hilSaveHeapAfter = ESP.getFreeHeap();
+    g_hilSaveMinAfter = ESP.getMinFreeHeap();
+#endif
+    if (!committed) {
         LOG_ERROR("advui: message save failed; previous file kept");
         return false;
     }
@@ -2232,8 +2247,22 @@ void epochNote()
     }
     if (now / 86400 == savedDay)
         return;
-    SafeFile f(kEpochPath, true);
-    if (f.write((uint8_t *)&now, sizeof(now)) == sizeof(now) && f.close()) {
+    // This value is only a best-effort date hint. A torn/missing record is
+    // already rejected by the loader and falls back to the build date, so a
+    // full SafeFile temp/readback/rename transaction buys no recoverability.
+    // Avoiding the temporary file and rename keeps this tiny advisory write out
+    // of LittleFS's heavier atomic path while messages spill into their archive.
+    auto f = FSCom.open(kEpochPath, FILE_O_WRITE);
+    const bool wrote = f && f.write((uint8_t *)&now, sizeof(now)) == sizeof(now);
+    if (f)
+        f.close();
+    auto check = wrote ? FSCom.open(kEpochPath, FILE_O_READ) : File();
+    uint32_t saved = 0;
+    const bool verified = check && check.size() == sizeof(saved) &&
+                          check.read((uint8_t *)&saved, sizeof(saved)) == sizeof(saved) && saved == now;
+    if (check)
+        check.close();
+    if (verified) {
         savedDay = now / 86400;
     } else
         LOG_ERROR("advui: epoch save failed; previous file kept");
@@ -5216,6 +5245,23 @@ void AdvUI::hilReactionState()
     Serial.flush();
 }
 
+void AdvUI::hilMemoryState()
+{
+    const uint32_t heap = ESP.getFreeHeap(), minimum = ESP.getMinFreeHeap();
+    unsigned incoming = 0, sending = 0;
+    for (int i = 0; i < g_msgCount; i++) {
+        incoming += g_msgs[i].status == MSG_IN;
+        sending += g_msgs[i].status == MSG_SENDING;
+    }
+    const int history = g_histTotal >= 0 ? g_histTotal : histTotal();
+    Serial.printf("@@MEM v=1 saves=%u save_before=%u save_after=%u min_before=%u min_after=%u heap=%u min_heap=%u "
+                  "messages=%d hist=%d incoming=%u sending=%u\n",
+                  (unsigned)g_hilSaveCount, (unsigned)g_hilSaveHeapBefore, (unsigned)g_hilSaveHeapAfter,
+                  (unsigned)g_hilSaveMinBefore, (unsigned)g_hilSaveMinAfter, (unsigned)heap, (unsigned)minimum,
+                  g_msgCount, history, incoming, sending);
+    Serial.flush();
+}
+
 void AdvUI::hilFrameDigest()
 {
     if (!haveCanvas) {
@@ -5308,6 +5354,9 @@ void AdvUI::hilClearData()
     g_reactNext = 0;
     memset(g_reacts, 0, sizeof(g_reacts));
     g_msgsDirty = false;
+    g_hilSaveCount = 0;
+    g_hilSaveHeapBefore = g_hilSaveHeapAfter = 0;
+    g_hilSaveMinBefore = g_hilSaveMinAfter = 0;
     g_histTotal = -1;
     g_seen24 = -1;
     g_seenPendN = 0;
@@ -6656,8 +6705,11 @@ int32_t AdvUI::runOnce()
     }
 
     { // Remember the last honestly-known day (manual-clock date base), once a minute.
+      // It is advisory, so never compete with a live receive/archive burst. The
+      // dirty ring is flushed after its quiet debounce; the next tick records
+      // the day. A permanently busy stream can safely defer this daily hint.
         static uint32_t lastEpochNoteMs = 0;
-        if (millis() - lastEpochNoteMs > 60 * 1000UL) {
+        if (!g_msgsDirty && millis() - lastEpochNoteMs > 60 * 1000UL) {
             lastEpochNoteMs = millis();
             epochNote();
         }
@@ -6809,6 +6861,8 @@ int32_t AdvUI::runOnce()
             hilState();
         } else if (sc == 'R') {
             hilReactionState();
+        } else if (sc == 'T') {
+            hilMemoryState();
         } else if (sc == 'Y') {
             const uint32_t before = ESP.getFreeHeap();
             bleHilReleaseState();
@@ -6912,6 +6966,10 @@ int32_t AdvUI::runOnce()
     // want_response and the reply carries their name. One node per pass, a
     // pass every 10 min, each node asked at most once per 6 h — negligible
     // airtime even on a congested channel.
+#ifndef ADVUI_HIL
+    // This is engine-owned radio traffic, not an ADV receive/UI path. The HIL
+    // build blocks TX at the engine too; skip allocating a doomed NodeInfo
+    // packet so its one-minute timer cannot contaminate ADV heap measurements.
     if (splashDone && !g_radioCompanion && nodeInfoModule && nodeDB) {
         static uint32_t nextAskMs = 60 * 1000UL; // let the boot-time chatter settle first
         static uint32_t asked[16], askedAtMs[16];
@@ -6944,6 +7002,7 @@ int32_t AdvUI::runOnce()
             }
         }
     }
+#endif
 
     // First-boot onboarding: a fresh install has no LoRa region, so the radio can't
     // transmit. Drop new users straight into the region picker instead of a dead node.

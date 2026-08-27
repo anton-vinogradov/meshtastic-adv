@@ -1,3 +1,4 @@
+import hashlib
 import importlib.util
 import json
 import stat
@@ -32,14 +33,27 @@ class HilRunnerTests(unittest.TestCase):
     def test_hil_firmware_forces_live_radio_tx_off(self):
         variant = (ROOT / "overlay/variants/esp32s3/m5stack_cardputer_adv_advui/platformio.ini").read_text()
         sync = (ROOT / "scripts/sync-overlay.sh").read_text()
+        source = (ROOT / "overlay/src/advui/AdvUI.cpp").read_text()
         self.assertIn("-D USERPREFS_LORA_TX_DISABLED=1", variant)
         self.assertIn("advui-inject-hil-rx-only", sync)
+        healing = source.split("// Nameless-node healing.", 1)[1].split("// First-boot onboarding:", 1)[0]
+        self.assertIn("#ifndef ADVUI_HIL", healing)
+        self.assertIn("nodeInfoModule->sendOurNodeInfo", healing)
 
     def test_hil_release_does_not_delete_static_queue_interior_pointers(self):
         source = (ROOT / "overlay/src/advui/AdvBle.cpp").read_text()
         body = source.split("void bleHilReleaseState()", 1)[1].split("uint32_t bleHilIngressFirstHeap()", 1)[0]
         self.assertNotIn("vQueueDelete(", body)
         self.assertIn("free(g_buffers)", body)
+
+    def test_advisory_epoch_write_cannot_overlap_a_message_burst(self):
+        source = (ROOT / "overlay/src/advui/AdvUI.cpp").read_text()
+        epoch = source.split("void epochNote()", 1)[1].split("uint32_t savedDateEpoch()", 1)[0]
+        self.assertNotIn("SafeFile f(", epoch)
+        self.assertIn("FSCom.open(kEpochPath, FILE_O_WRITE)", epoch)
+        self.assertIn("saved == now", epoch)
+        scheduler = source.split("static uint32_t lastEpochNoteMs", 1)[1].split("clockSeen", 1)[0]
+        self.assertIn("if (!g_msgsDirty &&", scheduler)
 
     def test_parse_fields(self):
         parsed = hil.parse_fields("@@STATE v=1 mode=chats heap=123", "@@STATE")
@@ -199,10 +213,56 @@ class HilRunnerTests(unittest.TestCase):
                 digest = hil.capture_config_fingerprint({}, Path(directory), "before")
 
         self.assertEqual(len(digest), 32)
+        self.assertEqual(run.call_count, 2)
+        destinations = [
+            call.args[0][call.args[0].index("--out") + 1]
+            for call in run.call_args_list
+        ]
+        self.assertEqual(len(set(destinations)), 2)
         command = run.call_args.args[0]
         self.assertEqual(command[command.index("--port") + 1], device["port"])
         self.assertIs(run.call_args.kwargs["stdout"], hil.subprocess.DEVNULL)
         self.assertIs(run.call_args.kwargs["stderr"], hil.subprocess.DEVNULL)
+
+    def test_config_fingerprint_requires_consecutive_matching_exports(self):
+        payloads = iter((b"first", b"second", b"second"))
+
+        def export(command, **_kwargs):
+            destination = Path(command[command.index("--out") + 1])
+            destination.mkdir(parents=True)
+            config = destination / "config-fixture.yaml"
+            config.write_bytes(next(payloads))
+            config.chmod(0o600)
+            return mock.Mock(returncode=0)
+
+        with tempfile.TemporaryDirectory() as directory:
+            with (
+                mock.patch.object(hil, "resolve_role", return_value={"port": "/dev/dut"}),
+                mock.patch.object(hil.subprocess, "run", side_effect=export) as run,
+            ):
+                digest = hil.capture_config_fingerprint({}, Path(directory), "before")
+
+        self.assertEqual(digest, hashlib.sha256(b"second").digest())
+        self.assertEqual(run.call_count, 3)
+
+    def test_config_fingerprint_rejects_three_different_exports(self):
+        payloads = iter((b"first", b"second", b"third"))
+
+        def export(command, **_kwargs):
+            destination = Path(command[command.index("--out") + 1])
+            destination.mkdir(parents=True)
+            config = destination / "config-fixture.yaml"
+            config.write_bytes(next(payloads))
+            config.chmod(0o600)
+            return mock.Mock(returncode=0)
+
+        with tempfile.TemporaryDirectory() as directory:
+            with (
+                mock.patch.object(hil, "resolve_role", return_value={"port": "/dev/dut"}),
+                mock.patch.object(hil.subprocess, "run", side_effect=export),
+            ):
+                with self.assertRaisesRegex(hil.HilError, "was not stable"):
+                    hil.capture_config_fingerprint({}, Path(directory), "after")
 
     def test_fromradio_text_fixture_matches_wire_schema(self):
         frame = hil.make_text_frame(0x01020304, 0xA0B0C0D0, 0x11223344, b"hi", channel=2, reply_id=9)

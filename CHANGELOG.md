@@ -40,15 +40,20 @@ This is the planned scope of the Meshtastic ADV 1.0 release candidate.
 - Companion queue ownership, reconnect handling, bounded node snapshots and packet
   ingress no longer leave static buffers charged to onboard mode or free interior
   queue-storage pointers.
+- Daily advisory-date persistence is deferred until receive bursts settle and
+  no longer uses an atomic LittleFS transaction for its recoverable four-byte
+  hint.
 - UTF-8 truncation, malformed input and legacy-history failure paths are bounded
   and fail without replacing recoverable stored data.
 
 ### Release safety
 
 - Physical USB HIL is radio-silent, bound to the intended Cardputer identity and
-  refuses every protected attached device.
+  refuses every protected attached device; engine-owned radio sends are excluded
+  from ADV memory checkpoints instead of allocating packets that TX will reject.
 - Production firmware and the original configuration are restored and verified
-  even after a failed test stage.
+  even after a failed test stage; configuration fingerprints require two
+  consecutive complete, byte-identical exports.
 - Local fixtures and configuration backups are owner-only; uploaded evidence
   redacts USB, serial, node and local-network identities.
 - Release publication is serialized, malformed tags fail closed, merged images

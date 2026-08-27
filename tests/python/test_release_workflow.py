@@ -60,6 +60,7 @@ class ReleaseWorkflowTests(unittest.TestCase):
         host = job("host-tests")
         self.assertIn("if: startsWith(github.ref, 'refs/tags/v')", host)
         self.assertIn('python scripts/release_tag.py "$GITHUB_REF_NAME"', host)
+        self.assertIn('python scripts/release_notes.py "$GITHUB_REF_NAME" >/dev/null', host)
         physical = job("release-hil")
         self.assertIn("needs: [host-tests, firmware]", physical)
 

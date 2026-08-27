@@ -29,7 +29,11 @@ jobs:
           python-version: '3.11'
       - name: Validate release tag
         if: startsWith(github.ref, 'refs/tags/v')
-        run: python scripts/release_tag.py "$GITHUB_REF_NAME"
+        run: |
+          python scripts/release_tag.py "$GITHUB_REF_NAME"
+          # A stable tag without reviewed notes must fail before firmware build
+          # can unlock the physical HIL runner.
+          python scripts/release_notes.py "$GITHUB_REF_NAME" >/dev/null
       - name: Host verification
         run: python scripts/verify.py --quick --artifacts hil-artifacts/ci-host
       - name: Upload host verification evidence

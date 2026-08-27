@@ -15,7 +15,8 @@ No user-visible changes are pending after 1.0.4.
   `CHANGELOG.md` instead of an empty generated-notes page containing only a
   comparison link. The notes are staged from the exact tag before the installer
   checkout moves to `main`, and a safe release rerun repairs both assets and
-  notes.
+  notes. A stable tag with missing or ambiguous changelog notes fails before it
+  can unlock the physical HIL job.
 
 ## [1.0.3] - 2026-08-28
 

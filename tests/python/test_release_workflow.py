@@ -93,6 +93,7 @@ class ReleaseWorkflowTests(unittest.TestCase):
         self.assertIn("cp docs/unifont.bin /tmp/unifont.bin", block[:checkout_main])
         self.assertIn("cp scripts/check-installer.py /tmp/check-installer.py", block[:checkout_main])
         self.assertIn("cp scripts/mkm5burner.sh /tmp/mkm5burner.sh", block[:checkout_main])
+        self.assertIn("cp scripts/verify_web_publish.py /tmp/verify_web_publish.py", block[:checkout_main])
         self.assertIn("cp requirements/release.txt /tmp/release-requirements.txt", block[:checkout_main])
         self.assertIn("pip install --require-hashes -r /tmp/release-requirements.txt", block[:checkout_main])
         self.assertIn('echo "engine=$engine" >> "$GITHUB_OUTPUT"', block[:checkout_main])
@@ -100,6 +101,9 @@ class ReleaseWorkflowTests(unittest.TestCase):
         self.assertIn("cp /tmp/unifont.bin docs/unifont.bin", block[checkout_main:publish])
         self.assertIn('engine="${{ steps.tagged.outputs.engine }}"', block[staging:checkout_main])
         self.assertIn("python /tmp/check-installer.py docs", block[checkout_main:publish])
+        self.assertIn("python /tmp/verify_web_publish.py", block[checkout_main:publish])
+        self.assertIn("--firmware /tmp/fw.bin", block[checkout_main:publish])
+        self.assertIn("--font /tmp/unifont.bin", block[checkout_main:publish])
         self.assertIn("MESHTASTIC_FONT=/tmp/unifont.bin", block[publish:])
         self.assertIn("python /tmp/m5burner_publish.py", block[publish:])
 

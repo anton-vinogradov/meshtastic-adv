@@ -204,6 +204,7 @@ jobs:
           cp scripts/check-installer.py /tmp/check-installer.py
           cp scripts/mkm5burner.sh /tmp/mkm5burner.sh
           cp scripts/m5burner_publish.py /tmp/m5burner_publish.py
+          cp scripts/verify_web_publish.py /tmp/verify_web_publish.py
           cp requirements/release.txt /tmp/release-requirements.txt
           engine=$(python -c 'import configparser; c=configparser.ConfigParser(); c.read("firmware/version.properties"); v=c["VERSION"]; print("{}.{}.{}".format(v["major"], v["minor"], v["build"]))')
           echo "engine=$engine" >> "$GITHUB_OUTPUT"
@@ -243,6 +244,15 @@ jobs:
             git commit -m "ci: web installer image for ${GITHUB_REF_NAME} [skip ci]"
             git push origin HEAD:main
           fi
+
+      - name: Verify public web installer
+        if: steps.tagged.outputs.prerelease == 'false'
+        run: |
+          python /tmp/verify_web_publish.py \
+            --base-url https://anton-vinogradov.github.io/meshtastic-adv/ \
+            --version "${{ steps.tagged.outputs.version }} (advui · engine ${{ steps.tagged.outputs.engine }})" \
+            --firmware /tmp/fw.bin \
+            --font /tmp/unifont.bin
 
       - name: Create the GitHub release
         env:

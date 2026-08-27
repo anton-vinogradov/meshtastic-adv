@@ -29,8 +29,8 @@ ESPTOOL="${ESPTOOL:-$(command -v esptool || command -v esptool.py || echo "$HOME
 
 mkdir -p "$(dirname "$OUT")"
 rm -f -- "$OUT"
-"$ESPTOOL" --chip esp32s3 merge_bin -o "$OUT" \
-    --flash_mode keep --flash_size keep \
+"$ESPTOOL" --chip esp32s3 merge-bin -o "$OUT" \
+    --flash-mode keep --flash-size keep \
     0x0 "$FACTORY" "$FONT_OFFSET" "$FONT"
 
 # Prove that this newly-created output contains both exact source artifacts.

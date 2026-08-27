@@ -55,6 +55,29 @@ class HilRunnerTests(unittest.TestCase):
         self.assertIn("if (uiChanged)\n            uiDirty = true", body)
         self.assertNotIn("}\n        uiDirty = true;", body)
 
+    def test_name_editor_enforces_wire_byte_limits_before_owner_broadcast(self):
+        source = (ROOT / "overlay/src/advui/AdvUI.cpp").read_text()
+        editor = source.split("if (mode == MODE_SETNAME)", 1)[1].split("if (mode == MODE_BTPIN)", 1)[0]
+        self.assertIn("translitFeed(nameBuf, nameLen, maxLen + 1", editor)
+        apply_name = source.split("bool AdvUI::applyName()", 1)[1].split("void AdvUI::extInit()", 1)[0]
+        self.assertIn("utf8CopyValid(owner.long_name", apply_name)
+        self.assertIn("utf8CopyValid(owner.short_name", apply_name)
+        self.assertIn("utf8CopyValid(ch.settings.name", apply_name)
+
+    def test_send_failures_preserve_compose_and_consume_queue_status(self):
+        source = (ROOT / "overlay/src/advui/AdvUI.cpp").read_text()
+        compose = source.split("if (mode == MODE_COMPOSE)", 1)[1].split("// Home: recent conversations", 1)[0]
+        self.assertIn("preserve both the draft and its reply target", compose)
+        self.assertIn("sendFailure != SendFailure::NONE", compose)
+        ingress = source.split("void AdvUI::handleFromRadio", 1)[1].split("static SendResult sendTextPacket", 1)[0]
+        self.assertIn("meshtastic_FromRadio_queueStatus_tag", ingress)
+        self.assertIn("ackMsg(status.mesh_packet_id, MSG_FAILED", ingress)
+        companion = (ROOT / "overlay/src/advui/AdvBle.cpp").read_text()
+        self.assertIn("case meshtastic_FromRadio_queueStatus_tag:", companion)
+        self.assertLess(source.index("if (injected != ERRNO_OK)"), source.index("service->sendToMesh"))
+        self.assertIn("emulate successful queue admission", source)
+        self.assertIn("g_hilLastSendError = ERRNO_DISABLED", source)
+
     def test_advisory_epoch_write_cannot_overlap_a_message_burst(self):
         source = (ROOT / "overlay/src/advui/AdvUI.cpp").read_text()
         epoch = source.split("void epochNote()", 1)[1].split("uint32_t savedDateEpoch()", 1)[0]
@@ -360,6 +383,10 @@ class HilRunnerTests(unittest.TestCase):
         with self.assertRaises(hil.HilError):
             hil.make_routing_frame(1, 2, 3, 0, variant=4)
 
+    def test_queue_status_fixture_matches_fromradio_schema(self):
+        frame = hil.make_queue_status_frame(32, 0x11223344)
+        self.assertEqual(frame.hex(), "5a0c08201000181020c4e6888901")
+
     def test_encrypted_fixture_uses_meshpacket_encrypted_oneof(self):
         frame = hil.make_encrypted_frame(1, 2, 3, b"ciphertext", channel=4)
         self.assertIn(bytes.fromhex("2a0a63697068657274657874"), frame)
@@ -404,6 +431,19 @@ class HilRunnerTests(unittest.TestCase):
         )
         with self.assertRaises(hil.HilError):
             hil.require_heap_fields({"heap": "13000", "before": "11999"}, ("heap", "before"))
+
+    def test_companion_heap_gate_uses_sustained_burst_envelope(self):
+        physical = {
+            "heap": "47412",
+            "ingress_first": "47276",
+            "ingress_pre": "47412",
+            "ingress_last": "47412",
+            "ingress_direct": "-2328",
+            "ingress_max": "2328",
+        }
+        self.assertEqual(hil.require_companion_ingress_heap(physical)["ingress_last"], 47412)
+        with self.assertRaises(hil.HilError):
+            hil.require_companion_ingress_heap({**physical, "ingress_last": "46763"})
 
     def test_scoped_heap_gate_ignores_only_an_older_lifetime_low(self):
         polluted = {
@@ -604,7 +644,7 @@ class HilRunnerTests(unittest.TestCase):
             self.assertEqual(digest, hil.hashlib.sha256(staged.read_bytes()).hexdigest())
             self.assertEqual(staged.stat().st_mode & 0o777, 0o600)
 
-    def test_chip_identity_uses_esptool_4_command_spelling(self):
+    def test_chip_identity_uses_esptool_5_command_spelling(self):
         with (
             mock.patch.object(hil, "find_esptool", return_value=["esptool"]),
             mock.patch.object(
@@ -615,8 +655,8 @@ class HilRunnerTests(unittest.TestCase):
         ):
             self.assertEqual(hil.chip_mac("/dev/cardputer"), "02:11:22:33:44:55")
         command = run.call_args.args[0]
-        self.assertIn("read_mac", command)
-        self.assertNotIn("read-mac", command)
+        self.assertIn("read-mac", command)
+        self.assertNotIn("read_mac", command)
 
     def test_esptool_prefers_the_hil_interpreters_pinned_module(self):
         with (
@@ -648,8 +688,8 @@ class HilRunnerTests(unittest.TestCase):
 
         commands = [call.args[0] for call in run.call_args_list]
         self.assertEqual(len(commands), 2)
-        self.assertIn("write_flash", commands[0])
-        self.assertIn("verify_flash", commands[1])
+        self.assertIn("write-flash", commands[0])
+        self.assertIn("verify-flash", commands[1])
         self.assertIn(device["port"], commands[0])
         self.assertNotIn("pio", commands[0])
         self.assertEqual(result["chip_mac"], device["usb_serial"])

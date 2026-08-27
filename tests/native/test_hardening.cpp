@@ -45,6 +45,16 @@ int main()
     assert(utf8CopyValid(copy, sizeof(copy), "AЖB") == 3);
     assert(strcmp(copy, "AЖ") == 0);
 
+    char ownerName[40];
+    assert(utf8CopyValid(ownerName, sizeof(ownerName), "яяяяяяяяяяяяяяяяяяяя") == 38);
+    assert(utf8Decode(ownerName + 36).valid);
+    assert(ownerName[38] == 0);
+
+    char channelName[12];
+    assert(utf8CopyValid(channelName, sizeof(channelName), "яяяяяя") == 10);
+    assert(utf8Decode(channelName + 8).valid);
+    assert(channelName[10] == 0);
+
     char invalid[] = {'x', (char)0x80, 'y', 0};
     utf8Sanitize(invalid, sizeof(invalid));
     assert(strcmp(invalid, "x?y") == 0);

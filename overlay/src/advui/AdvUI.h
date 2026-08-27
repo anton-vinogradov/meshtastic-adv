@@ -11,6 +11,14 @@
 namespace advui
 {
 
+enum class SendFailure : uint8_t {
+    NONE = 0,
+    LINK_DOWN,
+    QUEUE_FULL,
+    ENCODE_FAILED,
+    RADIO_REJECTED,
+};
+
 /**
  * Our own UI layer, replacing the stock graphics::Screen — additive overlay.
  *
@@ -115,9 +123,9 @@ class AdvUI : public concurrency::OSThread
     void favNode(uint32_t num, bool on);
     void favEntry(int s, bool on);
     void handleFromRadio(const meshtastic_FromRadio &fr);
-    void sendMessage(uint32_t to, const char *text, uint32_t replyId = 0);
-    void sendChannel(int chIdx, const char *text, uint32_t replyId = 0);
-    void sendReaction(int msgIdx, const char *label); // tapback on g_msgs[msgIdx]
+    SendFailure sendMessage(uint32_t to, const char *text, uint32_t replyId = 0);
+    SendFailure sendChannel(int chIdx, const char *text, uint32_t replyId = 0);
+    SendFailure sendReaction(int msgIdx, const char *label); // tapback on g_msgs[msgIdx]
     int matchedFromNewest(int back); // ring index of the thread's back-th newest message
     void handleKey(char c);
     void screenSleep(); // cut the display power rail (auto-off)
@@ -176,6 +184,7 @@ class AdvUI : public concurrency::OSThread
     char msgBuf[200] = {0};   // compose buffer (MODE_COMPOSE)
     uint8_t msgLen = 0;
     char pendingLat = 0;      // last Latin letter that may still start a digraph (sh/ya/...)
+    SendFailure sendFailure = SendFailure::NONE; // last rejected send; compose stays intact
 
     // Shared text-editor buffer (MODE_SETNAME). Sized for the LONGEST field it
     // ever edits, not for node names: the WiFi/MQTT pages reuse this editor and

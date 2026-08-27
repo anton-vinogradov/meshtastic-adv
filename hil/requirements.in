@@ -1,0 +1,16 @@
+# PlatformIO 6.1.19 (the current upstream release) pins starlette<0.53 even
+# though ADV only invokes its CLI builder, never the vulnerable web stack.
+# Re-audit and remove this exception as soon as PlatformIO relaxes that bound.
+platformio==6.1.19
+pyserial>=3.5,<4
+Pillow>=10,<13
+meshtastic>=2.7,<3
+PyYAML>=6,<7
+esptool>=5.3,<6
+rich-click>=1.8,<2
+
+# esptool only caps cryptography below 49 on Intel macOS. Keep supported Linux
+# CI and the ARM64 lab runner on a fixed release instead of letting a universal
+# lock select the vulnerable cross-platform common denominator.
+cryptography>=50,<51 ; sys_platform != 'darwin' or platform_machine != 'x86_64'
+cryptography>=48,<49 ; sys_platform == 'darwin' and platform_machine == 'x86_64'

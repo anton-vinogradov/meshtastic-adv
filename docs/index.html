@@ -6,6 +6,7 @@
   <title>Meshtastic ADV · installer</title>
   <meta name="description" content="Keyboard-first Meshtastic client for the M5Stack Cardputer ADV. Flash it from your browser." />
   <meta name="theme-color" content="#05060a" />
+  <meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; font-src 'self'; connect-src 'self'; worker-src 'self' blob:; object-src 'none'; base-uri 'self'; form-action 'none'; upgrade-insecure-requests" />
   <meta property="og:type" content="website" />
   <meta property="og:title" content="Meshtastic ADV · keyboard-first mesh messenger" />
   <meta property="og:description" content="Flash a chat-focused Meshtastic UI for the M5Stack Cardputer ADV directly from your browser." />
@@ -13,10 +14,8 @@
   <meta property="og:image" content="https://anton-vinogradov.github.io/meshtastic-adv/img/hero.png" />
   <meta property="og:image:alt" content="Meshtastic ADV recent chats and conversation UI on the Cardputer ADV" />
   <meta name="twitter:card" content="summary_large_image" />
-  <link rel="preconnect" href="https://fonts.googleapis.com">
-  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-  <link href="https://fonts.googleapis.com/css2?family=Press+Start+2P&family=VT323&display=swap" rel="stylesheet">
-  <script type="module" src="https://unpkg.com/esp-web-tools@10/dist/web/install-button.js?module"></script>
+  <script type="module" src="./vendor/esp-web-tools/install-button.js"></script>
+  <script defer src="./installer.js"></script>
   <style>
     :root{
       color-scheme: dark;
@@ -28,14 +27,14 @@
     html,body{ margin:0; }
     body{
       background:var(--bg); color:var(--ink);
-      font-family:"VT323", ui-monospace, monospace; font-size:22px; line-height:1.35;
+      font-family:ui-monospace, "SFMono-Regular", Menlo, Consolas, monospace; font-size:20px; line-height:1.35;
       min-height:100vh; padding:28px 16px 60px;
       background-image:
         radial-gradient(120% 80% at 50% -10%, rgba(55,225,255,.10), transparent 60%),
         repeating-linear-gradient(0deg, rgba(255,255,255,.028) 0 2px, transparent 2px 4px);
     }
     main{ width:min(760px, 100%); margin:0 auto; }
-    .pixel{ font-family:"Press Start 2P", monospace; }
+    .pixel{ font-family:ui-monospace, "SFMono-Regular", Menlo, Consolas, monospace; font-weight:900; }
     img{ image-rendering: pixelated; }
 
     /* --- header --- */
@@ -58,7 +57,7 @@
       --esp-tools-button-border-radius:0; }
     button[slot="activate"]{
       appearance:none; cursor:pointer; width:100%;
-      font-family:"Press Start 2P", monospace; font-size:15px; color:#04121a;
+      font-family:ui-monospace, "SFMono-Regular", Menlo, Consolas, monospace; font-size:15px; font-weight:900; color:#04121a;
       background:var(--cyan); border:0; padding:20px 18px;
       box-shadow: 0 6px 0 var(--cyanD), 0 6px 0 3px #04121a;
       transition:transform .05s, box-shadow .05s;
@@ -75,11 +74,11 @@
        document.body as <ewt-install-dialog>; custom props cascade into its
        shadow tree and every ew-* child. */
     ewt-install-dialog{
-      --roboto-font:"VT323", ui-monospace, monospace !important;
-      --md-ref-typeface-plain:"VT323", ui-monospace, monospace !important;
-      --md-ref-typeface-brand:"Press Start 2P", monospace !important;
-      --md-sys-typescale-title-font:"Press Start 2P", monospace !important;
-      --md-sys-typescale-headline-font:"Press Start 2P", monospace !important;
+      --roboto-font:ui-monospace, monospace !important;
+      --md-ref-typeface-plain:ui-monospace, monospace !important;
+      --md-ref-typeface-brand:ui-monospace, monospace !important;
+      --md-sys-typescale-title-font:ui-monospace, monospace !important;
+      --md-sys-typescale-headline-font:ui-monospace, monospace !important;
 
       --md-sys-color-primary:var(--cyan) !important;
       --md-sys-color-on-primary:#04121a !important;
@@ -109,15 +108,13 @@
 
     /* --- version picker --- */
     .verrow{ display:flex; align-items:center; gap:12px; margin-top:14px; }
-    .verrow label{ font-family:"Press Start 2P", monospace; font-size:11px; color:var(--dim); }
+    .verrow label{ font-family:ui-monospace, monospace; font-size:11px; font-weight:900; color:var(--dim); }
     .verrow select{
       flex:1; min-width:0; appearance:none; cursor:pointer;
-      font-family:"VT323", monospace; font-size:22px; color:var(--ink);
+      font-family:ui-monospace, monospace; font-size:20px; color:var(--ink);
       background:#000; border:3px solid var(--line); padding:6px 10px;
     }
     .verrow select:focus{ outline:none; border-color:var(--cyanD); }
-    .installs{ margin:12px 0 0; font-family:"Press Start 2P", monospace; font-size:11px;
-               color:var(--amber); letter-spacing:1px; }
 
     /* --- gallery --- */
     .shots{ display:grid; grid-template-columns:1fr 1fr; gap:14px; }
@@ -129,9 +126,9 @@
     ul{ margin:0; padding:0; list-style:none; }
     li{ margin:10px 0; padding-left:26px; position:relative; }
     li::before{ content:"▸"; position:absolute; left:0; color:var(--cyan); }
-    li.warn::before{ content:"!"; color:var(--red); font-family:"Press Start 2P"; font-size:13px; }
+    li.warn::before{ content:"!"; color:var(--red); font-family:ui-monospace, monospace; font-size:13px; font-weight:900; }
     b{ color:var(--ink); }
-    kbd{ font-family:"Press Start 2P"; font-size:11px; background:#000; border:2px solid var(--line);
+    kbd{ font-family:ui-monospace, monospace; font-size:11px; font-weight:900; background:#000; border:2px solid var(--line);
          padding:3px 6px; color:var(--amber); }
     a{ color:var(--cyan); text-decoration:none; border-bottom:2px dotted var(--cyanD); }
     a:hover{ color:#7cf0ff; }
@@ -161,43 +158,6 @@
         <label for="ver">version</label>
         <select id="ver"><option value="">latest</option></select>
       </div>
-      <p id="installs" class="installs" hidden></p>
-      <script>
-        (function () {
-          var sel = document.getElementById('ver');
-          var btn = document.querySelector('esp-web-install-button');
-          fetch('versions/index.json').then(function (r) { return r.ok ? r.json() : []; }).then(function (vs) {
-            if (!vs.length) return;
-            sel.innerHTML = '';
-            vs.forEach(function (v, i) {
-              var o = document.createElement('option');
-              o.value = v;
-              o.textContent = i === 0 ? v + ' · latest' : v;
-              sel.appendChild(o);
-            });
-          }).catch(function () {});
-          sel.addEventListener('change', function () {
-            // newest = the root manifest (same image); older = its archived copy
-            var first = sel.selectedIndex === 0;
-            btn.setAttribute('manifest', first || !sel.value ? './manifest.json' : './versions/' + sel.value + '/manifest.json');
-          });
-          // Count install attempts — cookieless, no personal data. One flat "install"
-          // path so the total is a single countable number for the badge below.
-          var act = document.querySelector('button[slot="activate"]');
-          if (act) act.addEventListener('click', function () {
-            if (window.goatcounter) window.goatcounter.count({ path: 'install', title: 'Install clicked', event: true });
-          });
-          // Show that running install count from GoatCounter's visitor counter.
-          fetch('https://randoom.goatcounter.com/counter/install.json')
-            .then(function (r) { return r.ok ? r.json() : null; })
-            .then(function (d) {
-              if (!d || !d.count) return;
-              var el = document.getElementById('installs');
-              el.textContent = '⬇ ' + d.count + ' installs';
-              el.hidden = false;
-            }).catch(function () {});
-        })();
-      </script>
     </div>
 
     <div class="panel">
@@ -214,6 +174,7 @@
       <h2>▚ Before you click</h2>
       <ul>
         <li class="warn">Attach the <b>LoRa antenna</b> to the Cap first — never power the PA without it.</li>
+        <li class="warn"><b>Back up your Meshtastic configuration first.</b> Choosing a full erase removes settings and message history.</li>
         <li>No LoRa cap? <b>Companion mode</b> pairs with any stock Meshtastic node over Bluetooth and uses its radio (Settings → Radio).</li>
         <li>Desktop <b>Chrome</b> or <b>Edge</b> only (Web Serial API).</li>
         <li>Use a <b>data</b> USB-C cable, straight into the computer — no hub.</li>
@@ -241,8 +202,5 @@
       Device imagery © <a href="https://shop.m5stack.com/products/m5stack-cardputer-adv">M5Stack</a>.
     </footer>
   </main>
-  <!-- GoatCounter: cookieless, privacy-first page-view + install-click stats -->
-  <script data-goatcounter="https://randoom.goatcounter.com/count"
-          async src="//gc.zgo.at/count.js"></script>
 </body>
 </html>

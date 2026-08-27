@@ -60,6 +60,22 @@ const lgfx::U8g2font cyrFont(u8g2_font_9x15_t_cyrillic);
 
 extern uint8_t g_nameShort;
 
+#ifdef ADVUI_HIL
+ErrorCode g_hilNextSendError = ERRNO_OK;
+uint8_t g_hilLastSendError = ERRNO_OK;
+#endif
+
+const char *sendFailureText(SendFailure failure)
+{
+    switch (failure) {
+    case SendFailure::LINK_DOWN: return "link disconnected";
+    case SendFailure::QUEUE_FULL: return "TX queue full";
+    case SendFailure::ENCODE_FAILED: return "packet encode failed";
+    case SendFailure::RADIO_REJECTED: return "radio rejected send";
+    default: return "";
+    }
+}
+
 const char *nodeName(const meshtastic_NodeInfoLite *n)
 {
     if (g_nameShort)
@@ -2807,6 +2823,12 @@ void AdvUI::onMeshPacket(const meshtastic_FromRadio &fr)
 
 void AdvUI::handleFromRadio(const meshtastic_FromRadio &fr)
 {
+    if (fr.which_payload_variant == meshtastic_FromRadio_queueStatus_tag) {
+        const meshtastic_QueueStatus &status = fr.queueStatus;
+        if (status.mesh_packet_id && status.res != ERRNO_OK)
+            ackMsg(status.mesh_packet_id, MSG_FAILED, (uint8_t)status.res);
+        return;
+    }
     if (fr.which_payload_variant != meshtastic_FromRadio_packet_tag)
         return;
     const meshtastic_MeshPacket &p = fr.packet;
@@ -2886,13 +2908,20 @@ void AdvUI::handleFromRadio(const meshtastic_FromRadio &fr)
     }
 }
 
-// Builds and transmits a text packet (DM with PKI, or channel broadcast) and returns
-// its packet id. replyId + asEmoji turn it into a reaction (tapback) on that message.
-static uint32_t sendTextPacket(uint32_t to, const char *text, int chIdx = 0, uint32_t replyId = 0, bool asEmoji = false)
+struct SendResult {
+    uint32_t id;
+    SendFailure failure;
+    uint8_t error;
+};
+
+// Builds and transmits a text packet (DM with PKI, or channel broadcast).
+// replyId + asEmoji turn it into a reaction (tapback) on that message.
+static SendResult sendTextPacket(uint32_t to, const char *text, int chIdx = 0, uint32_t replyId = 0,
+                                 bool asEmoji = false)
 {
     if (g_radioCompanion) { // ship it over BLE: the node's radio does routing/PKI itself
         if (g_linkState != BLE_CONNECTED)
-            return 0;
+            return {0, SendFailure::LINK_DOWN, 0};
         meshtastic_ToRadio t = meshtastic_ToRadio_init_default;
         t.which_payload_variant = meshtastic_ToRadio_packet_tag;
         meshtastic_MeshPacket &p = t.packet;
@@ -2928,14 +2957,18 @@ static uint32_t sendTextPacket(uint32_t to, const char *text, int chIdx = 0, uin
         }
         uint8_t buf[320];
         size_t len = pb_encode_to_bytes(buf, sizeof(buf), &meshtastic_ToRadio_msg, &t);
-        if (!len || !bleQueueToRadio(buf, (uint16_t)len))
-            return 0;
-        return p.id;
+        if (!len)
+            return {0, SendFailure::ENCODE_FAILED, 0};
+        if (!bleQueueToRadio(buf, (uint16_t)len))
+            return {0, SendFailure::QUEUE_FULL, ERRNO_UNKNOWN};
+        return {p.id, SendFailure::NONE, ERRNO_OK};
     }
 
     if (!router || !service)
-        return 0;
+        return {0, SendFailure::RADIO_REJECTED, ERRNO_NO_INTERFACES};
     meshtastic_MeshPacket *p = router->allocForSending();
+    if (!p)
+        return {0, SendFailure::QUEUE_FULL, ERRNO_UNKNOWN};
     p->to = to;
     p->decoded.portnum = meshtastic_PortNum_TEXT_MESSAGE_APP;
     p->decoded.dest = to;
@@ -2972,8 +3005,37 @@ static uint32_t sendTextPacket(uint32_t to, const char *text, int chIdx = 0, uin
     }
 
     uint32_t id = p->id;
-    service->sendToMesh(p, RX_SRC_LOCAL, true); // ccToPhone: a connected phone mirrors our sends
-    return id;
+#ifdef ADVUI_HIL
+    // An injected admission failure must happen before MeshService sees the
+    // packet. Overriding its result afterwards leaves a reliable-retry copy in
+    // the engine even though the UI correctly kept the draft, contaminating the
+    // next send and the rest of the deterministic HIL session.
+    const ErrorCode injected = g_hilNextSendError;
+    g_hilNextSendError = ERRNO_OK;
+    if (injected != ERRNO_OK) {
+        packetPool.release(p);
+        g_hilLastSendError = (uint8_t)injected;
+        return {id, injected == ERRNO_UNKNOWN ? SendFailure::QUEUE_FULL : SendFailure::RADIO_REJECTED,
+                (uint8_t)injected};
+    }
+    // The synthetic peer intentionally does not exist in the production
+    // NodeDB. Meshtastic 2.7 therefore rejects the DM before RadioLib with
+    // PKI_SEND_FAIL_PUBLIC_KEY. ADV HIL tests the application above that
+    // engine boundary: emulate successful queue admission, then feed the real
+    // UI routing/QueueStatus handlers below. The immutable RadioLibInterface
+    // guard remains defence in depth for every engine-owned packet.
+    packetPool.release(p);
+    g_hilLastSendError = ERRNO_DISABLED;
+    return {id, SendFailure::NONE, ERRNO_OK};
+#else
+    ErrorCode error = service->sendToMesh(p, RX_SRC_LOCAL, true); // a connected phone mirrors our sends
+    if (error != ERRNO_OK) {
+        ackMsg(id, MSG_FAILED, (uint8_t)error); // catches the synchronous self-echo of a broadcast
+        return {id, error == ERRNO_UNKNOWN ? SendFailure::QUEUE_FULL : SendFailure::RADIO_REJECTED,
+                (uint8_t)error};
+    }
+    return {id, SendFailure::NONE, ERRNO_OK};
+#endif
 }
 
 // Remote admin over the companion link: an AdminMessage addressed to the linked
@@ -3004,41 +3066,45 @@ static bool sendAdminToNode(const meshtastic_AdminMessage &adm)
 
 // Sends a text DM to a node and adds it to our own thread immediately (status
 // "sending"); the delivery ACK later flips it to "delivered" via ackMsg().
-void AdvUI::sendMessage(uint32_t to, const char *text, uint32_t replyId)
+SendFailure AdvUI::sendMessage(uint32_t to, const char *text, uint32_t replyId)
 {
-    uint32_t id = sendTextPacket(to, text, 0, replyId);
-    if (!id)
-        return;
+    SendResult result = sendTextPacket(to, text, 0, replyId);
+    if (result.failure != SendFailure::NONE)
+        return result.failure;
     uint32_t me = myNodeNum();
-    addMsg(me, to, 0, getTime(false), false, text, id, MSG_SENDING, replyId);
+    addMsg(me, to, 0, getTime(false), false, text, result.id, MSG_SENDING, replyId);
+    return SendFailure::NONE;
 }
 
 // Sends a text broadcast to a channel and adds it to that channel's thread.
-void AdvUI::sendChannel(int chIdx, const char *text, uint32_t replyId)
+SendFailure AdvUI::sendChannel(int chIdx, const char *text, uint32_t replyId)
 {
-    uint32_t id = sendTextPacket(NODENUM_BROADCAST, text, chIdx, replyId);
-    if (!id)
-        return;
+    SendResult result = sendTextPacket(NODENUM_BROADCAST, text, chIdx, replyId);
+    if (result.failure != SendFailure::NONE)
+        return result.failure;
     uint32_t me = myNodeNum();
-    addMsg(me, NODENUM_BROADCAST, chIdx, getTime(false), false, text, id, MSG_SENDING, replyId);
+    addMsg(me, NODENUM_BROADCAST, chIdx, getTime(false), false, text, result.id, MSG_SENDING, replyId);
+    return SendFailure::NONE;
 }
 
 // Sends a tapback on the message at ring index msgIdx and records it locally.
-void AdvUI::sendReaction(int msgIdx, const char *label)
+SendFailure AdvUI::sendReaction(int msgIdx, const char *label)
 {
     if (msgIdx < 0 || msgIdx >= kMaxMsgs)
-        return;
+        return SendFailure::RADIO_REJECTED;
     Msg &m = g_msgs[msgIdx];
     if (!m.id) {
         LOG_INFO("advui: can't react - message has no packet id (pre-update history)");
-        return;
+        return SendFailure::RADIO_REJECTED;
     }
-    uint32_t id = (selectedChannel >= 0) ? sendTextPacket(NODENUM_BROADCAST, label, selectedChannel, m.id, true)
-                                         : sendTextPacket(selectedNum, label, 0, m.id, true);
-    if (!id)
-        return;
+    SendResult result = (selectedChannel >= 0)
+                            ? sendTextPacket(NODENUM_BROADCAST, label, selectedChannel, m.id, true)
+                            : sendTextPacket(selectedNum, label, 0, m.id, true);
+    if (result.failure != SendFailure::NONE)
+        return result.failure;
     uint32_t me = myNodeNum();
     addReaction(m.id, me, label, m.from);
+    return SendFailure::NONE;
 }
 
 // Fills out[] with node-DB indices matching query (all if query is null/empty),
@@ -3216,6 +3282,7 @@ void AdvUI::openEntry(int s)
     reactSel = -1;
     reactStrip = false;
     pendingReplyId = 0;
+    sendFailure = SendFailure::NONE;
     histDepth = 0;           // live view; archive re-counted lazily per thread
     histCount = 0;
     histSeam = true;
@@ -3379,6 +3446,7 @@ void AdvUI::openConv(int i)
     reactSel = -1;
     reactStrip = false;
     pendingReplyId = 0;
+    sendFailure = SendFailure::NONE;
     histDepth = 0; // live view; archive re-counted lazily per thread
     histCount = 0;
     histSeam = true;
@@ -3731,7 +3799,7 @@ void AdvUI::drawNode()
 
     // message thread (chronological, most recent at the bottom)
     const int fy0 = 24, lh = 17;
-    int bottom = (mode == MODE_COMPOSE) ? (pendingReplyId ? 96 : 112) : 122; // room for compose (+ quote line)
+    int bottom = (mode == MODE_COMPOSE) ? ((pendingReplyId || sendFailure != SendFailure::NONE) ? 96 : 112) : 122;
     int maxLines = (bottom - fy0) / lh;
     // One continuous timeline: the staged archive slice first, then the live
     // ring whenever the window touches the seam — scrolling slides the window,
@@ -4116,7 +4184,12 @@ void AdvUI::drawNode()
     }
 
     if (mode == MODE_COMPOSE) {
-        if (pendingReplyId) { // replying: show what we're quoting above the input
+        if (sendFailure != SendFailure::NONE) {
+            g->fillRect(0, 97, 240, 16, 0x0000);
+            char error[40];
+            snprintf(error, sizeof(error), "! %s", sendFailureText(sendFailure));
+            printLineEmotes(g, 4, 99, error, 0xF800);
+        } else if (pendingReplyId) { // replying: show what we're quoting above the input
             g->fillRect(0, 97, 240, 16, 0x0000);
             g->setFont(&cyrFont);
             g->setTextSize(1);
@@ -4168,6 +4241,8 @@ void AdvUI::drawNode()
             hint = (smi >= 0 && g_msgs[smi].id == 0) ? "old msg: no id  up/dn  ESC"
                    : pickReply                       ? "up/dn msg  ENTER reply  ESC"
                                                      : "up/dn msg  ENTER react  ESC";
+        } else if (sendFailure != SendFailure::NONE) {
+            hint = sendFailureText(sendFailure);
         } else {
             hint = hasFailed ? "ENTER resend  <reply  >react" : "type  Tab emoji  <reply  >react";
         }
@@ -4258,15 +4333,13 @@ bool AdvUI::applyName()
             adm.which_payload_variant = meshtastic_AdminMessage_set_channel_tag;
             if (!bleCopyCompChannel(0, &adm.set_channel))
                 return false;
-            strncpy(adm.set_channel.settings.name, nameBuf, sizeof(adm.set_channel.settings.name));
-            adm.set_channel.settings.name[sizeof(adm.set_channel.settings.name) - 1] = 0;
+            utf8CopyValid(adm.set_channel.settings.name, sizeof(adm.set_channel.settings.name), nameBuf);
             if (sendAdminToNode(adm)) // applied live on the node (no reboot); mirror it
                 bleUpdateCompChannel(0, adm.set_channel);
             return false;
         }
         meshtastic_Channel ch = channels.getByIndex(0);
-        strncpy(ch.settings.name, nameBuf, sizeof(ch.settings.name));
-        ch.settings.name[sizeof(ch.settings.name) - 1] = 0;
+        utf8CopyValid(ch.settings.name, sizeof(ch.settings.name), nameBuf);
         channels.setChannel(ch);
         channels.onConfigChanged();
         if (nodeDB)
@@ -4312,19 +4385,17 @@ bool AdvUI::applyName()
         snprintf(u.long_name, sizeof(u.long_name), "%s", node.longName);
         snprintf(u.short_name, sizeof(u.short_name), "%s", node.shortName);
         if (editTarget == 1)
-            snprintf(u.short_name, sizeof(u.short_name), "%s", nameBuf);
+            utf8CopyValid(u.short_name, sizeof(u.short_name), nameBuf);
         else
-            snprintf(u.long_name, sizeof(u.long_name), "%s", nameBuf);
+            utf8CopyValid(u.long_name, sizeof(u.long_name), nameBuf);
         if (sendAdminToNode(adm)) // mirror locally so Settings shows it at once
             bleUpdateCompNodeNames(node.num, u.long_name, u.short_name);
         return false;
     }
     if (editTarget == 1) {
-        strncpy(owner.short_name, nameBuf, sizeof(owner.short_name));
-        owner.short_name[sizeof(owner.short_name) - 1] = 0;
+        utf8CopyValid(owner.short_name, sizeof(owner.short_name), nameBuf);
     } else {
-        strncpy(owner.long_name, nameBuf, sizeof(owner.long_name));
-        owner.long_name[sizeof(owner.long_name) - 1] = 0;
+        utf8CopyValid(owner.long_name, sizeof(owner.long_name), nameBuf);
     }
     snprintf(owner.id, sizeof(owner.id), "!%08x", (unsigned)(nodeDB ? nodeDB->getNodeNum() : 0));
     if (service)
@@ -5163,11 +5234,12 @@ void AdvUI::hilState()
     // short as well as enabling bounded blocking for the dev-only protocol.
     Serial.setTxTimeoutMs(1000);
     Serial.printf("@@STATE v=2 boot=%08x reset=%d mode=%s splash=%u screen=%u keyboard=%u canvas=%u node=%08x selected=%08x channel=%d "
-                  "compose=%u query=%u set_section=%d set_sel=%d net_page=%d backend=%s\n",
+                  "compose=%u send_error=%u send_errno=%u query=%u set_section=%d set_sel=%d net_page=%d backend=%s\n",
                   (unsigned)hilBootId(), (int)esp_reset_reason(), hilModeName(), splashDone ? 1U : 0U,
                   screenOn ? 1U : 0U, kbMissing ? 0U : 1U,
                   haveCanvas ? 1U : 0U, (unsigned)myNodeNum(), (unsigned)selectedNum, selectedChannel, (unsigned)msgLen,
-                  (unsigned)queryLen, setSection, setSel, netPage, g_radioCompanion ? "companion" : "onboard");
+                  (unsigned)sendFailure, (unsigned)g_hilLastSendError, (unsigned)queryLen, setSection, setSel, netPage,
+                  g_radioCompanion ? "companion" : "onboard");
     Serial.printf("@@STATS v=2 messages=%d hist=%d unread=%d reactions=%d conversations=%d filtered=%d heap=%u "
                   "min_heap=%u link=%u rx_drop=%u tx_drop=%u radio_tx=%u rf_region=%d rf_power=%d sort=%u names=%u\n",
                   g_msgCount, histTotal(), unreadCount(), g_reactCount, convCount, filteredCount, (unsigned)ESP.getFreeHeap(),
@@ -5299,6 +5371,8 @@ void AdvUI::hilHome()
     scrollTop = 0;
     msgBuf[0] = 0;
     msgLen = 0;
+    sendFailure = SendFailure::NONE;
+    g_hilLastSendError = ERRNO_OK;
     pendingLat = 0;
     pendingReplyId = 0;
     reactSel = -1;
@@ -6032,8 +6106,8 @@ void AdvUI::handleKey(char ch)
                 if (nameLen)
                     nameBuf[--nameLen] = 0;
             }
-        } else if (g_ruMode && !numeric && editTarget < 20 && printable && nameLen + 2 < sizeof(nameBuf)) {
-            translitFeed(nameBuf, nameLen, sizeof(nameBuf), c, pendingLat); // WiFi/MQTT fields stay Latin
+        } else if (g_ruMode && !numeric && editTarget < 20 && printable && nameLen < maxLen) {
+            translitFeed(nameBuf, nameLen, maxLen + 1, c, pendingLat); // limits are UTF-8 bytes on the wire
         } else if (printable && nameLen < maxLen &&
                    (!numeric || (c >= '0' && c <= '9') || c == (editTarget == 4 ? ':' : '.'))) {
             nameBuf[nameLen++] = c;
@@ -6313,7 +6387,7 @@ void AdvUI::handleKey(char ch)
         } else if (enter) {
             int idx = matchedFromNewest(reactSel);
             if (idx >= 0)
-                sendReaction(idx, kQuickReacts[reactPick]);
+                sendFailure = sendReaction(idx, kQuickReacts[reactPick]);
             reactStrip = false;
             reactSel = -1;
         }
@@ -6335,6 +6409,7 @@ void AdvUI::handleKey(char ch)
             int smi = matchedFromNewest(reactSel);
             if (smi >= 0 && g_msgs[smi].id != 0) { // old history has no id to reference
                 if (pickReply) { // LEFT flow: compose a quoted reply to this message
+                    sendFailure = SendFailure::NONE;
                     pendingReplyId = g_msgs[smi].id;
                     utf8Copy(replyPrev, g_msgs[smi].text, (int)sizeof(replyPrev) - 1);
                     reactSel = -1;
@@ -6398,9 +6473,10 @@ void AdvUI::handleKey(char ch)
                 int idx = i;
                 Msg &m = g_msgs[idx];
                 if (m.from == me && m.to == selectedNum && m.status == MSG_FAILED) {
-                    uint32_t id = sendTextPacket(selectedNum, m.text);
-                    if (id) {
-                        m.id = id; // the new ACK will find it by this id
+                    SendResult result = sendTextPacket(selectedNum, m.text);
+                    sendFailure = result.failure;
+                    if (result.failure == SendFailure::NONE) {
+                        m.id = result.id; // the new ACK will find it by this id
                         m.status = MSG_SENDING;
                         m.err = 0;
                         const uint32_t now = getTime(false);
@@ -6411,6 +6487,7 @@ void AdvUI::handleKey(char ch)
                 }
             }
         } else if (tab) {
+            sendFailure = SendFailure::NONE;
             msgLen = 0; // start a fresh reply built from the picked emoji
             msgBuf[0] = 0;
             chatScroll = 0;
@@ -6418,6 +6495,7 @@ void AdvUI::handleKey(char ch)
             emojiSel = 0;
             mode = MODE_EMOJI;
         } else if (printable) {
+            sendFailure = SendFailure::NONE;
             chatScroll = 0; // jump to the bottom to compose in context
             msgBuf[0] = 0;  // start composing a reply to this node
             msgLen = 0;
@@ -6462,18 +6540,22 @@ void AdvUI::handleKey(char ch)
 
     if (mode == MODE_COMPOSE) {
         if (esc) {
+            sendFailure = SendFailure::NONE;
             pendingReplyId = 0; // cancelling compose drops the quote too
             mode = MODE_NODE;
         } else if (tab) {
+            sendFailure = SendFailure::NONE;
             emojiReturn = MODE_COMPOSE; // add an emoji into the current message
             emojiSel = 0;
             mode = MODE_EMOJI;
         } else if (enter) {
-            if (msgLen) {
-                if (selectedChannel >= 0)
-                    sendChannel(selectedChannel, msgBuf, pendingReplyId);
-                else
-                    sendMessage(selectedNum, msgBuf, pendingReplyId);
+            if (!msgLen)
+                return;
+            sendFailure = selectedChannel >= 0 ? sendChannel(selectedChannel, msgBuf, pendingReplyId)
+                                               : sendMessage(selectedNum, msgBuf, pendingReplyId);
+            if (sendFailure != SendFailure::NONE) {
+                pendingLat = 0;
+                return; // preserve both the draft and its reply target for retry
             }
             pendingReplyId = 0;
             msgLen = 0;
@@ -6482,14 +6564,17 @@ void AdvUI::handleKey(char ch)
             chatScroll = 0; // show the just-sent message at the bottom
             mode = MODE_NODE;
         } else if (bksp) {
+            sendFailure = SendFailure::NONE;
             pendingLat = 0;
             while (msgLen > 0 && ((unsigned char)msgBuf[msgLen - 1] & 0xC0) == 0x80)
                 msgBuf[--msgLen] = 0; // drop UTF-8 continuation bytes, then the lead byte
             if (msgLen)
                 msgBuf[--msgLen] = 0;
         } else if (g_ruMode && printable && msgLen + 2 < sizeof(msgBuf)) {
+            sendFailure = SendFailure::NONE;
             translitFeed(msgBuf, msgLen, sizeof(msgBuf), c, pendingLat);
         } else if (printable && msgLen < sizeof(msgBuf) - 1) {
+            sendFailure = SendFailure::NONE;
             msgBuf[msgLen++] = c;
             msgBuf[msgLen] = 0;
         }
@@ -6755,6 +6840,7 @@ int32_t AdvUI::runOnce()
     // payload bytes as commands. kBleFrameMax also bounds companion ingress.
     static uint8_t hilInjectPhase = 0;
     static bool hilInjectToCompanion = false;
+    static bool hilSendFaultPending = false;
     static uint8_t hilInjectLenLo = 0;
     static uint16_t hilInjectExpected = 0, hilInjectUsed = 0;
     static uint8_t hilInjectBuf[kBleFrameMax];
@@ -6765,7 +6851,12 @@ int32_t AdvUI::runOnce()
             screenWake(); // remote session must survive the screen auto-off: the
                           // render (and so the 'L' dump) is gated on a lit screen
 #ifdef ADVUI_HIL
-        if (hilInjectPhase) {
+        if (hilSendFaultPending) {
+            hilSendFaultPending = false;
+            g_hilNextSendError = (uint8_t)sc;
+            Serial.printf("@@FAULT v=1 ok=1 error=%u\n", (unsigned)g_hilNextSendError);
+            Serial.flush();
+        } else if (hilInjectPhase) {
             if (hilInjectPhase == 1) {
                 hilInjectLenLo = (uint8_t)sc;
                 hilInjectPhase = 2;
@@ -6851,6 +6942,8 @@ int32_t AdvUI::runOnce()
             hilInjectToCompanion = true;
             hilInjectPhase = 1;
             hilInjectExpected = hilInjectUsed = 0;
+        } else if (sc == 'F') {
+            hilSendFaultPending = true;
         } else if (sc == 'P') {
             hilPersist();
         } else if (sc == 'M') {
@@ -6888,7 +6981,7 @@ int32_t AdvUI::runOnce()
         // One complete request per UI tick. A host that immediately follows each
         // response with another query must not starve keyboard polling, splash
         // expiry, mesh pumping or rendering inside this Serial.available() loop.
-        if (!shotPendingKey && !hilInjectPhase)
+        if (!shotPendingKey && !hilInjectPhase && !hilSendFaultPending)
             break;
 #endif
     }

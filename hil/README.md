@@ -175,7 +175,9 @@ firmware. The firmware decodes them with its actual nanopb schema and passes the
 result to the production `handleFromRadio` path. It covers an incoming Unicode
 DM, packet-ID deduplication (including equal IDs from different senders),
 replies, reactions, channel broadcasts, a real
-key-driven compose/send path stopped at the radio-silent transport guard,
+key-driven compose/send path whose HIL admission result is deterministic before
+the mesh enqueue (with the radio-silent transport guard still protecting all
+engine-owned packets),
 positive routing ACK, `MAX_RETRANSMIT` NAK, malformed UTF-8 and protobuf, plus
 negative filters for non-packet envelopes, still-encrypted payloads, unrelated
 ports, route-discovery traffic, missing request IDs and malformed routing data.
@@ -205,8 +207,9 @@ battery, channels, LoRa/device config and `config_complete_id` are asserted from
 the resulting state. A second `my_info` on the same logical connection then
 proves that a resync replaces stale nodes, channels and configuration and
 recounts the new snapshot. A mesh packet then crosses the real companion RX queue into
-the production UI handler, with its direct allocation delta and current-heap
-samples checked. Fixture cleanup
+the production UI handler, with its sustained burst heap envelope and current-heap
+samples checked. Per-call deltas remain diagnostic because asynchronous USB/log
+task allocations can overlap a decoder call. Fixture cleanup
 also initializes the on-demand companion buffer block and reapplies the 12 KiB
 clean-start lifetime heap floor before those scenarios proceed. Before the onboard-storage workload,
 HIL explicitly releases that companion-only arena, matching the mandatory reboot between

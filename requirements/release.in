@@ -1,0 +1,8 @@
+esptool>=5.3,<6
+requests>=2.32,<3
+
+# The release job is Linux, where esptool permits the patched cryptography 50.x
+# line. Retain an explicit Intel-macOS fallback so this source file still
+# compiles as a truthful universal lock.
+cryptography>=50,<51 ; sys_platform != 'darwin' or platform_machine != 'x86_64'
+cryptography>=48,<49 ; sys_platform == 'darwin' and platform_machine == 'x86_64'

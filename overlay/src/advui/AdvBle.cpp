@@ -640,7 +640,8 @@ bool routeFromRadio(const uint8_t *bytes, uint16_t len)
         g_linkConfigDone = true;
         LOG_INFO("advui: companion config complete, %d nodes, preset=%d", (int)g_compNodeCount, (int)g_compPreset);
         break;
-    case meshtastic_FromRadio_packet_tag: { // mesh traffic: hand off to the UI pipeline
+    case meshtastic_FromRadio_packet_tag:
+    case meshtastic_FromRadio_queueStatus_tag: { // mesh traffic and TX admission results -> UI pipeline
         BleFrame frame = {};
         if (len <= sizeof(frame.data)) {
             frame.len = len;

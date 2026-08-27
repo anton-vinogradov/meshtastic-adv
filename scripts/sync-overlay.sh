@@ -185,4 +185,15 @@ if [ -f "$ND" ] && [ -f "$NDH" ] && ! grep -q 'advui-inject-forward-nodedb' "$ND
   fi
 fi
 
+# ADV sends need the synchronous queue-admission result. Existing callers may
+# ignore the returned ErrorCode, so widening the API is source-compatible.
+MS="$FW/src/mesh/MeshService.cpp"
+MSH="$FW/src/mesh/MeshService.h"
+if grep -q '^void MeshService::sendToMesh' "$MS"; then
+  git -C "$FW" apply "$ROOT/overlay/patches/meshservice-send-result.patch"
+  echo "injected MeshService send result"
+fi
+grep -q '^ErrorCode MeshService::sendToMesh' "$MS"
+grep -q '^    ErrorCode sendToMesh' "$MSH"
+
 echo "overlay synced into $FW"

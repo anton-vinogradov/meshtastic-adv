@@ -224,6 +224,15 @@ def make_routing_frame(
     )
 
 
+def make_queue_status_frame(error: int, packet_id: int, *, free: int = 0, maxlen: int = 16) -> bytes:
+    """Build the PhoneAPI admission result emitted after sendToMesh()."""
+    status = protobuf_uint(1, error)
+    status += protobuf_uint(2, free)
+    status += protobuf_uint(3, maxlen)
+    status += protobuf_uint(4, packet_id)
+    return protobuf_bytes(11, status)
+
+
 def make_companion_my_info(node: int) -> bytes:
     return protobuf_bytes(3, protobuf_uint(1, node))
 
@@ -556,11 +565,10 @@ def stage_release_image(image_override: Path | None, temporary_root: Path) -> tu
 
 
 def chip_mac(port: str) -> str:
-    # esptool 4.x (the version pinned by the firmware toolchain and HIL
-    # requirements) uses underscore command names. Hyphenated spellings are
-    # rejected by argparse before a serial connection is attempted.
+    # Use the canonical esptool 5.x command spelling. The HIL interpreter pins
+    # that major independently of PlatformIO's embedded toolchain.
     output = run_captured(
-        find_esptool() + ["--chip", "esp32s3", "--port", port, "read_mac"],
+        find_esptool() + ["--chip", "esp32s3", "--port", port, "read-mac"],
         redact_command=True,
     )
     matches = re.findall(r"^MAC:\s*([0-9a-f:]{17})\s*$", output, re.IGNORECASE | re.MULTILINE)
@@ -623,7 +631,7 @@ def flash(
     image = validate_app_image(image_override) if image_override is not None else firmware_image(env_name)
     command = find_esptool() + [
         "--chip", "esp32s3", "--port", str(live["port"]), "--baud", "921600",
-        "write_flash", "--flash_mode", "dio", "--flash_freq", "80m", "--flash_size", "8MB",
+        "write-flash", "--flash-mode", "dio", "--flash-freq", "80m", "--flash-size", "8MB",
         "0x10000", str(image),
     ]
     run_checked(command, redact_output=True)
@@ -631,7 +639,7 @@ def flash(
     run_checked(
         find_esptool() + [
             "--chip", "esp32s3", "--port", str(verified["port"]),
-            "verify_flash", "0x10000", str(image),
+            "verify-flash", "0x10000", str(image),
         ],
         redact_output=True,
     )
@@ -963,6 +971,11 @@ class HilSession:
         time.sleep(0.01)
         return response
 
+    def fault_next_send(self, error: int) -> dict[str, str]:
+        if not 0 <= error <= 255:
+            raise HilError(f"send fault must fit one byte: {error}")
+        return parse_fields(self.exchange(b"F" + bytes((error,)), "@@FAULT"), "@@FAULT")
+
     def clear(self) -> dict[str, str]:
         self.exchange(b"E", "@@ACK clear")
         return self.wait_state({"messages": "0", "reactions": "0"})
@@ -1124,6 +1137,21 @@ def require_heap_fields(
 def require_heap_headroom(state: dict[str, str], minimum: int = 12_000) -> dict[str, int]:
     """Gate a clean phase on both current and lifetime minimum free heap."""
     return require_heap_fields(state, ("heap", "min_heap"), minimum)
+
+
+def require_companion_ingress_heap(
+    state: dict[str, str], minimum: int = 12_000, retained_tolerance: int = 512
+) -> dict[str, int]:
+    """Gate sustained companion-ingress retention, not asynchronous heap noise."""
+    values = require_heap_fields(state, ("heap", "ingress_first", "ingress_pre", "ingress_last"), minimum)
+    # FreeRTOS logging/native-USB work can allocate and free around an individual
+    # decoder call, so summing per-call deltas and gating the largest transient
+    # misclassified harmless 2 KiB task activity as a decoder leak on hardware.
+    # The first/last envelope spans the complete 66-node burst and catches the
+    # retained growth that matters, with a small allocator-alignment allowance.
+    if values["ingress_last"] + retained_tolerance < values["ingress_first"]:
+        raise HilError(f"companion ingress retained heap across the burst: {state}")
+    return values
 
 
 def require_scoped_heap_headroom(
@@ -1423,7 +1451,19 @@ def message_flow(fixture: dict[str, object], artifacts: Path) -> Report:
             require_fields(opened, {"selected": f"{source:08x}"})
             session.key("o", {"mode": "compose", "compose": "1"})
             session.key("k", {"mode": "compose", "compose": "2"})
-            state = session.key("~", {"mode": "node", "messages": "4", "sending": "1"})
+            session.fault_next_send(32)  # ERRNO_UNKNOWN: deterministic local TX FIFO rejection
+            rejected = session.key(
+                "~", {
+                    "mode": "compose", "compose": "2", "send_error": "2",
+                    "send_errno": "32", "messages": "3",
+                }
+            )
+            state = session.key(
+                "~", {
+                    "mode": "node", "messages": "4", "sending": "1",
+                    "send_error": "0", "send_errno": "34",
+                }
+            )
             request_id = int(state["id"], 16)
             if request_id == 0:
                 raise HilError(f"UI send did not allocate a packet id: {state}")
@@ -1445,11 +1485,22 @@ def message_flow(fixture: dict[str, object], artifacts: Path) -> Report:
             malformed_routing = require_fields(
                 session.query(), {"sending": "1", "delivered": "0", "failed": "0"}
             )
-            session.inject(make_routing_frame(source, me, request_id, 0))
+            session.inject(make_queue_status_frame(32, request_id))
+            queue_rejected = require_fields(
+                session.wait_state({"sending": "0", "delivered": "0", "failed": "1"}),
+                {"err": "32"},
+            )
+            retried = session.key("~", {"mode": "node", "sending": "1", "failed": "0"})
+            retry_id = int(retried["id"], 16)
+            if retry_id == request_id:
+                raise HilError(f"retry reused rejected packet id: {retried}")
+            session.inject(make_routing_frame(source, me, retry_id, 0))
             result = require_fields(
                 session.wait_state({"sending": "0", "delivered": "1"}), {"failed": "0", "radio_tx": "0"}
             )
-            result["request_id"] = f"{request_id:08x}"
+            result["request_id"] = f"{retry_id:08x}"
+            result["draft_preserved"] = rejected
+            result["queue_rejected"] = queue_rejected
             result["ignored_before_ack"] = {
                 "route_request": route_request,
                 "missing_request_id": no_request_id,
@@ -1524,9 +1575,7 @@ def message_flow(fixture: dict[str, object], artifacts: Path) -> Report:
                     "name_fnv": fnv1a32(b"Fixture 63"),
                 },
             )
-            if int(state.get("ingress_direct", "-1")) < -128 or int(state.get("ingress_max", "999")) > 128:
-                raise HilError(f"companion ingress retained heap inside the decoder/router: {state}")
-            require_heap_fields(state, ("heap", "ingress_first", "ingress_pre", "ingress_last"))
+            require_companion_ingress_heap(state)
             return state
 
         report.check("companion/bounded-66-node-db-mirror", companion_nodes_case)

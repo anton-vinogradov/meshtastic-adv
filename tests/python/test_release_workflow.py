@@ -42,11 +42,11 @@ class ReleaseWorkflowTests(unittest.TestCase):
         self.assertIn("command -v python3.12", block)
         self.assertIn('python3.12 -m venv "$RUNNER_TEMP/meshtastic-adv-hil-venv"', block)
         self.assertIn('echo "$RUNNER_TEMP/meshtastic-adv-hil-venv/bin" >> "$GITHUB_PATH"', block)
-        self.assertIn("python -m pip install -r hil/requirements.txt", block)
+        self.assertIn("python -m pip install --require-hashes -r hil/requirements.txt", block)
 
     def test_host_ci_runs_actionlint(self):
         block = job("host-tests")
-        self.assertIn("docker://rhysd/actionlint:1.7.12", block)
+        self.assertIn("docker://rhysd/actionlint@sha256:", block)
 
     def test_malformed_release_tag_cannot_reach_physical_hil(self):
         host = job("host-tests")
@@ -93,6 +93,8 @@ class ReleaseWorkflowTests(unittest.TestCase):
         self.assertIn("cp docs/unifont.bin /tmp/unifont.bin", block[:checkout_main])
         self.assertIn("cp scripts/check-installer.py /tmp/check-installer.py", block[:checkout_main])
         self.assertIn("cp scripts/mkm5burner.sh /tmp/mkm5burner.sh", block[:checkout_main])
+        self.assertIn("cp requirements/release.txt /tmp/release-requirements.txt", block[:checkout_main])
+        self.assertIn("pip install --require-hashes -r /tmp/release-requirements.txt", block[:checkout_main])
         self.assertIn('echo "engine=$engine" >> "$GITHUB_OUTPUT"', block[:checkout_main])
         self.assertIn('python scripts/release_tag.py "$GITHUB_REF_NAME" >> "$GITHUB_OUTPUT"', block[:checkout_main])
         self.assertIn("cp /tmp/unifont.bin docs/unifont.bin", block[checkout_main:publish])
@@ -118,6 +120,36 @@ class ReleaseWorkflowTests(unittest.TestCase):
         self.assertIn('API = "https://m5burner-api.m5stack.com"', publisher)
         self.assertNotIn('API = "http://', publisher)
 
+    def test_stable_release_fails_closed_until_m5burner_is_public(self):
+        block = job("release")
+        m5burner = block.split("- name: Publish to M5Burner", 1)[1]
+        self.assertNotIn("continue-on-error", m5burner)
+        self.assertIn('echo "M5Burner secrets not set"', m5burner)
+        self.assertIn("exit 1", m5burner)
+        self.assertNotIn("pip install", m5burner)
+        publisher = (ROOT / "scripts/m5burner_publish.py").read_text()
+        self.assertIn("verify_public_version", publisher)
+        self.assertIn('public.get("published") is True', publisher)
+
+    def test_external_actions_and_python_installs_are_immutable(self):
+        for reference in re.findall(r"(?m)^\s+uses:\s+([^\s#]+)", WORKFLOW):
+            if reference.startswith("docker://"):
+                self.assertIn("@sha256:", reference)
+            else:
+                self.assertRegex(reference, r"@[0-9a-f]{40}$")
+        self.assertNotRegex(WORKFLOW, r"pip install ['\"]?[^\n]*[<>=]")
+        self.assertEqual(WORKFLOW.count("pip install --require-hashes"), 3)
+
+    def test_release_tooling_excludes_fixed_python_vulnerabilities(self):
+        for relative in ("hil/requirements.txt", "requirements/release.txt"):
+            lock = (ROOT / relative).read_text()
+            self.assertRegex(lock, r"(?m)^esptool==5\.")
+            self.assertNotRegex(lock, r"(?m)^ecdsa==")
+            self.assertIn(
+                "cryptography==50.0.1 ; platform_machine != 'x86_64' or sys_platform != 'darwin'",
+                lock,
+            )
+
     def test_installer_commit_errors_are_not_treated_as_no_change(self):
         block = job("release")
         self.assertIn("if git diff --cached --quiet; then", block)
@@ -131,13 +163,13 @@ class ReleaseWorkflowTests(unittest.TestCase):
             self.assertIn("meshtastic-adv-vX.Y.Z.factory.bin", text)
             self.assertIn("meshtastic-adv-cardputer-adv-merged.bin", text)
 
-    def test_merged_image_builder_is_esptool4_safe_and_fail_closed(self):
+    def test_merged_image_builder_is_esptool5_safe_and_fail_closed(self):
         script = (ROOT / "scripts/mkm5burner.sh").read_text()
-        self.assertIn("merge_bin", script)
-        self.assertIn("--flash_mode", script)
-        self.assertIn("--flash_size", script)
-        self.assertNotIn("merge-bin", script)
-        self.assertNotIn("--flash-mode", script)
+        self.assertIn("merge-bin", script)
+        self.assertIn("--flash-mode", script)
+        self.assertIn("--flash-size", script)
+        self.assertNotIn("merge_bin", script)
+        self.assertNotIn("--flash_mode", script)
         self.assertNotIn("|| true", script)
         self.assertNotIn("assert ", script)
         self.assertIn('rm -f -- "$OUT"', script)

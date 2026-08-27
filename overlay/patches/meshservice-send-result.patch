@@ -1,0 +1,34 @@
+diff --git a/src/mesh/MeshService.cpp b/src/mesh/MeshService.cpp
+index 952a6d2be..089b92701 100644
+--- a/src/mesh/MeshService.cpp
++++ b/src/mesh/MeshService.cpp
+@@ -244,7 +244,7 @@ ErrorCode MeshService::sendQueueStatusToPhone(const meshtastic_QueueStatus &qs,
+     return res ? ERRNO_OK : ERRNO_UNKNOWN;
+ }
+ 
+-void MeshService::sendToMesh(meshtastic_MeshPacket *p, RxSource src, bool ccToPhone)
++ErrorCode MeshService::sendToMesh(meshtastic_MeshPacket *p, RxSource src, bool ccToPhone)
+ {
+     uint32_t mesh_packet_id = p->id;
+     nodeDB->updateFrom(*p); // update our local DB for this packet (because phone might have sent position packets etc...)
+@@ -272,6 +272,7 @@ void MeshService::sendToMesh(meshtastic_MeshPacket *p, RxSource src, bool ccToPh
+     if (res == ERRNO_SHOULD_RELEASE) {
+         releaseToPool(p);
+     }
++    return res;
+ }
+ 
+ bool MeshService::trySendPosition(NodeNum dest, bool wantReplies)
+diff --git a/src/mesh/MeshService.h b/src/mesh/MeshService.h
+index 71fb544a0..9122efdb6 100644
+--- a/src/mesh/MeshService.h
++++ b/src/mesh/MeshService.h
+@@ -164,7 +164,7 @@ class MeshService
+     /// Send a packet into the mesh - note p must have been allocated from packetPool.  We will return it to that pool after
+     /// sending. This is the ONLY function you should use for sending messages into the mesh, because it also updates the nodedb
+     /// cache
+-    void sendToMesh(meshtastic_MeshPacket *p, RxSource src = RX_SRC_LOCAL, bool ccToPhone = false);
++    ErrorCode sendToMesh(meshtastic_MeshPacket *p, RxSource src = RX_SRC_LOCAL, bool ccToPhone = false);
+ 
+     /** Attempt to cancel a previously sent packet from this _local_ node.  Returns true if a packet was found we could cancel */
+     bool cancelSending(PacketId id);

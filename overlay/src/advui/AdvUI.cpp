@@ -5332,13 +5332,20 @@ void AdvUI::hilInjectCompanion(const uint8_t *bytes, uint16_t len)
     if (ok) {
         // Companion mesh packets normally cross the fixed pump->UI queue. Drain
         // it here as runOnce would after a real BLE read, retaining that boundary.
+        bool uiChanged = false;
         BleFrame frame;
         while (bleNextPacket(&frame)) {
             meshtastic_FromRadio fr = meshtastic_FromRadio_init_default;
-            if (pb_decode_from_bytes(frame.data, frame.len, &meshtastic_FromRadio_msg, &fr))
+            if (pb_decode_from_bytes(frame.data, frame.len, &meshtastic_FromRadio_msg, &fr)) {
                 handleFromRadio(fr);
+                uiChanged = true;
+            }
         }
-        uiDirty = true;
+        // Production routes node/channel/config frames on the BLE pump without
+        // forcing a full display push for every entry. HIL must not invent 66
+        // back-to-back 32 KB redraws while exercising that same config stream.
+        if (uiChanged)
+            uiDirty = true;
     }
     Serial.printf("@@CINJECT v=1 ok=%u bytes=%u\n", ok ? 1U : 0U, (unsigned)len);
     Serial.flush();

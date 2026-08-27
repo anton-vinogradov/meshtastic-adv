@@ -46,6 +46,15 @@ class HilRunnerTests(unittest.TestCase):
         self.assertNotIn("vQueueDelete(", body)
         self.assertIn("free(g_buffers)", body)
 
+    def test_hil_companion_config_stream_does_not_invent_ui_redraws(self):
+        source = (ROOT / "overlay/src/advui/AdvUI.cpp").read_text()
+        body = source.split("void AdvUI::hilInjectCompanion", 1)[1].split(
+            "void AdvUI::hilClearData", 1
+        )[0]
+        self.assertIn("bool uiChanged = false", body)
+        self.assertIn("if (uiChanged)\n            uiDirty = true", body)
+        self.assertNotIn("}\n        uiDirty = true;", body)
+
     def test_advisory_epoch_write_cannot_overlap_a_message_burst(self):
         source = (ROOT / "overlay/src/advui/AdvUI.cpp").read_text()
         epoch = source.split("void epochNote()", 1)[1].split("uint32_t savedDateEpoch()", 1)[0]
@@ -74,6 +83,57 @@ class HilRunnerTests(unittest.TestCase):
             self.assertEqual(session.exchange(b"E", "@@ACK clear", attempts=2), "@@ACK clear")
         sleep.assert_called_once_with(0.15)
         self.assertEqual(session.send.call_count, 2)
+
+    def test_demo_row_loss_is_drained_and_classified_for_retry(self):
+        session = object.__new__(hil.HilSession)
+        session.serial = mock.Mock()
+        session.serial.readline.side_effect = [
+            b"@@SHOT splash 2 2\n",
+            b"0001\n",
+            b"@@END\n",
+            b"@@DONE\n",
+        ]
+        session.send = mock.Mock()
+        with tempfile.TemporaryDirectory() as directory:
+            with self.assertRaisesRegex(hil.DemoCaptureTransportError, "received 1/2 rows"):
+                session.demo_frames(Path(directory), 1)
+        self.assertEqual(session.serial.readline.call_count, 4)
+
+    def test_visual_retries_one_transport_loss_after_a_proven_reboot(self):
+        capture_one = mock.MagicMock()
+        capture_one.query.return_value = {"node": "00000001", "backend": "onboard", "boot": "one"}
+        capture_one.demo_frames.side_effect = hil.DemoCaptureTransportError("lost row")
+        verify_one = mock.MagicMock()
+        verify_one.wait_state.return_value = {"boot": "two"}
+        capture_two = mock.MagicMock()
+        capture_two.query.return_value = {"node": "00000001", "backend": "onboard", "boot": "two"}
+        frames = [
+            {"name": name, "sha256": f"{index:064x}", "colors": 4}
+            for index, name in enumerate(hil.EXPECTED_DEMO_FRAMES, 1)
+        ]
+        capture_two.demo_frames.return_value = frames
+        verify_two = mock.MagicMock()
+        verify_two.wait_state.return_value = {"boot": "three"}
+        sessions = [capture_one, verify_one, capture_two, verify_two]
+        for session in sessions:
+            session.__enter__.return_value = session
+
+        with tempfile.TemporaryDirectory() as directory:
+            with (
+                mock.patch.object(
+                    hil,
+                    "resolve_role",
+                    return_value={"port": "/dev/dut", "usb_serial": "02:11:22:33:44:55"},
+                ),
+                mock.patch.object(hil, "HilSession", side_effect=sessions),
+                mock.patch.object(hil, "wait_for_usb_serial", return_value={"port": "/dev/dut"}),
+                mock.patch.object(hil.time, "sleep"),
+            ):
+                report = hil.visual({"schema": 2}, Path(directory), 1)
+
+        self.assertEqual(report.failed, 0)
+        capture_one.demo_frames.assert_called_once()
+        capture_two.demo_frames.assert_called_once()
 
     def test_query_keeps_selected_and_companion_channel_fields_distinct(self):
         session = object.__new__(hil.HilSession)
@@ -333,6 +393,33 @@ class HilRunnerTests(unittest.TestCase):
         )
         with self.assertRaises(hil.HilError):
             hil.require_heap_headroom({"heap": "11999", "min_heap": "12000"})
+
+    def test_feature_heap_gate_uses_named_current_samples(self):
+        self.assertEqual(
+            hil.require_heap_fields(
+                {"heap": "13000", "before": "12500", "min_heap": "1000"},
+                ("heap", "before"),
+            ),
+            {"heap": 13000, "before": 12500},
+        )
+        with self.assertRaises(hil.HilError):
+            hil.require_heap_fields({"heap": "13000", "before": "11999"}, ("heap", "before"))
+
+    def test_scoped_heap_gate_ignores_only_an_older_lifetime_low(self):
+        polluted = {
+            "heap": "15000", "save_before": "14000", "save_after": "13000",
+            "min_before": "2500", "min_after": "2500",
+        }
+        values = hil.require_scoped_heap_headroom(
+            polluted, ("heap", "save_before", "save_after"), "min_before", "min_after"
+        )
+        self.assertEqual(values["min_after"], 2500)
+
+        new_trough = {**polluted, "min_before": "13000", "min_after": "11000"}
+        with self.assertRaises(hil.HilError):
+            hil.require_scoped_heap_headroom(
+                new_trough, ("heap", "save_before", "save_after"), "min_before", "min_after"
+            )
 
     def test_persist_rejects_failed_device_commit(self):
         session = object.__new__(hil.HilSession)

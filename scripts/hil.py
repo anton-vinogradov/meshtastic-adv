@@ -47,6 +47,10 @@ class UnexpectedReboot(HilError):
     pass
 
 
+class DemoCaptureTransportError(HilError):
+    pass
+
+
 def redact_lab_details(value: str) -> str:
     """Remove stable USB identities and ephemeral serial paths from public evidence."""
     value = USB_IDENTITY_RE.sub("<usb-identity>", value)
@@ -1028,6 +1032,7 @@ class HilSession:
         current: tuple[str, int, int] | None = None
         rows: list[str] = []
         frames: list[dict[str, object]] = []
+        transport_error: DemoCaptureTransportError | None = None
         while time.monotonic() < deadline:
             line = self.serial.readline().decode("ascii", "replace").strip()
             if line.startswith("@@SHOT "):
@@ -1039,7 +1044,15 @@ class HilSession:
             elif line == "@@END" and current:
                 name, width, height = current
                 if len(rows) != height:
-                    raise HilError(f"{name}: received {len(rows)}/{height} rows")
+                    if transport_error is None:
+                        transport_error = DemoCaptureTransportError(
+                            f"{name}: received {len(rows)}/{height} rows"
+                        )
+                    current = None
+                    # Consume the remaining matrix through @@DONE so the
+                    # firmware reaches its transactional reboot. The visual
+                    # suite can then retry the whole deterministic dump once.
+                    continue
                 pixels = b"".join(bytes.fromhex(row) for row in rows)
                 if len(pixels) != width * height or len(set(pixels)) < 2:
                     raise HilError(f"{name}: blank or truncated framebuffer")
@@ -1067,6 +1080,8 @@ class HilSession:
                     rows.append(line)
         else:
             raise HilError("demo capture timed out")
+        if transport_error is not None:
+            raise transport_error
         names = [str(frame["name"]) for frame in frames]
         if names != EXPECTED_DEMO_FRAMES:
             raise HilError(f"demo frame set/order mismatch: {names}")
@@ -1097,10 +1112,38 @@ def require_fields(state: dict[str, str], expected: dict[str, str]) -> dict[str,
     return state
 
 
-def require_heap_headroom(state: dict[str, str], minimum: int = 12_000) -> dict[str, int]:
-    values = {name: int(state.get(name, "0")) for name in ("heap", "min_heap")}
+def require_heap_fields(
+    state: dict[str, str], fields: tuple[str, ...], minimum: int = 12_000
+) -> dict[str, int]:
+    values = {name: int(state.get(name, "0")) for name in fields}
     if min(values.values()) < minimum:
         raise HilError(f"unsafe heap headroom (minimum {minimum}): {state}")
+    return values
+
+
+def require_heap_headroom(state: dict[str, str], minimum: int = 12_000) -> dict[str, int]:
+    """Gate a clean phase on both current and lifetime minimum free heap."""
+    return require_heap_fields(state, ("heap", "min_heap"), minimum)
+
+
+def require_scoped_heap_headroom(
+    state: dict[str, str],
+    current_fields: tuple[str, ...],
+    watermark_before: str,
+    watermark_after: str,
+    minimum: int = 12_000,
+) -> dict[str, int]:
+    """Gate one feature without charging it for an older unrelated heap trough."""
+    values = require_heap_fields(state, current_fields, minimum)
+    before = int(state.get(watermark_before, "0"))
+    after = int(state.get(watermark_after, "0"))
+    values[watermark_before] = before
+    values[watermark_after] = after
+    # The ESP watermark is monotonic for the whole boot. It describes this
+    # feature only when it moved while the feature was running; an unchanged
+    # older low belongs to a previous display/engine phase.
+    if after < before and after < minimum:
+        raise HilError(f"unsafe scoped heap headroom (minimum {minimum}): {state}")
     return values
 
 
@@ -1483,7 +1526,7 @@ def message_flow(fixture: dict[str, object], artifacts: Path) -> Report:
             )
             if int(state.get("ingress_direct", "-1")) < -128 or int(state.get("ingress_max", "999")) > 128:
                 raise HilError(f"companion ingress retained heap inside the decoder/router: {state}")
-            require_heap_headroom(state)
+            require_heap_fields(state, ("heap", "ingress_first", "ingress_pre", "ingress_last"))
             return state
 
         report.check("companion/bounded-66-node-db-mirror", companion_nodes_case)
@@ -1622,6 +1665,7 @@ def message_flow(fixture: dict[str, object], artifacts: Path) -> Report:
                             "hist": int(checkpoint.get("hist", "-1")),
                         }
                     )
+                    require_heap_fields(checkpoint, ("heap",))
                     state = checkpoint
             state = require_fields(
                 state,
@@ -1629,7 +1673,14 @@ def message_flow(fixture: dict[str, object], artifacts: Path) -> Report:
             )
             memory = state
             try:
-                require_heap_headroom(state)
+                if int(memory.get("saves", "0")) < 1:
+                    raise HilError(f"storage workload did not persist its live ring: {memory}")
+                require_scoped_heap_headroom(
+                    memory,
+                    ("heap", "save_before", "save_after"),
+                    "min_before",
+                    "min_after",
+                )
             except HilError as exc:
                 raise HilError(f"{exc}; overflow checkpoints={checkpoints}; persistence={memory}") from exc
             return {"state": state, "checkpoints": checkpoints, "persistence": memory}
@@ -1813,21 +1864,34 @@ def visual(fixture: dict[str, object], artifacts: Path, timeout: float) -> Repor
 
     def capture_case():
         nonlocal frame_data
-        with HilSession(str(dut["port"])) as session:
-            state = session.query()
-            report.protect_node_id(state.get("node"))
-            require_fields(state, {"backend": "onboard"})
-            boot_before = state["boot"]
-            frame_data = session.demo_frames(artifacts / "frames", timeout)
-            unique = len({str(frame["sha256"]) for frame in frame_data})
-            if unique < 20:
-                raise HilError(f"only {unique}/{len(frame_data)} visually distinct demo frames")
-        time.sleep(3)  # runDemoDump ends with a transactional reboot
-        live = wait_for_usb_serial(str(dut["usb_serial"]), timeout=20)
-        with HilSession(str(live["port"])) as session:
-            restored = session.wait_state({"splash": "1", "backend": "onboard"}, timeout=30)
-        if restored.get("boot") == boot_before:
-            raise HilError(f"visual reboot was not proven: boot nonce stayed {boot_before}")
+        live = dut
+        restored: dict[str, str] = {}
+        for attempt in range(2):
+            capture_error: DemoCaptureTransportError | None = None
+            with HilSession(str(live["port"])) as session:
+                state = session.query()
+                report.protect_node_id(state.get("node"))
+                require_fields(state, {"backend": "onboard"})
+                boot_before = state["boot"]
+                try:
+                    frame_data = session.demo_frames(artifacts / "frames", timeout)
+                except DemoCaptureTransportError as exc:
+                    capture_error = exc
+            time.sleep(3)  # runDemoDump ends with a transactional reboot
+            live = wait_for_usb_serial(str(dut["usb_serial"]), timeout=20)
+            with HilSession(str(live["port"])) as session:
+                restored = session.wait_state({"splash": "1", "backend": "onboard"}, timeout=30)
+            if restored.get("boot") == boot_before:
+                raise HilError(f"visual reboot was not proven: boot nonce stayed {boot_before}")
+            if capture_error is None:
+                break
+            if attempt == 1:
+                raise capture_error
+            print(f"RETRY visual matrix after USB row loss: {capture_error}", flush=True)
+
+        unique = len({str(frame["sha256"]) for frame in frame_data})
+        if unique < 20:
+            raise HilError(f"only {unique}/{len(frame_data)} visually distinct demo frames")
         hashes_path = artifacts / "visual-hashes.json"
         hashes_path.write_text(json.dumps(frame_data, indent=2) + "\n")
         os.chmod(hashes_path, 0o600)

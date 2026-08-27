@@ -141,6 +141,10 @@ truncated-but-plausible CLI response cannot masquerade as configuration drift.
 Secret exports live only in an owner-readable system temporary directory
 and are deleted before the runner exits; HIL evidence records only the comparison
 result and error type.
+The deterministic visual matrix requires every framebuffer row. If native USB
+loses a row, the runner drains the current matrix through its proven reboot and
+retries the complete matrix once; a second loss or any content mismatch still
+fails the release.
 Use `--skip-build` only during local runner development when both images already
 exist. A summary and the four sub-suite reports share one timestamped artifact
 directory.
@@ -186,10 +190,12 @@ ledger before admitting a fresh sender by bounded oldest-entry replacement. The 
 node sort and name style, commits their atomic UI configuration and proves both
 values and exact reaction targets survive the same reboot. A synthetic isolated
 `AVS4` save also proves old target-less reactions migrate conservatively into
-the current format. Lightweight single-record memory checkpoints keep the
-diagnostic USB protocol itself out of the watermark, and engine-owned NodeInfo
+the current format. Lightweight single-record current-heap checkpoints keep the
+diagnostic USB protocol itself out of the measurement, and engine-owned NodeInfo
 sends are omitted from the radio-silent build because they are not ADV receive/UI
-behavior. The 12 KiB heap floor is reapplied after this reachable storage workload. The suite uses
+behavior. The 12 KiB heap floor is applied to each checkpoint and the save's
+before/after samples; a newly lowered ESP watermark is also gated, while an older
+display/engine trough is not misattributed to storage. The suite uses
 isolated `/advui_hil_*` files for messages, seen nodes, UI/radio preferences and
 the BLE crash guard, and clears them at both boundaries; their production
 counterparts are never opened or replaced. A second in-memory ingress replays the stock BLE
@@ -199,9 +205,10 @@ battery, channels, LoRa/device config and `config_complete_id` are asserted from
 the resulting state. A second `my_info` on the same logical connection then
 proves that a resync replaces stale nodes, channels and configuration and
 recounts the new snapshot. A mesh packet then crosses the real companion RX queue into
-the production UI handler, with its drop counter and heap floor checked. Fixture cleanup
+the production UI handler, with its direct allocation delta and current-heap
+samples checked. Fixture cleanup
 also initializes the on-demand companion buffer block and reapplies the 12 KiB
-runtime heap floor before those scenarios proceed. Before the onboard-storage workload,
+clean-start lifetime heap floor before those scenarios proceed. Before the onboard-storage workload,
 HIL explicitly releases that companion-only arena, matching the mandatory reboot between
 radio backends; the heap gate therefore never measures an impossible co-resident mode.
 

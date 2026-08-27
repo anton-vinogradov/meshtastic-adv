@@ -45,6 +45,13 @@ This is the planned scope of the Meshtastic ADV 1.0 release candidate.
   hint.
 - UTF-8 truncation, malformed input and legacy-history failure paths are bounded
   and fail without replacing recoverable stored data.
+- Visual HIL drains and retries one complete deterministic matrix after a native
+  USB row loss, while still rejecting incomplete frames and content regressions.
+- Synthetic companion config streams now follow production redraw semantics
+  instead of forcing a full display push for every mirrored node.
+- Per-feature HIL memory gates use direct/current samples and newly observed
+  troughs, so an earlier display allocation cannot be misattributed to storage
+  or companion ingress; clean-start checks still enforce the lifetime minimum.
 
 ### Release safety
 

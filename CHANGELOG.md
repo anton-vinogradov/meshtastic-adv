@@ -41,6 +41,8 @@ No user-visible changes are pending after 1.0.3.
   install the hash-locked PlatformIO CLI without its unused vulnerable Home web
   stack. nanopb's gRPC generator is declared and locked instead of being
   downloaded during a clean build.
+- Official GitHub Actions are pinned to their current Node 24 releases instead
+  of relying on GitHub's temporary Node 20 compatibility override.
 
 ## [1.0.2] - 2026-08-27
 

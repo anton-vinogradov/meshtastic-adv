@@ -11,8 +11,8 @@
 UI, написанный с нуля ради одной цели: чтобы **переписываться по мешу** с карманного QWERTY-устройства было по-настоящему удобно — без телефона — при этом внизу остаётся проверенный радио-стек Meshtastic. Нет LoRa-капа? [Режим компаньона](#режим-компаньона-чужая-нода-по-ble) превращает Cardputer в терминал для вашего Heltec / T-Beam / RAK.
 
 <p align="center">
-  <a href="docs/img/demo.gif"><img src="docs/img/hero.png" width="72%" alt="Meshtastic ADV на Cardputer ADV: открытие непрочитанного чата, набор с эмодзи, подтверждение доставки и входящий ответ, реакция и ответ с цитатой на кириллице"/></a>
-  <br/><sub><a href="docs/img/demo.gif">▶ открыть 16-секундное демо</a> · настоящий UI прошивки с синтетическим диалогом · рендер устройства © <a href="https://shop.m5stack.com/products/m5stack-cardputer-adv-version-esp32-s3">M5Stack</a></sub>
+  <img src="docs/img/demo.gif?sha256=26ee131a27ec1cbf4493ad4dcddf4df02b4b8a8adce2a5975e34390c60be8ccc" width="72%" alt="Meshtastic ADV: открытие непрочитанного чата, набор с эмодзи, подтверждение доставки и входящий ответ, реакция и ответ с цитатой на кириллице"/>
+  <br/><sub>16-секундное демо · настоящий UI прошивки с синтетическим диалогом</sub>
 </p>
 
 > **[▶ Установка из браузера](https://anton-vinogradov.github.io/meshtastic-adv/)** — один клик, без тулчейна (десктопный Chrome/Edge).

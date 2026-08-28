@@ -507,7 +507,9 @@ jobs:
             python /tmp/update_social_image.py \
               --html docs/index.html \
               --image docs/img/hero.png \
-              --url https://anton-vinogradov.github.io/meshtastic-adv/img/hero.png
+              --url https://anton-vinogradov.github.io/meshtastic-adv/img/hero.png \
+              --demo docs/img/demo.gif \
+              --poster docs/img/hero.png
             cp docs/index.html /tmp/site-index.html
             tmp=$(mktemp)
             jq --arg v "$ver (advui · engine $engine)" '.version=$v' docs/manifest.json > "$tmp" && mv "$tmp" docs/manifest.json

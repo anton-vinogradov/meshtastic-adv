@@ -40,3 +40,36 @@ class SocialImageTests(unittest.TestCase):
             html.write_text('<meta property="og:image" content="http://bad.invalid/x" />\n')
             with self.assertRaisesRegex(RuntimeError, "HTTPS|exact matching"):
                 social.update(html, image, "http://bad.invalid/x")
+
+    def test_inline_demo_and_poster_urls_are_bound_to_exact_bytes(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            demo = root / "demo.gif"
+            poster = root / "hero.png"
+            demo.write_bytes(b"demo")
+            poster.write_bytes(b"poster")
+            html = root / "index.html"
+            html.write_text(
+                '<img src="./img/hero.png?old=1" '
+                'data-animation="./img/demo.gif" '
+                'data-poster="./img/hero.png">',
+                encoding="utf-8",
+            )
+            demo_digest, poster_digest = social.bind_inline_demo(html, demo, poster)
+            updated = html.read_text()
+            self.assertEqual(demo_digest, hashlib.sha256(b"demo").hexdigest())
+            self.assertEqual(poster_digest, hashlib.sha256(b"poster").hexdigest())
+            self.assertEqual(updated.count(f"hero.png?sha256={poster_digest}"), 2)
+            self.assertEqual(updated.count(f"demo.gif?sha256={demo_digest}"), 1)
+
+    def test_missing_inline_binding_fails_closed(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            demo = root / "demo.gif"
+            poster = root / "hero.png"
+            demo.write_bytes(b"demo")
+            poster.write_bytes(b"poster")
+            html = root / "index.html"
+            html.write_text('<img src="./img/hero.png">', encoding="utf-8")
+            with self.assertRaisesRegex(RuntimeError, "exactly one"):
+                social.bind_inline_demo(html, demo, poster)

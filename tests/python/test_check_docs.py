@@ -1,4 +1,5 @@
 import importlib.util
+import json
 import sys
 import tempfile
 import unittest
@@ -25,17 +26,35 @@ class DocumentationTests(unittest.TestCase):
         self.assertIn('name="twitter:card" content="summary_large_image"', site)
         self.assertIn('name="twitter:image:alt"', site)
 
-    def test_site_demo_is_user_controlled_and_legacy_private_gallery_is_gone(self):
+    def test_demo_plays_inline_and_remains_user_controlled(self):
         site = (ROOT / "docs/index.html").read_text()
         script = (ROOT / "docs/site.js").read_text()
         css = (ROOT / "docs/site.css").read_text()
-        self.assertIn('src="./img/hero.png"', site)
-        self.assertIn('data-animation="./img/hero.gif"', site)
+        manifest = json.loads((ROOT / "docs/img/demo-manifest.json").read_text())
+        demo_hash = manifest["outputs"]["screen"]["sha256"]
+        poster_hash = manifest["outputs"]["poster"]["sha256"]
+        self.assertIn(f'src="./img/hero.png?sha256={poster_hash}"', site)
+        self.assertIn(f'data-animation="./img/demo.gif?sha256={demo_hash}"', site)
+        self.assertIn(f'data-poster="./img/hero.png?sha256={poster_hash}"', site)
+        duration = sum(
+            frame["delay_ms"]
+            for frame in json.loads((ROOT / "docs/img/demo-story.json").read_text())["frames"]
+        )
+        self.assertIn(f'data-duration-ms="{duration}"', site)
         self.assertIn('id="demo-toggle"', site)
         self.assertIn(".demo-toggle[hidden] { display: none; }", css)
-        self.assertIn('toggle.textContent = playing ? "Stop animation"', script)
+        self.assertIn("aspect-ratio: 16 / 9", css)
+        self.assertIn('toggle.textContent = playing ? "Stop 16-second demo"', script)
+        self.assertIn('matchMedia("(prefers-reduced-motion: reduce)")', script)
+        self.assertIn("connection?.saveData", script)
+        self.assertIn("window.setTimeout(stop, duration)", script)
         self.assertNotIn('aria-pressed', script)
-        self.assertIn('playing = !playing', script)
+        self.assertIn("if (playing) stop()", script)
+        for name in ("README.md", "README.ru.md"):
+            readme = (ROOT / name).read_text()
+            self.assertIn(f'<img src="docs/img/demo.gif?sha256={demo_hash}"', readme)
+            self.assertNotIn("open the 16-second demo", readme)
+            self.assertNotIn("открыть 16-секундное демо", readme)
         for name in ("nodes.png", "chat.png", "chats.png", "settings.png", "lora.png"):
             self.assertFalse((ROOT / "docs/img" / name).exists())
             self.assertNotIn(name, (ROOT / "README.md").read_text())
@@ -52,6 +71,23 @@ class DocumentationTests(unittest.TestCase):
             (root / "README.md").write_text("# Demo\n\n![missing](docs/nope.png)\n")
             with self.assertRaisesRegex(ValueError, "missing docs/nope.png"):
                 check_docs.validate(root)
+
+    def test_html_data_media_and_query_strings_are_checked(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            docs = root / "docs"
+            media = docs / "img"
+            media.mkdir(parents=True)
+            (root / "README.md").write_text("# Demo\n")
+            (media / "demo.gif").write_bytes(b"gif")
+            (docs / "index.html").write_text(
+                '<img data-animation="./img/demo.gif?sha256=abc" '
+                'data-poster="./img/missing.png?sha256=def">'
+            )
+            with self.assertRaisesRegex(ValueError, "missing"):
+                check_docs.validate(root)
+            (media / "missing.png").write_bytes(b"png")
+            check_docs.validate(root)
 
     def test_missing_markdown_anchor_is_rejected(self):
         with tempfile.TemporaryDirectory() as directory:

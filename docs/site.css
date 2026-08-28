@@ -171,8 +171,10 @@ h3 { margin: 0 0 9px; font-size: 20px; line-height: 1.25; }
   overflow: hidden;
   width: 100%;
   height: auto;
+  aspect-ratio: 16 / 9;
+  object-fit: contain;
   border: 3px solid var(--line);
-  background: #fff;
+  background: #000;
   box-shadow: 10px 10px 0 rgba(0, 0, 0, .65);
 }
 .hero-media figcaption {

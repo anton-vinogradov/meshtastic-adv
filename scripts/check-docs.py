@@ -6,12 +6,15 @@ from __future__ import annotations
 import argparse
 import re
 from pathlib import Path
-from urllib.parse import unquote
+from urllib.parse import unquote, urlsplit
 
 
 ROOT = Path(__file__).resolve().parents[1]
 MARKDOWN_LINK_RE = re.compile(r"!?\[[^\]]*\]\(([^)]+)\)")
-HTML_LINK_RE = re.compile(r"\b(?:href|src)=[\"']([^\"']+)[\"']", re.IGNORECASE)
+HTML_LINK_RE = re.compile(
+    r"\b(?:href|src|data-animation|data-poster)=[\"']([^\"']+)[\"']",
+    re.IGNORECASE,
+)
 HEADING_RE = re.compile(r"^\s{0,3}#{1,6}\s+(.+?)\s*#*\s*$")
 INLINE_LINK_RE = re.compile(r"\[([^\]]+)\]\([^)]+\)")
 HTML_TAG_RE = re.compile(r"<[^>]+>")
@@ -73,13 +76,16 @@ def validate(root: Path) -> dict[str, int]:
     for source in documents:
         for raw in references(source):
             target_text = raw.strip().strip("<>")
+            target_url = urlsplit(target_text)
             if (
                 not target_text
                 or target_text.startswith("//")
-                or re.match(r"^[a-z][a-z0-9+.-]*:", target_text, re.IGNORECASE)
+                or target_url.scheme
+                or target_url.netloc
             ):
                 continue
-            path_text, separator, fragment = target_text.partition("#")
+            path_text = target_url.path
+            fragment = target_url.fragment
             target = source if not path_text else (source.parent / unquote(path_text)).resolve()
             checked += 1
             try:
@@ -90,7 +96,7 @@ def validate(root: Path) -> dict[str, int]:
             if not target.exists():
                 failures.append(f"{source.relative_to(root)}: missing {target_text}")
                 continue
-            if separator and fragment:
+            if fragment:
                 heading_file = target / "README.md" if target.is_dir() else target
                 if heading_file.suffix.lower() not in {".md", ".html", ".htm"}:
                     failures.append(f"{source.relative_to(root)}: fragment on unsupported target {target_text}")

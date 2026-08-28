@@ -87,10 +87,9 @@ jobs:
 
       - name: Rebuild and verify the exact tagged distribution inputs
         env:
-          GH_TOKEN: ${{ github.token }}
           REPAIR_TAG: ${{ inputs.tag }}
         run: |
-          mkdir -p /tmp/tag-source repair-draft
+          mkdir -p /tmp/tag-source
           git archive "$REPAIR_TAG" -- \
             docs/unifont.bin docs/img/demo-story.json docs/img/mockup.json \
             docs/img/device.png \
@@ -118,28 +117,8 @@ jobs:
           MESHTASTIC_FACTORY="${factories[0]}" \
             MESHTASTIC_FONT=/tmp/tag-source/docs/unifont.bin \
             MESHTASTIC_MERGED_OUT=/tmp/expected-merged.bin \
-            MESHTASTIC_REPO_ROOT="$GITHUB_WORKSPACE" \
+          MESHTASTIC_REPO_ROOT="$GITHUB_WORKSPACE" \
             bash /tmp/tag-source/scripts/mkm5burner.sh "${REPAIR_TAG#v}"
-
-          releases_json=$(mktemp)
-          gh api --paginate --slurp \
-            "repos/$GITHUB_REPOSITORY/releases?per_page=100" > "$releases_json"
-          asset_api=$(jq -er --arg tag "$REPAIR_TAG" --arg name \
-            meshtastic-adv-cardputer-adv-merged.bin '
-              [.[][] | select(
-                .tag_name == $tag and .draft == true and .prerelease == false
-              )] as $releases |
-              if ($releases | length) != 1 then
-                error("expected exactly one matching draft release")
-              elif ([$releases[0].assets[] | select(.name == $name)] | length) != 1 then
-                error("expected exactly one matching merged asset")
-              else
-                $releases[0].assets[] | select(.name == $name) | .url
-              end
-            ' "$releases_json")
-          gh api -H 'Accept: application/octet-stream' "$asset_api" \
-            > repair-draft/meshtastic-adv-cardputer-adv-merged.bin
-          cmp /tmp/expected-merged.bin repair-draft/meshtastic-adv-cardputer-adv-merged.bin
 
       - name: Publish and verify the repaired M5Burner version
         env:

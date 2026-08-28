@@ -121,10 +121,24 @@ jobs:
             MESHTASTIC_REPO_ROOT="$GITHUB_WORKSPACE" \
             bash /tmp/tag-source/scripts/mkm5burner.sh "${REPAIR_TAG#v}"
 
-          test "$(gh release view "$REPAIR_TAG" --json isDraft,isPrerelease,tagName \
-            --jq '[.isDraft,.isPrerelease,.tagName] | @tsv')" = $'true\tfalse\t'"$REPAIR_TAG"
-          gh release download "$REPAIR_TAG" \
-            --pattern meshtastic-adv-cardputer-adv-merged.bin --dir repair-draft
+          releases_json=$(mktemp)
+          gh api --paginate --slurp \
+            "repos/$GITHUB_REPOSITORY/releases?per_page=100" > "$releases_json"
+          asset_api=$(jq -er --arg tag "$REPAIR_TAG" --arg name \
+            meshtastic-adv-cardputer-adv-merged.bin '
+              [.[][] | select(
+                .tag_name == $tag and .draft == true and .prerelease == false
+              )] as $releases |
+              if ($releases | length) != 1 then
+                error("expected exactly one matching draft release")
+              elif ([$releases[0].assets[] | select(.name == $name)] | length) != 1 then
+                error("expected exactly one matching merged asset")
+              else
+                $releases[0].assets[] | select(.name == $name) | .url
+              end
+            ' "$releases_json")
+          gh api -H 'Accept: application/octet-stream' "$asset_api" \
+            > repair-draft/meshtastic-adv-cardputer-adv-merged.bin
           cmp /tmp/expected-merged.bin repair-draft/meshtastic-adv-cardputer-adv-merged.bin
 
       - name: Publish and verify the repaired M5Burner version

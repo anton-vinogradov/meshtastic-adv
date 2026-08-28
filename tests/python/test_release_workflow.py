@@ -426,6 +426,10 @@ class ReleaseWorkflowTests(unittest.TestCase):
             REPAIR_WORKFLOW.index("python -m pip install --require-hashes -r requirements/release.txt"),
             REPAIR_WORKFLOW.index("python /tmp/tag-source/scripts/mkcover.py"),
         )
+        self.assertIn("gh api --paginate --slurp", REPAIR_WORKFLOW)
+        self.assertIn("Accept: application/octet-stream", REPAIR_WORKFLOW)
+        self.assertNotIn("gh release view", REPAIR_WORKFLOW)
+        self.assertNotIn("gh release download", REPAIR_WORKFLOW)
         self.assertIn("cmp /tmp/expected-merged.bin", REPAIR_WORKFLOW)
         self.assertIn("python scripts/m5burner_publish.py", REPAIR_WORKFLOW)
         self.assertNotIn("gh release edit", REPAIR_WORKFLOW)

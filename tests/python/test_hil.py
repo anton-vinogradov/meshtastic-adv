@@ -17,6 +17,11 @@ SPEC.loader.exec_module(hil)
 
 
 class HilRunnerTests(unittest.TestCase):
+    def local_full_run(self, *args, **kwargs):
+        """Exercise local defaults without inheriting the CI process identity."""
+        with mock.patch.dict(hil.os.environ, {"GITHUB_ACTIONS": ""}):
+            return hil.full_run(*args, **kwargs)
+
     def test_init_writes_identity_fixture_owner_only(self):
         with tempfile.TemporaryDirectory() as directory:
             output = Path(directory) / "fixture.json"
@@ -746,7 +751,7 @@ class HilRunnerTests(unittest.TestCase):
                 ) as flash,
             ):
                 with self.assertRaises(hil.HilError):
-                    hil.full_run({"schema": 1}, artifacts, timeout=1, skip_build=True)
+                    self.local_full_run({"schema": 1}, artifacts, timeout=1, skip_build=True)
             self.assertEqual([call.kwargs["release"] for call in flash.call_args_list], [False, True])
             summary = json.loads((artifacts / "summary.json").read_text())
             self.assertTrue(summary["hil_flash_attempted"])
@@ -770,7 +775,7 @@ class HilRunnerTests(unittest.TestCase):
                 ),
             ):
                 with self.assertRaisesRegex(hil.HilError, "restore failed"):
-                    hil.full_run({"schema": 1}, artifacts, timeout=1, skip_build=True)
+                    self.local_full_run({"schema": 1}, artifacts, timeout=1, skip_build=True)
             summary = json.loads((artifacts / "summary.json").read_text())
             self.assertTrue(summary["hil_flash_attempted"])
             self.assertFalse(summary["production_restored"])
@@ -795,7 +800,7 @@ class HilRunnerTests(unittest.TestCase):
                 mock.patch.object(hil, "visual", return_value=report),
             ):
                 with self.assertRaisesRegex(hil.HilError, "verified backup restored"):
-                    hil.full_run({"schema": 1}, artifacts, timeout=1, skip_build=True)
+                    self.local_full_run({"schema": 1}, artifacts, timeout=1, skip_build=True)
 
             summary = json.loads((artifacts / "summary.json").read_text())
             restore_config.assert_called_once()
@@ -818,7 +823,7 @@ class HilRunnerTests(unittest.TestCase):
                 mock.patch.object(hil, "flash") as flash,
             ):
                 with self.assertRaisesRegex(hil.HilError, "backup failed"):
-                    hil.full_run({"schema": 1}, artifacts, timeout=1, skip_build=True)
+                    self.local_full_run({"schema": 1}, artifacts, timeout=1, skip_build=True)
 
             flash.assert_not_called()
             summary = json.loads((artifacts / "summary.json").read_text())
@@ -857,7 +862,7 @@ class HilRunnerTests(unittest.TestCase):
                 mock.patch.object(hil, "flash", side_effect=flash),
             ):
                 with self.assertRaisesRegex(hil.HilError, "upload failed"):
-                    hil.full_run({"schema": 1}, artifacts, timeout=1, skip_build=True)
+                    self.local_full_run({"schema": 1}, artifacts, timeout=1, skip_build=True)
 
         self.assertEqual(events[:4], ["backup", "marker", "hil", "production"])
 

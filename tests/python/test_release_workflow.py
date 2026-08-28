@@ -96,7 +96,10 @@ class ReleaseWorkflowTests(unittest.TestCase):
     def test_host_ci_runs_actionlint(self):
         block = job("host-tests")
         self.assertIn("docker://rhysd/actionlint@sha256:", block)
-        self.assertIn("-ignore 'unexpected key \"queue\" for \"concurrency\" section'", block)
+        self.assertIn(
+            r"-ignore=unexpected[ ]key[ ]\x22queue\x22[ ]for[ ]\x22concurrency\x22[ ]section",
+            block,
+        )
 
     def test_malformed_release_tag_cannot_reach_physical_hil(self):
         host = job("host-tests")

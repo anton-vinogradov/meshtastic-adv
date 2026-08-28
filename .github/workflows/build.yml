@@ -26,7 +26,9 @@ jobs:
         with:
           # GitHub added concurrency.queue after actionlint 1.7.12. Keep the
           # suppression exact so every other workflow/schema error still fails.
-          args: -color -ignore 'unexpected key "queue" for "concurrency" section'
+          # Avoid shell-style quoted whitespace: Docker actions receive `args`
+          # differently from a local shell. This remains the exact diagnostic.
+          args: -color -ignore=unexpected[ ]key[ ]\x22queue\x22[ ]for[ ]\x22concurrency\x22[ ]section
       - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
         with:
           python-version: '3.11'

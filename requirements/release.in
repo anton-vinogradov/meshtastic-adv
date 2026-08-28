@@ -1,5 +1,6 @@
 esptool>=5.3,<6
 requests>=2.32,<3
+pillow>=12.3,<13 ; sys_platform == 'linux' and platform_machine == 'x86_64'
 
 # The release job is Linux, where esptool permits the patched cryptography 50.x
 # line. Retain an explicit Intel-macOS fallback so this source file still

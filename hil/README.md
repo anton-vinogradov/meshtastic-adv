@@ -7,12 +7,16 @@ the suite allocates the complete companion arena, its local NodeDB uses the same
 its normal 100/150-slot profile and never allocates that arena. The
 published firmware never contains that protocol.
 
-The HIL image forces `tx_enabled=false` in RAM at boot, has an immutable final
-guard in `RadioLibInterface::send()`, and makes its ADV receive module ignore
-live RF. It cannot emit boot announcements, telemetry, retries or test messages
-into the real mesh; all behavioral ingress comes from serialized `FromRadio`
-frames over USB. The persisted US region, 26 dBm setting, channels and production
-message files are neither replaced nor normalized.
+The HIL image leaves the user's LoRa configuration untouched, has an immutable
+final guard in `RadioLibInterface::send()`, and makes its ADV receive module ignore
+live RF. It also compiles the physical BLE-companion scan, connect, queue and
+GATT-write paths fail-closed, so a saved companion preference cannot proxy a
+test send through another node. Direct companion `FromRadio` decoder fixtures
+still enter through USB only. The image cannot emit boot announcements,
+telemetry, retries or test messages into the real mesh; all behavioral ingress
+comes from serialized `FromRadio` frames over USB. The persisted US region,
+26 dBm setting, channels and production message files are neither replaced nor
+normalized.
 The DUT fixture records `expected_region: "US"` and `expected_tx_power: 26`;
 both smoke passes read those persisted values back from the HIL process and fail
 before behavioral assertions if the lab profile has drifted.
@@ -95,7 +99,8 @@ python3 scripts/hil.py smoke
 # This does not send a mesh packet and uses a HIL-only storage namespace.
 python3 scripts/hil.py messages
 
-# Full 29-screen capture. PNG output needs Pillow; raw RGB332 is always saved.
+# Full visual capture. PNG and raw RGB332 frames stay in the local/private
+# artifact tree; tag jobs publish only redacted text, hashes and safe media.
 python3 scripts/hil.py visual
 
 # Put the normal serial PhoneAPI firmware back after the session.
@@ -141,9 +146,18 @@ but excludes the top-level live `location` reported by Meshtastic: GPS movement 
 runtime state, not restorable configuration. Each fingerprint is accepted only
 after two consecutive complete normalized exports match, so a single
 truncated-but-plausible CLI response cannot masquerade as configuration drift.
-Secret exports live only in an owner-readable system temporary directory
-and are deleted before the runner exits; HIL evidence records only the comparison
-result and error type.
+For a local run, the accepted pre-run export and durable flash-start marker are
+retained with owner-only permissions below the ignored `private/` artifact
+directory. `--config-backup /absolute/external/path.yaml` can instead place the
+backup outside the checkout. Tag HIL requires that external form: each run and
+attempt receives a fresh directory in a persistent runner vault, so a later
+`actions/checkout` clean cannot delete or overwrite a failed recovery's only good
+backup. If drift is detected, the runner restores and verifies that exact backup
+for device safety, but the release still fails: recovery never hides a firmware
+regression. The tag workflow deletes only its own backup and marker after a
+successful HIL or verified recovery; if recovery itself fails, both remain in
+the vault for manual repair. Public evidence never traverses the vault or copies
+YAML and records only the comparison/recovery result and error type.
 The deterministic visual matrix requires every framebuffer row. If native USB
 loses a row, the runner drains the current matrix through its proven reboot and
 retries the complete matrix once; a second loss or any content mismatch still
@@ -231,7 +245,7 @@ leaving a thread and the explicit persistence path still flush synchronously.
 This is deliberately a hybrid fixture model. Behavioral input scenarios live on the host
 and are encoded as ordinary `FromRadio` protobufs; the device consumes them in
 RAM and, where persistence is under test, writes only its HIL namespace. Direct
-`Msg` array seeding is reserved for the 29-screen visual/stress matrix, where the
+`Msg` array seeding is reserved for the 35-screen visual/stress matrix, where the
 decoder is not the subject and dense state is useful. Writing production storage
 files directly would skip exactly the parsing, deduplication and migration logic
 the release gate is meant to verify.
@@ -258,9 +272,26 @@ own freshly captured export afterward. Release automation additionally asserts
 either fixture, so configuration drift fails safely.
 
 `visual` renders controlled in-RAM fixtures, captures every major screen, then
-soft-reboots and verifies that the persisted real UI state is available again. Evidence lands under
-`hil-artifacts/<timestamp>-*/` as `report.json`, `junit.xml`, raw RGB332 frames,
-PNGs when Pillow is installed, and SHA-256 hashes.
+soft-reboots and verifies that the persisted real UI state is available again. Private/local
+evidence lands under `hil-artifacts/<timestamp>-*/` as `report.json`, `junit.xml`,
+raw RGB332 frames, PNGs when Pillow is installed, and SHA-256 hashes. Raw frames
+are diagnostic material, not public release artifacts.
+
+The tag workflow consumes only the exact ordered `a01`..`a19` frames declared in
+`docs/img/demo-story.json`. `scripts/demo_media.py` checks every source PNG is a
+complete 720x405 RGB capture, binds its hash and exact per-frame delay into a
+manifest, generates the 900x600 device-composited `hero.gif`, the screen-focused
+960x540 `demo.gif`, and a 900x600 poster, then reopens the outputs and enforces
+their geometry, duration, frame count and byte budgets. A missing, reordered,
+truncated or oversized frame/media file fails the physical release job.
+
+Before artifact upload, the same tool copies only UTF-8 JSON, JUnit/XML, logs,
+text hashes and the verified marketing media into a fresh public tree. It
+redacts the local fixture's device/peer names and identities plus serial paths,
+local IPs and mesh node IDs. Symlinks, unsafe paths and non-text diagnostics fail
+closed. In particular, raw `frames/*.png` and `*.rgb332` files never enter the
+public `release-hil-evidence` artifact; the sole PNG there is the generated,
+synthetic marketing poster.
 
 ## Coverage matrix
 
@@ -268,7 +299,7 @@ PNGs when Pillow is installed, and SHA-256 hashes.
 |---|---|---|
 | Boot, heap, serial protocol | USB HIL state assertions | programmable USB power switch for cold-boot loops |
 | UI navigation and settings pages | injected keys + state assertions | key actuator/matrix jig to verify every physical key |
-| Display and all major screens | framebuffer digest + 29 real captures | camera for panel/backlight/colour verification |
+| Display and all major screens | framebuffer digest + 35 real captures | camera for panel/backlight/colour verification |
 | Unicode, emoji, replies, reactions, history screens | real serialized FromRadio injection + controlled visual fixtures | extend private RF traffic to every live message type |
 | LoRa send/receive | state-preserving private RF exchange in both directions | programmable attenuator for sensitivity/range thresholds |
 | Routing ACK/NAK | injected production handler path plus explicit ACK for private directed RF in both directions | programmable attenuator for deterministic failure/retry thresholds |
@@ -295,25 +326,66 @@ gate; production firmware is restored even on failure. RF routing is provided by
 the embedded upstream Meshtastic engine and is
 not re-tested as a release condition for the ADV UI layer. The private RF runner
 remains available as an explicit, manual integration diagnostic.
+The release job downloads the privacy-safe media artifact from that same tag run
+and verifies it again against the tag's staged generator, story, mockup geometry
+and device photo before checking out `main`. Stable tags update the site's
+`hero.gif`, `demo.gif` and social poster in the installer commit; prerelease tags
+cannot change the stable site. Both stable and prerelease GitHub Releases attach
+the generated GIFs under the fixed `meshtastic-adv-hero.gif` and
+`meshtastic-adv-demo.gif` asset names.
 The host gate also runs pinned `actionlint` validation over the workflow itself.
 The macOS runner must provide Homebrew `python3.12`; the job creates a private
 virtual environment under `RUNNER_TEMP`. It deliberately does not use
 `actions/setup-python`: downloadable macOS Python builds from that action are
 non-relocatable and require privileged access to `/Users/runner/hostedtoolcache`.
 
-Tags must use SemVer syntax. A stable `vX.Y.Z` tag updates the web installer and,
-when credentials are configured, M5Burner. A tag such as `vX.Y.Z-rc.1` passes the
-same build and physical HIL gates but is published as a GitHub prerelease with
-`latest=false`; it cannot replace either stable distribution channel. Malformed
-tags fail before publication.
+Tags must use SemVer syntax. A stable `vX.Y.Z` tag requires configured M5Burner
+credentials and updates both M5Burner and the web installer; either channel
+failing its exact public verification blocks the GitHub Release. A tag such as
+`vX.Y.Z-rc.1` passes the same build and physical HIL gates but is published as a
+GitHub prerelease with `latest=false`; it cannot replace either stable
+distribution channel. Malformed tags fail before publication.
 
 Configure the protected GitHub environment `release-hil` with:
 
 - secret `HIL_FIXTURE_JSON`: a schema-2 fixture binding the Cardputer DUT by USB
-  MAC, listing every forbidden USB device (including Leshy) under
+  MAC, listing every forbidden USB device under
   `protected_devices`, and pinning its intentional `expected_region: "US"` and
   `expected_tx_power: 26`. No WiFi peers or RF credentials are required by the
   release job.
+- variable `HIL_RECOVERY_ROOT`: an existing owner-only absolute directory on the
+  persistent self-hosted runner, outside both the checkout and `RUNNER_TEMP`.
+  Provision it once with mode `0700`; the workflow creates exclusive
+  `run-<id>-attempt-<n>` children and never cleans a failed recovery's directory.
+
+If a failed job leaves one of those directories behind, keep it private and
+recover from the runner before retrying the release. Use the app-partition image
+downloaded from that exact tag's `firmware-factory` artifact; do not substitute a
+new local build, a factory image, or an image from another run:
+
+```bash
+recovery_attempt=/absolute/recovery/root/run-123-attempt-1
+python scripts/hil.py restore \
+  --fixture hil/fixture.local.json \
+  --image /absolute/path/to/exact-tag-firmware-app.bin \
+  --config-backup "$recovery_attempt/config-before.yaml" \
+  --flash-marker "$recovery_attempt/hil-flash-started"
+```
+
+`restore` validates the owner-only backup and the marker's bound backup
+filename/SHA-256 plus release-app size/SHA-256 before it touches the Cardputer,
+flashes those exact production application bytes, then compares and repairs
+configuration only when drift is proven. Only after that command succeeds,
+remove this attempt's two private files and empty directory:
+
+```bash
+rm -f -- "$recovery_attempt/config-before.yaml" "$recovery_attempt/hil-flash-started"
+rmdir -- "$recovery_attempt"
+```
+
+If recovery fails, leave the directory intact for the next repair attempt. It
+contains the node's private identity and channel credentials; never upload,
+commit, or copy it into HIL evidence.
 
 The job writes the fixture only below the runner's private temporary directory
 with owner-only permissions. Stable USB identities and local serial paths are

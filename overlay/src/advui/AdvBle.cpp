@@ -272,6 +272,15 @@ bool bleNextPacket(BleFrame *frame)
 
 bool bleQueueToRadio(const uint8_t *buf, uint16_t len)
 {
+#ifdef ADVUI_HIL
+    // USB HIL may exercise the companion decoder, but it must never enqueue a
+    // real ToRadio frame.  Otherwise a persisted companion selection could
+    // reach a bonded node and make that node transmit into the live mesh.
+    (void)buf;
+    (void)len;
+    g_txDrops.fetch_add(1);
+    return false;
+#else
     if (!g_txQueue || !buf || len > kTxSlot) {
         g_txDrops.fetch_add(1);
         return false;
@@ -282,6 +291,7 @@ bool bleQueueToRadio(const uint8_t *buf, uint16_t len)
         return true;
     g_txDrops.fetch_add(1);
     return false;
+#endif
 }
 
 uint32_t bleRxDrops() { return g_rxDrops.load(); }
@@ -810,6 +820,12 @@ void bleAdvSlow(bool slow)
 
 bool bleCompanionInit()
 {
+#ifdef ADVUI_HIL
+    // HIL ingress calls initQueues() directly.  Never initialise the physical
+    // BLE client stack in a test image: scan/connect/write are all fail-closed.
+    g_bleUnsupported = true;
+    return false;
+#else
     if (!initQueues()) {
         fail("no mem for companion");
         return false;
@@ -819,10 +835,15 @@ bool bleCompanionInit()
     BLEDevice::init("advui"); // no-op if the stock peripheral initialised the stack already
     g_bleInited = true;
     return true;
+#endif
 }
 
 void bleScanStart()
 {
+#ifdef ADVUI_HIL
+    g_linkState = BLE_FAILED;
+    return;
+#else
     if (!bleCompanionInit())
         return;
     bool scanning = false;
@@ -844,6 +865,7 @@ void bleScanStart()
         g_scanning = rc == 0;
     }
     LOG_INFO("advui: ble scan %s (rc=%d)", rc == 0 ? "started" : "FAILED", rc);
+#endif
 }
 
 void bleScanStop()
@@ -855,6 +877,12 @@ void bleScanStop()
 
 void bleConnectAsync(const char *addr, uint8_t addrType)
 {
+#ifdef ADVUI_HIL
+    (void)addr;
+    (void)addrType;
+    g_linkState = BLE_FAILED;
+    return;
+#else
     if (!bleCompanionInit())
         return;
     if (!validBleAddress(addr) || addrType > 3) {
@@ -881,6 +909,7 @@ void bleConnectAsync(const char *addr, uint8_t addrType)
         }
     g_connectTaskRunning.store(false, std::memory_order_release);
     fail("no mem for link task");
+#endif
 }
 
 bool bleDisconnect()
@@ -918,9 +947,15 @@ void bleCancelPin()
 
 bool bleWriteToRadio(const uint8_t *buf, size_t len)
 {
+#ifdef ADVUI_HIL
+    (void)buf;
+    (void)len;
+    return false;
+#else
     if (g_linkState != BLE_CONNECTED || !g_toRadio)
         return false;
     return g_toRadio->writeValue(const_cast<uint8_t *>(buf), len, true);
+#endif
 }
 
 // The transport pump lives in the link task (see pumpLoop) — the UI thread must

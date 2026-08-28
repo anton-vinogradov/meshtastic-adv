@@ -139,12 +139,18 @@ def validate(docs: Path) -> dict[str, str]:
 
     for name in index:
         archive = versions / name
+        archived_font = archive / "unifont.bin"
+        if archived_font.is_file():
+            archived_font_label = "unifont.bin"
+        else:
+            archived_font = font
+            archived_font_label = "../../unifont.bin"
         archived_manifest, archived_release, _archived_engine, archived_hash = validate_manifest(
             archive / "manifest.json",
             factory_path=archive / "firmware.factory.bin",
-            font_path=font,
+            font_path=archived_font,
             factory_label="firmware.factory.bin",
-            font_label="../../unifont.bin",
+            font_label=archived_font_label,
         )
         if name != f"v{archived_release}":
             raise ValueError(f"archive {name} contains release {archived_release}")

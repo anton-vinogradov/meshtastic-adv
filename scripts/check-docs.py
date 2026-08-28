@@ -15,6 +15,7 @@ HTML_LINK_RE = re.compile(r"\b(?:href|src)=[\"']([^\"']+)[\"']", re.IGNORECASE)
 HEADING_RE = re.compile(r"^\s{0,3}#{1,6}\s+(.+?)\s*#*\s*$")
 INLINE_LINK_RE = re.compile(r"\[([^\]]+)\]\([^)]+\)")
 HTML_TAG_RE = re.compile(r"<[^>]+>")
+HTML_ID_RE = re.compile(r"\bid=[\"']([^\"']+)[\"']", re.IGNORECASE)
 
 
 def public_documents(root: Path) -> list[Path]:
@@ -34,6 +35,11 @@ def github_slug(heading: str) -> str:
 
 
 def anchors(path: Path) -> set[str]:
+    if path.suffix.lower() in {".html", ".htm"}:
+        return {
+            unquote(value).lower()
+            for value in HTML_ID_RE.findall(path.read_text(encoding="utf-8"))
+        }
     result: set[str] = set()
     counts: dict[str, int] = {}
     fenced = False
@@ -86,8 +92,8 @@ def validate(root: Path) -> dict[str, int]:
                 continue
             if separator and fragment:
                 heading_file = target / "README.md" if target.is_dir() else target
-                if heading_file.suffix.lower() != ".md":
-                    failures.append(f"{source.relative_to(root)}: fragment on non-Markdown target {target_text}")
+                if heading_file.suffix.lower() not in {".md", ".html", ".htm"}:
+                    failures.append(f"{source.relative_to(root)}: fragment on unsupported target {target_text}")
                     continue
                 available = anchor_cache.setdefault(heading_file, anchors(heading_file))
                 wanted = unquote(fragment).lower()

@@ -67,6 +67,24 @@ uint8_t g_hilLastSendError = ERRNO_OK;
 uint32_t g_hilLastTxReply = 0;
 #endif
 
+#ifdef ADVUI_SCREENSHOT
+constexpr uint32_t kDemoMe = 0x00A11CE1;
+constexpr uint32_t kDemoPeer = 0x00BEEF01;
+bool g_demoActive = false;
+bool g_demoNetActive = false;
+meshtastic_NodeInfoLite g_demoMeNode;
+meshtastic_NodeInfoLite g_demoPeerNode;
+#endif
+
+bool demoNetActive()
+{
+#ifdef ADVUI_SCREENSHOT
+    return g_demoNetActive;
+#else
+    return false;
+#endif
+}
+
 const char *sendFailureText(SendFailure failure)
 {
     switch (failure) {
@@ -586,10 +604,32 @@ bool bleAttemptPending()
 
 uint32_t myNodeNum()
 {
+#ifdef ADVUI_SCREENSHOT
+    if (g_demoActive)
+        return kDemoMe;
+#endif
     if (g_radioCompanion)
         return g_linkMyNode;
     return nodeDB ? nodeDB->getNodeNum() : 0;
 }
+
+#ifdef ADVUI_SCREENSHOT
+void beginDemoIdentity()
+{
+    memset(&g_demoMeNode, 0, sizeof(g_demoMeNode));
+    g_demoMeNode.num = kDemoMe;
+    nodeSetNames(&g_demoMeNode, "Field Kit", "ME");
+
+    memset(&g_demoPeerNode, 0, sizeof(g_demoPeerNode));
+    g_demoPeerNode.num = kDemoPeer;
+    g_demoPeerNode.snr = 8.5f;
+    g_demoPeerNode.has_hops_away = true;
+    g_demoPeerNode.hops_away = 0;
+    g_demoPeerNode.last_heard = getTime(false);
+    nodeSetNames(&g_demoPeerNode, "TrailOps", "TOP");
+    g_demoActive = true;
+}
+#endif
 
 // Synthesizes a NodeInfoLite view of a companion node so the existing row/name
 // rendering keeps working unchanged. Sequential use only (one shared temp).
@@ -608,6 +648,15 @@ meshtastic_NodeInfoLite *compSynth(const CompNode &c)
 
 meshtastic_NodeInfoLite *nodeByNum(uint32_t num)
 {
+#ifdef ADVUI_SCREENSHOT
+    if (g_demoActive) {
+        if (num == kDemoMe)
+            return &g_demoMeNode;
+        if (num == kDemoPeer)
+            return &g_demoPeerNode;
+        return nullptr;
+    }
+#endif
     if (g_radioCompanion) {
         CompNode node;
         return bleCopyCompNode(num, &node) ? compSynth(node) : nullptr;
@@ -1947,6 +1996,13 @@ const NetField *netFields(int page) { return page == 0 ? kWifiFields : kMqttFiel
 
 bool netGetBool(int page, int i)
 {
+#ifdef ADVUI_SCREENSHOT
+    if (demoNetActive()) {
+        if (page == 0)
+            return true;
+        return i == 0 || i == 5; // MQTT + encryption on; TLS/uplink/downlink off
+    }
+#endif
     if (page == 0)
         return config.network.wifi_enabled;
     if (i == 0)
@@ -1983,6 +2039,18 @@ void netSetBool(int page, int i, bool v)
 }
 const char *netGetText(int page, int i)
 {
+#ifdef ADVUI_SCREENSHOT
+    if (demoNetActive()) {
+        if (page == 0)
+            return i == 1 ? "HomeWiFi" : "s3cret-pass";
+        switch (i) {
+        case 1: return ""; // default broker
+        case 2: return "";
+        case 3: return "";
+        default: return "msh";
+        }
+    }
+#endif
     if (page == 0)
         return i == 1 ? config.network.wifi_ssid : config.network.wifi_psk;
     switch (i) {
@@ -2076,6 +2144,12 @@ void drawNodeRow(lgfx::LGFXBase *g, const meshtastic_NodeInfoLite *n, int y, boo
 
     char abuf[6];
     uint16_t acol;
+#ifdef ADVUI_SCREENSHOT
+    if (g_demoActive) {
+        strcpy(abuf, "now");
+        acol = 0x07E0;
+    } else
+#endif
     if (!n->last_heard) {
         strcpy(abuf, "?");
         acol = 0x630C;
@@ -2167,6 +2241,13 @@ bool batteryCharging();
 
 void batteryText(char *out, size_t cap, uint16_t &col)
 {
+#ifdef ADVUI_SCREENSHOT
+    if (g_demoActive) {
+        snprintf(out, cap, "87%%");
+        col = 0x07E0;
+        return;
+    }
+#endif
     if (powerStatus && powerStatus->getHasBattery()) {
         int pct = powerStatus->getBatteryChargePercent();
         if (pct > 100)
@@ -2200,6 +2281,10 @@ void batteryText(char *out, size_t cap, uint16_t &col)
 // them. Hence nothing that matters may hang on this answer — see drawBattery().
 bool batteryCharging()
 {
+#ifdef ADVUI_SCREENSHOT
+    if (g_demoActive)
+        return false;
+#endif
     if (!powerStatus || !powerStatus->getHasBattery())
         return false;
     return powerStatus->getIsCharging() || HWCDC::isPlugged() || powerStatus->getBatteryVoltageMv() >= 4195;
@@ -2943,6 +3028,11 @@ static SendResult sendTextPacket(uint32_t to, const char *text, int chIdx = 0, u
                                  bool asEmoji = false)
 {
     if (g_radioCompanion) { // ship it over BLE: the node's radio does routing/PKI itself
+#ifdef ADVUI_HIL
+        // A persisted companion preference must not turn USB HIL into an
+        // indirect live-mesh transmitter through a bonded radio node.
+        return {0, SendFailure::RADIO_REJECTED, ERRNO_DISABLED};
+#else
         if (g_linkState != BLE_CONNECTED)
             return {0, SendFailure::LINK_DOWN, 0};
         meshtastic_ToRadio t = meshtastic_ToRadio_init_default;
@@ -2984,10 +3074,8 @@ static SendResult sendTextPacket(uint32_t to, const char *text, int chIdx = 0, u
             return {0, SendFailure::ENCODE_FAILED, 0};
         if (!bleQueueToRadio(buf, (uint16_t)len))
             return {0, SendFailure::QUEUE_FULL, ERRNO_UNKNOWN};
-#ifdef ADVUI_HIL
-        g_hilLastTxReply = p.decoded.reply_id; // capture the structure that was actually encoded and queued
-#endif
         return {p.id, SendFailure::NONE, ERRNO_OK};
+#endif
     }
 
     if (!router || !service)
@@ -3071,6 +3159,11 @@ static SendResult sendTextPacket(uint32_t to, const char *text, int chIdx = 0, u
 // needed on the node side.
 static bool sendAdminToNode(const meshtastic_AdminMessage &adm)
 {
+#ifdef ADVUI_HIL
+    // Remote admin is a real persistent write on the companion node.
+    (void)adm;
+    return false;
+#else
     if (!g_radioCompanion || g_linkState != BLE_CONNECTED || !g_linkMyNode)
         return false;
     meshtastic_ToRadio t = meshtastic_ToRadio_init_default;
@@ -3089,6 +3182,7 @@ static bool sendAdminToNode(const meshtastic_AdminMessage &adm)
     uint8_t buf[320];
     size_t len = pb_encode_to_bytes(buf, sizeof(buf), &meshtastic_ToRadio_msg, &t);
     return len && bleQueueToRadio(buf, (uint16_t)len);
+#endif
 }
 
 // Sends a text DM to a node and adds it to our own thread immediately (status
@@ -3558,8 +3652,20 @@ void AdvUI::drawChats()
         if (i == sel)
             g->fillRect(0, y - 1, 240, rowH, 0x2945);
         bool unread = c.isChan ? hasUnreadChannel(c.ch) : hasUnreadFrom(c.node);
-        bool fav = c.isChan ? chanFav(c.ch)
-                            : ((!g_radioCompanion && nodeDB && nodeDB->isFavorite(c.node)) || favNodeLocal(c.node));
+        bool fav;
+        if (c.isChan) {
+            fav = chanFav(c.ch);
+        } else {
+#ifdef ADVUI_SCREENSHOT
+            // Promotional frames must not inherit even visual metadata from a
+            // production NodeDB entry that happens to share the fixture id.
+            if (g_demoActive) {
+                meshtastic_NodeInfoLite *n = nodeByNum(c.node);
+                fav = n && isFav(n);
+            } else
+#endif
+                fav = (!g_radioCompanion && nodeDB && nodeDB->isFavorite(c.node)) || favNodeLocal(c.node);
+        }
 
         int nameX = 6;
         if (unread) { // red envelope before the name
@@ -4764,13 +4870,23 @@ void AdvUI::drawNetPage()
         // question). isConnectedDirectly() is the broker link itself.
         const char *st;
         uint16_t sc;
-        if (!moduleConfig.mqtt.enabled) {
+        if (!netGetBool(1, 0)) {
             st = "off";
             sc = 0x8410;
-        } else if (mqtt && mqtt->isConnectedDirectly()) {
+        }
+#ifdef ADVUI_SCREENSHOT
+        else if (!demoNetActive() && mqtt && mqtt->isConnectedDirectly()) {
+#else
+        else if (mqtt && mqtt->isConnectedDirectly()) {
+#endif
             st = "connected";
             sc = 0x07E0;
-        } else if (!channels.anyMqttEnabled()) {
+        }
+#ifdef ADVUI_SCREENSHOT
+        else if (demoNetActive() || !channels.anyMqttEnabled()) {
+#else
+        else if (!channels.anyMqttEnabled()) {
+#endif
             // The engine parks the MQTT thread for good unless a channel opts in
             // (uplink or downlink), so "connecting..." here was a lie: nothing was
             // ever dialled. Say what's actually missing — the toggles are below.
@@ -4845,7 +4961,7 @@ void AdvUI::drawNetPage()
     // this shows what the radio is actually doing right now — so a wrong network or a
     // 5 GHz SSID reads as "AP not found" on the device instead of just silently not
     // connecting (which is exactly how it used to fail with no on-device feedback).
-    if (netPage == 0 && config.network.wifi_enabled) {
+    if (netPage == 0 && netGetBool(0, 0)) {
         int sy = top + 3 * rowH + 8; // just below the 3 WiFi fields
         g->drawFastHLine(0, sy - 6, 240, 0x39C7);
         g->setFont(&lgfx::fonts::FreeSansBold9pt7b);
@@ -4857,7 +4973,11 @@ void AdvUI::drawNetPage()
         char st[24];
         uint16_t col;
         bool connected = false;
-        if (netDirty) {
+        if (demoNetActive()) {
+            col = 0x07E0;
+            strcpy(st, "connected");
+            connected = true;
+        } else if (netDirty) {
             // Edits on this page aren't live until ESC saves + reboots — the radio
             // still runs the old config, so a WiFi.status() readout here would be
             // misleading (it reads "connecting" while nothing is actually happening).
@@ -4888,7 +5008,10 @@ void AdvUI::drawNetPage()
 
         if (connected) { // second line: IP + signal once the link is up
             char ln[40];
-            snprintf(ln, sizeof(ln), "%s  %ddBm", WiFi.localIP().toString().c_str(), (int)WiFi.RSSI());
+            if (demoNetActive())
+                strcpy(ln, "192.0.2.10  -55dBm");
+            else
+                snprintf(ln, sizeof(ln), "%s  %ddBm", WiFi.localIP().toString().c_str(), (int)WiFi.RSSI());
             g->setFont(&lgfx::fonts::Font0);
             g->setTextColor(0x9CD3);
             g->setCursor(6, sy + 16);
@@ -5278,7 +5401,8 @@ void AdvUI::hilState()
                   g_msgCount, histTotal(), unreadCount(), g_reactCount, convCount, filteredCount, (unsigned)ESP.getFreeHeap(),
                   (unsigned)ESP.getMinFreeHeap(),
                   (unsigned)g_linkState.load(), (unsigned)bleRxDrops(), (unsigned)bleTxDrops(),
-                  config.lora.tx_enabled ? 1U : 0U, (int)config.lora.region, (int)config.lora.tx_power,
+                  0U, // effective HIL TX ability: immutable Router/RadioLib guards always deny it
+                  (int)config.lora.region, (int)config.lora.tx_power,
                   (unsigned)g_nodeSort, (unsigned)g_nameShort);
     unsigned statuses[5] = {};
     for (int i = 0; i < g_msgCount; i++)
@@ -5717,21 +5841,20 @@ void AdvUI::runDemoDump()
     drawPickList();
     screenshot("utc");
 
-    // WiFi / MQTT pages with sample values (RAM-only; rebooted without a save)
-    config.network.wifi_enabled = true;
-    strcpy(config.network.wifi_ssid, "HomeWiFi");
-    strcpy(config.network.wifi_psk, "s3cret-pass");
-    moduleConfig.mqtt.enabled = true;
-    moduleConfig.mqtt.address[0] = 0;
-    moduleConfig.mqtt.encryption_enabled = true;
-    strcpy(moduleConfig.mqtt.root, "msh");
+    // WiFi / MQTT pages use view-only fixtures. Never mutate the engine's live
+    // config: its network threads run concurrently and a save from another
+    // subsystem must not be able to persist promotional credentials.
+    g_demoNetActive = true;
     netSel = 0;
     netScroll = 0;
     netPage = 0;
     drawNetPage();
+    g_demoNetActive = false;
     screenshot("wifi");
+    g_demoNetActive = true;
     netPage = 1;
     drawNetPage();
+    g_demoNetActive = false;
     screenshot("mqtt");
 
     // Unicode showcase: several scripts in one thread (needs the font partition/SD)
@@ -5812,9 +5935,19 @@ void AdvUI::runDemoDump()
     pinLen = 0;
     pinBuf[0] = 0;
 
-    // --- Usage-scenario frames (a01..) for the animated hero: pick the chat,
-    // type, send, get the delivery check, receive the reply, scroll the history.
+    // --- Usage-scenario frames (a01..) for the animated hero.
+    beginDemoIdentity();
+    me = myNodeNum();
+    peer = kDemoPeer;
+    g_radioCompanion = false;
     g_ruMode = false;
+    g_nameShort = 0;
+    g_utcOffsetMin = 0;
+    g_favChannels = 0;
+    g_favNodeCount = 0;
+    histExit();
+    sendFailure = SendFailure::NONE;
+    confirmDel = false;
     g_msgCount = 0;
     g_reactCount = 0;
     g_reactNext = 0;
@@ -5839,39 +5972,100 @@ void AdvUI::runDemoDump()
     screenshot("a02"); // opened at the first unread
 
     mode = MODE_COMPOSE;
-    const char *typing[] = {"O", "On m", "On my w", "On my way", "On my way \U0001F642"};
-    for (unsigned i = 0; i < sizeof(typing) / sizeof(typing[0]); i++) {
-        snprintf(msgBuf, sizeof(msgBuf), "%s", typing[i]);
-        msgLen = (uint8_t)strlen(msgBuf);
-        drawNode();
-        char nm[8];
-        snprintf(nm, sizeof(nm), "a%02u", 3 + i);
-        screenshot(nm); // a03..a07: the reply being typed
-    }
+    snprintf(msgBuf, sizeof(msgBuf), "O");
+    msgLen = (uint8_t)strlen(msgBuf);
+    drawNode();
+    screenshot("a03");
+    snprintf(msgBuf, sizeof(msgBuf), "On m");
+    msgLen = (uint8_t)strlen(msgBuf);
+    drawNode();
+    screenshot("a04");
+    snprintf(msgBuf, sizeof(msgBuf), "On my w");
+    msgLen = (uint8_t)strlen(msgBuf);
+    drawNode();
+    screenshot("a05");
+    snprintf(msgBuf, sizeof(msgBuf), "On my way");
+    msgLen = (uint8_t)strlen(msgBuf);
+    drawNode();
+    screenshot("a06");
+
+    emojiSel = 5; // slightly smiling face
+    emojiReturn = MODE_COMPOSE;
+    mode = MODE_EMOJI;
+    drawEmoji();
+    screenshot("a07");
+
+    snprintf(msgBuf, sizeof(msgBuf), "On my way \U0001F642");
+    msgLen = (uint8_t)strlen(msgBuf);
+    mode = MODE_COMPOSE;
+    drawNode();
+    screenshot("a08");
+
     msgBuf[0] = 0;
     msgLen = 0;
     addMsg(me, peer, 0, t + 60, false, "On my way \U0001F642", 16, MSG_SENDING);
     mode = MODE_NODE;
     chatScroll = 0;
     drawNode();
-    screenshot("a08"); // sent: the pending dot
-    for (int i = 0; i < g_msgCount; i++)
-        if (g_msgs[i].id == 16)
-            g_msgs[i].status = MSG_DELIVERED; // the routing ACK lands
+    screenshot("a09"); // sent: the pending dot
+    ackMsg(16, MSG_DELIVERED, 0);
     drawNode();
-    screenshot("a09"); // the green check
-    addMsg(peer, me, 0, t + 120, false, "Same, see you there \U0001F44D", 17, MSG_IN);
+    screenshot("a10"); // the routing ACK lands: green check
+    addMsg(peer, me, 0, t + 120, false, "Copy. See you there \U0001F44D", 17, MSG_IN);
     drawNode();
-    screenshot("a10"); // their reply arrives
-    chatScroll = 4;
-    drawNode();
-    screenshot("a11"); // scrolling back through the history
-    chatScroll = 8;
+    screenshot("a11"); // their reply arrives
+
+    reactSel = 0;
+    reactStrip = true;
+    reactPick = 5; // fire
     drawNode();
     screenshot("a12");
+
+    addReaction(17, me, "\U0001F525", peer);
+    reactSel = -1;
+    reactStrip = false;
+    drawNode();
+    screenshot("a13");
+
+    pendingReplyId = 17;
+    utf8Copy(replyPrev, "Copy. See you there \U0001F44D", (int)sizeof(replyPrev) - 1);
+    g_ruMode = true;
+    mode = MODE_COMPOSE;
+    snprintf(msgBuf, sizeof(msgBuf), "\xD0\x94");
+    msgLen = (uint8_t)strlen(msgBuf);
+    drawNode();
+    screenshot("a14");
+    snprintf(msgBuf, sizeof(msgBuf), "\xD0\x94\xD0\xB0, \xD0\xB2\xD0\xB8\xD0\xB6\xD1\x83");
+    msgLen = (uint8_t)strlen(msgBuf);
+    drawNode();
+    screenshot("a15");
+    snprintf(msgBuf, sizeof(msgBuf),
+             "\xD0\x94\xD0\xB0, \xD0\xB2\xD0\xB8\xD0\xB6\xD1\x83 \xD1\x81\xD0\xB2\xD0\xB5\xD1\x82 \U0001F525");
+    msgLen = (uint8_t)strlen(msgBuf);
+    drawNode();
+    screenshot("a16"); // quoted Cyrillic reply
+
+    msgBuf[0] = 0;
+    msgLen = 0;
+    pendingReplyId = 0;
+    g_ruMode = false;
+    addMsg(me, peer, 0, t + 180, false,
+           "\xD0\x94\xD0\xB0, \xD0\xB2\xD0\xB8\xD0\xB6\xD1\x83 \xD1\x81\xD0\xB2\xD0\xB5\xD1\x82 \U0001F525",
+           18, MSG_SENDING, 17);
+    mode = MODE_NODE;
     chatScroll = 0;
     drawNode();
-    screenshot("a13"); // back at the newest message
+    screenshot("a17");
+
+    ackMsg(18, MSG_DELIVERED, 0);
+    drawNode();
+    screenshot("a18");
+
+    sel = 0;
+    scrollTop = 0;
+    mode = MODE_CHATS;
+    drawChats();
+    screenshot("a19"); // updated preview, no unread badge
     Serial.println("@@DONE");
     Serial.flush();
     delay(200); // give the host time to consume @@DONE before USB resets
@@ -7060,9 +7254,9 @@ int32_t AdvUI::runOnce()
     // Announce ourselves early so neighbours see us right away — stock waits ~30s.
     if (splashDone && !announced && nodeInfoModule) {
 #ifdef ADVUI_HIL
-        // The HIL build is radio-silent by contract. The compile-time
-        // USERPREFS_LORA_TX_DISABLED guard also blocks every engine-owned
-        // periodic send; skip this eager ADV announcement before it is queued.
+        // The HIL build is radio-silent by contract. Skip this eager ADV
+        // announcement before it is queued; Router and RadioLib have immutable
+        // compile-time guards for every other engine-owned path.
         announced = true;
 #else
         nodeInfoModule->sendOurNodeInfo(NODENUM_BROADCAST, false);

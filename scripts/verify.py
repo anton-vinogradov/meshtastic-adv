@@ -37,6 +37,10 @@ def parser() -> argparse.ArgumentParser:
         "--release-image", type=Path,
         help="exact production app artifact restored after USB HIL (requires --usb)",
     )
+    result.add_argument(
+        "--config-backup", type=Path,
+        help="exclusive private backup destination for USB HIL (requires --usb)",
+    )
     result.add_argument("--backup-root", type=Path, help="pre-run WiFi fixture backup root required by --rf")
     result.add_argument("--capture-rf-backups", action="store_true", help="capture fresh WiFi exports before --rf")
     result.add_argument("--rf-profile-from", help="fixture name that supplies the intentional shared RF profile")
@@ -53,6 +57,8 @@ def validate_args(args: argparse.Namespace, source: argparse.ArgumentParser) -> 
         source.error("hardware stages cannot be combined with --quick or --firmware-only")
     if args.release_image is not None and not args.usb:
         source.error("--release-image requires --usb")
+    if args.config_backup is not None and not args.usb:
+        source.error("--config-backup requires --usb")
     if args.rf and args.backup_root is None:
         source.error("--rf requires --backup-root")
     if (
@@ -128,6 +134,8 @@ def build_plan(args: argparse.Namespace, artifacts: Path) -> list[Stage]:
         ]
         if args.release_image is not None:
             usb_command.extend(("--release-image", str(args.release_image)))
+        if args.config_backup is not None:
+            usb_command.extend(("--config-backup", str(args.config_backup)))
         stages.append(Stage("hardware/usb-cardputer", tuple(usb_command), hardware=True))
     if args.rf:
         rf_command = [

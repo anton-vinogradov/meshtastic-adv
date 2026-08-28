@@ -8,15 +8,20 @@ account by hand after editing.
 ---
 Keyboard-first Meshtastic client for the M5Stack Cardputer ADV — message the mesh right from the keyboard, no phone needed.
 
-• Works with or without a LoRa cap: pair over Bluetooth with any stock Meshtastic node and use its radio
+• Works with or without a LoRa cap: pair over Bluetooth with a BLE-capable stock Meshtastic node and use its radio
 • Type-to-search contacts, full on-device chat with delivery status
-• Cyrillic + full Unicode (CJK, Arabic, Greek…) via a bundled font partition
+• Cyrillic + broad Unicode glyph coverage via a bundled font partition (no complex-script shaping or BiDi)
 • Emoji palette, reactions, replies
 • On-device settings: region, channels, WiFi/MQTT, LoRa role/hops/power, remote node admin
 
 Installs complete from here — firmware and font partition together, nothing to add afterwards.
 
-Actively developed, updated most weeks. Questions and requests are answered:
+IMPORTANT: attach the LoRa antenna before powering a Cap LoRa-1262; running its
+PA without an antenna can damage it. Export your Meshtastic configuration before
+a full erase, which removes settings and message history.
+
+Stable releases are build-, memory- and hardware-gated on a real Cardputer ADV.
+Questions, field reports and feature requests are welcome:
 https://github.com/anton-vinogradov/meshtastic-adv/discussions
 
 Open source (GPL-3.0): https://github.com/anton-vinogradov/meshtastic-adv

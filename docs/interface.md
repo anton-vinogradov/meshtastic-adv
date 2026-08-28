@@ -5,39 +5,23 @@
 The advui firmware replaces the stock Meshtastic screen with a keyboard-first UI built
 for the Cardputer ADV. This is the guide to what's on screen and how to drive it.
 
-The engine underneath is unmodified upstream Meshtastic, so the node still behaves like a
-normal Meshtastic device on the mesh — this only changes the local UI. In **companion
-mode** the same UI drives a *different* node's radio over Bluetooth instead (see the end).
+Routing, crypto and the Client API underneath remain upstream Meshtastic, so the node still
+behaves like a normal Meshtastic device on the mesh. The build applies a small, reviewed set
+of integration patches for startup, USB reliability and low-memory operation around this UI.
+In **companion mode** the same UI drives a *different* node's radio over Bluetooth instead
+(see the end).
 
 ## Screens at a glance
 
-<table>
-<tr>
-<td align="center" width="33%"><img src="img/splash.png" width="230"><br><sub><b>Splash</b> — branded boot screen</sub></td>
-<td align="center" width="33%"><img src="img/chats.png" width="230"><br><sub><b>Chats</b> — home: recent DMs + channels, unread badges</sub></td>
-<td align="center" width="33%"><img src="img/chat.png" width="230"><br><sub><b>Conversation</b> — Cyrillic, inline emoji, delivery checks</sub></td>
-</tr>
-<tr>
-<td align="center" width="33%"><img src="img/unicode.png" width="230"><br><sub><b>Full Unicode</b> — CJK / Greek / Hebrew / Korean text</sub></td>
-<td align="center" width="33%"><img src="img/nodes.png" width="230"><br><sub><b>Node list</b> — signal, hops, last-heard, role</sub></td>
-<td align="center" width="33%"><img src="img/emoji.png" width="230"><br><sub><b>Emoji palette</b> — Tab to insert</sub></td>
-</tr>
-<tr>
-<td align="center" width="33%"><img src="img/react.png" width="230"><br><sub><b>Reactions</b> — tapback strip on a picked message</sub></td>
-<td align="center" width="33%"><img src="img/settings.png" width="230"><br><sub><b>Settings</b> — sectioned menu with value previews</sub></td>
-<td align="center" width="33%"><img src="img/lora.png" width="230"><br><sub><b>LoRa settings</b> — region, preset, role, hops, power</sub></td>
-</tr>
-<tr>
-<td align="center" width="33%"><img src="img/utc.png" width="230"><br><sub><b>UTC picker</b> — offset by city</sub></td>
-<td align="center" width="33%"><img src="img/wifi.png" width="230"><br><sub><b>WiFi</b> — join a network, NTP time</sub></td>
-<td align="center" width="33%"><img src="img/mqtt.png" width="230"><br><sub><b>MQTT</b> — bridge the mesh to the internet</sub></td>
-</tr>
-<tr>
-<td align="center" width="33%"><img src="img/bscan.png" width="230"><br><sub><b>Companion: find node</b> — scan for a stock node over BLE</sub></td>
-<td align="center" width="33%"><img src="img/bpin.png" width="230"><br><sub><b>Companion: pairing</b> — type the PIN from the node</sub></td>
-<td align="center" width="33%"><img src="img/blink.png" width="230"><br><sub><b>Companion: link status</b> — signal, node battery, synced nodes</sub></td>
-</tr>
-</table>
+<p align="center">
+  <a href="img/demo.gif"><img src="img/hero.png" width="720" alt="Synthetic release-HIL conversation: unread chat, emoji, delivery ACK, incoming reply, reaction and quoted Cyrillic reply"></a><br>
+  <sub><a href="img/demo.gif">▶ open the 16-second screen demo</a></sub>
+</p>
+
+The release-generated demo above is captured from the real framebuffer with
+synthetic, RAM-only identities and messages. The guide below covers the rest of
+the interface: Chats, node list, conversation, emoji and reactions, Unicode,
+settings, LoRa/WiFi/MQTT/UTC and companion pairing/status.
 
 ## Screens
 
@@ -120,8 +104,9 @@ the middle, the compose bar sits at the bottom.
   their uptime moment and get their real stamps backfilled the instant time arrives (within
   the same boot; across a power loss the arrival time is genuinely unknowable and stays blank).
 - **Delivery status** on your messages: a grey dot while sending → a **green ✓** on the
-  routing ACK (channel broadcasts get their ✓ on transmit) → a **red ✗ with the reason** on
-  failure. When the newest message has failed, **Enter resends it**.
+  routing ACK → a **red ✗ with the reason** on failure. For a channel, ✓ is an implicit mesh
+  acknowledgement: a neighbour was heard relaying the packet, not confirmation that every
+  member received it. When the newest message has failed, **Enter resends it**.
 - **↑ / ↓** scroll the history — **hold to keep scrolling** (arrows auto-repeat everywhere,
   and so does backspace while erasing text); opening a thread auto-jumps to the first unread.
 - **Scrolling past the top pages into the flash archive**: messages evicted from the live
@@ -153,7 +138,7 @@ a section (or WiFi / MQTT / Radio directly), ESC steps back up.
 | Section | Rows |
 | ------- | ---- |
 | **Node**   | **Name** and **Short** — the node's long/short names (text editor)         |
-| **LoRa**   | **Region** (required on first boot) · **Preset** (LongFast, MediumFast, …) · **Frequency** (SX1262 override, 150–960 MHz; leave blank for automatic) · **Channel** (primary name; key kept) · **Role** (Client, Client Mute/Hidden, Router (Late), Repeater, Tracker, Sensor, TAK) · **Hops** (1–7) · **Power** (region max or 2–22 dBm) · **Rebroadcast** (All / Local only / Known only / Core ports only / None) |
+| **LoRa**   | **Region** (required on first boot) · **Preset** (LongFast, MediumFast, …) · **Frequency** (SX1262 override, 150–960 MHz; leave blank for automatic) · **Channel** (primary name; key kept) · **Role** (Client, Client Mute/Hidden, Router (Late), Repeater, Tracker, Sensor, TAK) · **Hops** (1–7) · **Power** (region-aware values up to the region maximum, including 26 dBm where supported) · **Rebroadcast** (All / Local only / Known only / Core ports only / None) |
 | **WiFi**   | join a network (NTP time comes with it); enabling WiFi turns Bluetooth off |
 | **MQTT**   | bridge the mesh to the internet: default public broker or your own         |
 | **Device** | **UTC** — offset picker with city labels, drives all timestamps · **Clock** — the device time, `not set` until it syncs; type `HH:MM` to set it by hand when there's no phone, NTP or GPS node around (the clock resets on every reboot, and messages received while it's unset stay timeless) · **Screen** — auto-off timeout (15 s … 5 min or never; default 5 min) · **Font** — where the Unicode font came from (`flash` / `sd` / `off`), read-only |
@@ -204,8 +189,9 @@ reminds you).
 - **Screen auto-off** cuts the whole display rail after the configured idle time. Any key
   wakes it (that key is swallowed); incoming messages don't light it up — the beep and the
   LED do the notifying, the unread badges are there when you wake it.
-- **Full Unicode:** messages and names in any BMP script (CJK, Greek, Hebrew, Arabic, …)
-  **plus the emoji blocks** (U+1F000–U+1FBFF — so reactions and messages from phone users
+- **Broad Unicode glyph coverage:** messages and names in any BMP script (CJK, Greek,
+  Hebrew, Arabic, …) render by code point; complex-script shaping and bidirectional layout
+  are not implemented. Coverage also includes **the emoji blocks** (U+1F000–U+1FBFF — so reactions and messages from phone users
   render as Unifont glyphs instead of tofu boxes; invisible modifiers like variation
   selectors, ZWJ and skin tones are skipped) via GNU Unifont — the installer flashes it
   into a dedicated partition, no user action; esptool users write `unifont.bin` at
@@ -214,11 +200,11 @@ reminds you).
 - **Phone app:** the stock Bluetooth API is untouched, so the official Meshtastic app pairs
   with the Cardputer like with any node — a passkey screen pops up (waking the display) with
   the PIN to type on the phone. WiFi turns Bluetooth off, as in stock.
-- The header counts **nodes heard in the last 24 hours** — a flash-backed ledger of every
-  node identity ever met, so the number reflects the living mesh and never saturates at the
-  storage caps (until the clock syncs it falls back to the stored-identity count). The list
-  itself shows the 200 most current nodes with full data; in companion mode it mirrors the
-  64 most recently heard while the header counts the linked node's whole DB from the sync
-  stream.
+- The header counts **nodes heard in the last 24 hours** from a flash-backed 2,048-entry
+  identity ledger. It is independent of the smaller hot-list caps and replaces the oldest
+  identity when full (until the clock syncs it falls back to the stored-identity count).
+  The list itself shows the 200 most current nodes with full data; in companion mode it
+  mirrors the 64 most recently heard while the header counts the linked node's whole DB
+  from the sync stream.
 - Other nodes' battery levels aren't stored by this build's compact node DB — only our own
   battery (header/footer) and, in companion mode, the linked node's.

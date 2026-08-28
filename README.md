@@ -6,17 +6,13 @@
 [![Release](https://img.shields.io/github/v/release/anton-vinogradov/meshtastic-adv)](https://github.com/anton-vinogradov/meshtastic-adv/releases/latest)
 [![License](https://img.shields.io/github/license/anton-vinogradov/meshtastic-adv)](LICENSE)
 
-**A keyboard-first [Meshtastic](https://meshtastic.org) client for the [M5Stack Cardputer ADV](https://shop.m5stack.com/products/m5stack-cardputer-adv) — with its own Cap LoRa-1262 (SX1262), or driving any stock Meshtastic node over Bluetooth.**
+**A keyboard-first [Meshtastic](https://meshtastic.org) client for the [M5Stack Cardputer ADV](https://shop.m5stack.com/products/m5stack-cardputer-adv-version-esp32-s3) — with its own Cap LoRa-1262 (SX1262), or driving any BLE-capable stock Meshtastic node.**
 
 A from-scratch on-device UI focused on one thing: making it genuinely comfortable to **message people over the mesh** from a pocket QWERTY device — no phone required — while keeping the proven Meshtastic radio stack underneath. No LoRa cap? [Companion mode](#companion-mode-drive-another-node-over-ble) turns the Cardputer into a terminal for a Heltec / T-Beam / RAK you already own.
 
 <p align="center">
-  <img src="docs/img/hero.gif" width="72%" alt="Meshtastic ADV running on the Cardputer ADV: recent chats, a Cyrillic + emoji conversation, the emoji palette and the node list"/>
-  <br/><sub>device render © <a href="https://shop.m5stack.com/products/m5stack-cardputer-adv">M5Stack</a> · the screen is the real UI</sub>
-</p>
-<p align="center">
-  <img src="docs/img/chats.png" width="49%" alt="Recent conversations home with previews and unread badges"/>
-  <img src="docs/img/chat.png" width="49%" alt="Conversation with Cyrillic text, inline emoji and delivery status"/>
+  <a href="docs/img/demo.gif"><img src="docs/img/hero.png" width="72%" alt="Meshtastic ADV running on the Cardputer ADV: opening an unread chat, typing with emoji, receiving an acknowledgement and reply, reacting, then sending a quoted Cyrillic reply"/></a>
+  <br/><sub><a href="docs/img/demo.gif">▶ open the 16-second demo</a> · real firmware UI with a synthetic conversation · device render © <a href="https://shop.m5stack.com/products/m5stack-cardputer-adv-version-esp32-s3">M5Stack</a></sub>
 </p>
 
 > **[▶ Install in your browser](https://anton-vinogradov.github.io/meshtastic-adv/)** — one click, no toolchain (desktop Chrome/Edge).
@@ -34,9 +30,9 @@ You get a device that boots straight into a usable messenger: pick a contact, ty
 - **📢 Channels** — read and broadcast to any channel, right alongside your DMs.
 - **✅ Delivery status** — every sent message shows *sending* (dot) → *delivered* (green check, from the routing ACK) → *failed* (red ✗ with the reason). For channel broadcasts, the check is an implicit mesh acknowledgement: a neighbour was heard relaying the packet.
 - **⌨️ Cyrillic input + 😀 emoji** — type Russian on the Latin keyboard via a live transliteration layer (**Fn+L**); receive/render non-Latin text and inline emoji bitmaps; a **Tab** palette inserts emoji.
-- **🈶 Full Unicode text** — CJK, Greek, Hebrew, Arabic… any script in the Basic Multilingual Plane, plus the emoji blocks (reactions from phone users render as glyphs, not tofu), via a GNU Unifont partition the installer flashes automatically (Latin/Cyrillic stay on the fast embedded font).
-- **📇 Node list** — press **Tab** for everyone on the mesh, with a signal-bar meter (from SNR), hop count, last-heard age and role, in fixed columns.
-- **🔎 Contact search** — start typing to find any node and start a new chat.
+- **🈶 Broad Unicode glyph coverage** — CJK, Greek, Hebrew, Arabic and the rest of the Basic Multilingual Plane, plus emoji blocks, via a GNU Unifont partition the installer flashes automatically. The renderer is intentionally simple: complex-script shaping and bidirectional layout are not implemented, so Arabic/Hebrew display in code-point order (Latin/Cyrillic stay on the fast embedded font).
+- **📇 Node list** — press **Tab** for the nodes currently known on-device, with a signal-bar meter (from SNR), hop count, last-heard age and role, in fixed columns.
+- **🔎 Contact search** — start typing to find a known node and start a new chat.
 - **⭐ Favourites** — flag contacts and channels; they get priority alerts.
 - **🔔 Sound + light** — a single beep **and** a green LED flash from a favourite; a blue flash for everyone else (no buzzing on every packet).
 - **🕘 Timestamps** — compact local `HH:MM` on every message, with a UTC-offset (city) picker and a manual clock setting for meshes with no time source.
@@ -44,14 +40,8 @@ You get a device that boots straight into a usable messenger: pick a contact, ty
 - **💾 History that survives reboots — and eviction** — the live conversation window is persisted to flash, and older messages move to a 256-deep flash archive you can page back into right in the thread.
 - **⚙️ On-device settings** — name, region, modem preset, frequency, channel, role, hop limit, TX power, rebroadcast mode, UTC, WiFi and MQTT, all editable on the device (long-press **ESC**).
 - **🔋 Screen auto-off** — the display powers down after 15 s…5 min idle (your pick); any key wakes it, alerts still beep and flash the LED while it's dark.
-- **📱 Phone app still works** — the stock Bluetooth API stays on: pair the official Meshtastic app (the Cardputer shows the pairing PIN) and use it alongside the on-device UI.
-- **🔗 Companion mode** — no LoRa cap? Pair the Cardputer with **any stock Meshtastic node** (Heltec, T-Beam, RAK…) over Bluetooth and use its radio: the whole chat UI above, through the other node. [Details below.](#companion-mode-drive-another-node-over-ble)
-
-<p align="center">
-  <img src="docs/img/emoji.png" width="32%" alt="Emoji palette"/>
-  <img src="docs/img/settings.png" width="32%" alt="On-device settings"/>
-  <img src="docs/img/utc.png" width="32%" alt="UTC offset picker with cities"/>
-</p>
+- **📱 Phone app still works** — the stock Bluetooth API stays on: pair the official Meshtastic app (the Cardputer shows the pairing PIN) and use it alongside the on-device UI whenever Bluetooth is free.
+- **🔗 Companion mode** — no LoRa cap? Pair the Cardputer with **any BLE-capable stock Meshtastic node** (Heltec, T-Beam, RAK…) and use its radio: the whole chat UI above, through the other node. [Details below.](#companion-mode-drive-another-node-over-ble)
 
 <p align="center"><b><a href="docs/interface.md#screens-at-a-glance">▶ See every screen with captions →</a></b></p>
 
@@ -61,7 +51,7 @@ Every `v*` tag is held until the exact source passes the hardware-free tests,
 both firmware builds and size budgets, then a real Cardputer ADV on a trusted
 runner. The physical gate is radio-silent and identity-bound; it replays ordinary
 serialized `FromRadio` traffic through the production decoder, drives the real UI,
-overflows and reloads persistent history, checks 29 framebuffer captures, reboots,
+overflows and reloads persistent history, checks 35 framebuffer captures, reboots,
 and finally restores and verifies the exact application bytes users will receive.
 See the honest [HIL coverage matrix](hil/README.md#coverage-matrix), including what
 still needs a camera, key jig or controlled RF lab for physical proof.
@@ -72,16 +62,17 @@ Release hardening changes and migration notes are kept in the [changelog](CHANGE
 The easiest way is the **[web installer](https://anton-vinogradov.github.io/meshtastic-adv/)** (ESP Web Tools):
 
 1. Attach the **LoRa antenna** to the Cap first — *never power the PA without it.*
-2. Open the page in desktop **Chrome** or **Edge**, plug the Cardputer in with a **data** USB-C cable.
-3. Click **Install**. If the device isn't listed, hold **G0/BOOT** while connecting, then release.
-4. After flashing, long-press **ESC** → set your **Region** and **UTC**.
+2. Export your Meshtastic configuration from the official app before any full erase.
+3. Open the page in desktop **Chrome** or **Edge**, plug the Cardputer in with a **data** USB-C cable.
+4. Click **Install**. If the device isn't listed, hold **G0/BOOT** while connecting, then release.
+5. After flashing, long-press **ESC** → set your **Region** and **UTC**.
 
 **No computer?** Two on-device paths:
 
 - **M5Launcher catalog** — in the launcher's online-install (OTA) menu, find **Meshtastic ADV** and install from there: the catalog entry is a complete merged image and the launcher places everything correctly. Same firmware is in **M5Burner** (Cardputer category).
 - **M5Launcher from SD card** — use `meshtastic-adv-cardputer-adv-merged.bin` from the [latest release](https://github.com/anton-vinogradov/meshtastic-adv/releases) and flash it as a **full firmware** (written to address `0x0`, replacing the launcher) — *not* as an app/OTA install. An app-slot install runs this firmware on the launcher's partition layout, which ends in restarts and a dead keyboard. Don't use `factory.bin` here: it lacks the Unicode font.
 
-Prefer the CLI? Grab `meshtastic-adv-vX.Y.Z.factory.bin` from the [latest release](https://github.com/anton-vinogradov/meshtastic-adv/releases) and flash it at offset `0x0` with esptool; add `unifont.bin` at `0x340000` for the full-Unicode font (or drop it on the SD card root instead) — or just take `meshtastic-adv-cardputer-adv-merged.bin`, which contains both in one file.
+Prefer the CLI? Grab `meshtastic-adv-vX.Y.Z.factory.bin` from the [latest release](https://github.com/anton-vinogradov/meshtastic-adv/releases) and flash it at offset `0x0` with esptool; add `unifont.bin` at `0x340000` for broad Unicode glyph coverage (or drop it on the SD card root instead) — or just take `meshtastic-adv-cardputer-adv-merged.bin`, which contains both in one file.
 
 ## How to drive it
 
@@ -100,7 +91,7 @@ Everything is keyboard-driven. The footer of each screen shows the live hints.
 | Conversation | **ESC** | back |
 | Anywhere | **long-press ESC** | open Settings |
 
-In Settings, **↑/↓** move, **Enter** edits (toggles for on/off items), **ESC** goes back. Changing Region/Preset/Frequency/Channel, or WiFi/MQTT, reboots to apply. Enabling WiFi turns Bluetooth off (Meshtastic behaviour).
+In Settings, **↑/↓** move, **Enter** edits (toggles for on/off items), **ESC** goes back. Changing anything under LoRa, WiFi/MQTT or Radio mode reboots to apply. Enabling WiFi turns Bluetooth off (Meshtastic behaviour).
 
 ## Companion mode: drive another node over BLE
 
@@ -140,7 +131,7 @@ See [docs/interface.md](docs/interface.md) for the on-screen details and [HARDWA
 | Part | Detail |
 |---|---|
 | MCU | M5Stack Cardputer ADV — Stamp-S3A (ESP32-S3FN8, 8 MB flash, **no PSRAM**) |
-| Radio | Cap LoRa-1262 — Semtech **SX1262**, 868–923 MHz, external antenna — *or* any stock Meshtastic node over BLE (companion mode) |
+| Radio | Cap LoRa-1262 — Semtech **SX1262**, 868–923 MHz, external antenna — *or* any BLE-capable stock Meshtastic node (companion mode) |
 | Display | 1.14" 240×135 IPS |
 | Input | 56-key QWERTY |
 | Audio | ES8311 codec + speaker |
@@ -168,7 +159,7 @@ Hardware remains an explicit opt-in; commands, fixture safeguards and the covera
 
 ## Status
 
-The read **and** write paths are done and running on real hardware: node list, DMs, channels, delivery status, Cyrillic, emoji, reactions, replies, favourites, sound, timestamps, persisted history, on-device settings and BLE companion mode all work today. Companion mode is verified end-to-end over the air (encrypted DM through the linked node, routing ACK back).
+The read **and** write paths are done and running on real hardware: node list, DMs, channels, delivery status, Cyrillic, emoji, reactions, replies, favourites, sound, timestamps, persisted history, on-device settings and BLE companion mode all work today. Companion mode has been manually exercised end-to-end over BLE (encrypted DM through the linked node and routing ACK back); the actual BLE GATT transport is not yet part of the automated release fixture.
 
 The stable 1.0 line is maintained with the same hardware release gate; ongoing work
 focuses on field reliability, memory headroom and small usability improvements.

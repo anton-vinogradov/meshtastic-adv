@@ -30,15 +30,61 @@ class HilRunnerTests(unittest.TestCase):
                 self.assertEqual(hil.main(), 0)
             self.assertEqual(stat.S_IMODE(output.stat().st_mode), 0o600)
 
-    def test_hil_firmware_forces_live_radio_tx_off(self):
+    def test_hil_firmware_forces_all_live_packet_egress_off(self):
         variant = (ROOT / "overlay/variants/esp32s3/m5stack_cardputer_adv_advui/platformio.ini").read_text()
         sync = (ROOT / "scripts/sync-overlay.sh").read_text()
         source = (ROOT / "overlay/src/advui/AdvUI.cpp").read_text()
-        self.assertIn("-D USERPREFS_LORA_TX_DISABLED=1", variant)
+        production, hil_variant = variant.split("[env:m5stack-cardputer-adv-advui-hil]", 1)
+        self.assertNotIn("ADVUI_HIL", production)
+        self.assertIn("-D ADVUI_HIL", hil_variant)
+        self.assertNotIn("USERPREFS_LORA_TX_DISABLED", variant)
+        self.assertNotIn("USERPREFS_NETWORK_WIFI_ENABLED", variant)
         self.assertIn("advui-inject-hil-rx-only", sync)
+        self.assertIn("advui-inject-hil-no-mqtt-init", sync)
+        self.assertIn("advui-inject-hil-no-wifi-init", sync)
+        self.assertIn("grep -c 'advui-inject-hil-network-silence'", sync)
+        self.assertIn("HAS_UDP_MULTICAST \\&\\& !defined(ADVUI_HIL)", sync)
         healing = source.split("// Nameless-node healing.", 1)[1].split("// First-boot onboarding:", 1)[0]
         self.assertIn("#ifndef ADVUI_HIL", healing)
         self.assertIn("nodeInfoModule->sendOurNodeInfo", healing)
+
+    def test_demo_network_frames_do_not_mutate_live_engine_config(self):
+        source = (ROOT / "overlay/src/advui/AdvUI.cpp").read_text()
+        body = source.split("void AdvUI::runDemoDump()", 1)[1].split("// Unicode showcase:", 1)[0]
+        self.assertIn("g_demoNetActive = true", body)
+        self.assertIn("g_demoNetActive = false", body)
+        for forbidden in (
+            "config.", "moduleConfig.", "channels.", "nodeDB", "netSet",
+            "saveToDisk", "FSCom", "strcpy", "memcpy",
+        ):
+            self.assertNotIn(forbidden, body)
+        wifi_draw = body.index("drawNetPage();")
+        wifi_reset = body.index("g_demoNetActive = false;", wifi_draw)
+        wifi_shot = body.index('screenshot("wifi")')
+        self.assertLess(wifi_draw, wifi_reset)
+        self.assertLess(wifi_reset, wifi_shot)
+        mqtt_enable = body.index("g_demoNetActive = true;", wifi_shot)
+        mqtt_draw = body.index("drawNetPage();", mqtt_enable)
+        mqtt_reset = body.index("g_demoNetActive = false;", mqtt_draw)
+        mqtt_shot = body.index('screenshot("mqtt")')
+        self.assertLess(mqtt_enable, mqtt_draw)
+        self.assertLess(mqtt_draw, mqtt_reset)
+        self.assertLess(mqtt_reset, mqtt_shot)
+        net_page = source.split("void AdvUI::drawNetPage()", 1)[1].split(
+            "// Companion: scan for Meshtastic nodes", 1
+        )[0]
+        self.assertIn("if (demoNetActive())", net_page)
+        self.assertNotIn("g_demoNetActive", net_page)
+        self.assertIn('strcpy(ln, "192.0.2.10  -55dBm")', net_page)
+
+    def test_promotional_story_has_a_fixed_battery_fixture(self):
+        source = (ROOT / "overlay/src/advui/AdvUI.cpp").read_text()
+        battery = source.split("void batteryText", 1)[1].split("bool batteryCharging()", 1)[0]
+        charging = source.split("bool batteryCharging()", 2)[2].split("int drawBattery", 1)[0]
+        self.assertIn("if (g_demoActive)", battery)
+        self.assertIn('snprintf(out, cap, "87%%")', battery)
+        self.assertIn("if (g_demoActive)", charging)
+        self.assertIn("return false;", charging)
 
     def test_hil_release_does_not_delete_static_queue_interior_pointers(self):
         source = (ROOT / "overlay/src/advui/AdvBle.cpp").read_text()
@@ -166,6 +212,16 @@ class HilRunnerTests(unittest.TestCase):
             with self.assertRaisesRegex(hil.DemoCaptureTransportError, "received 1/2 rows"):
                 session.demo_frames(Path(directory), 1)
         self.assertEqual(session.serial.readline.call_count, 4)
+
+    def test_visual_matrix_includes_the_exact_promotional_story(self):
+        story = json.loads((ROOT / "docs/img/demo-story.json").read_text())
+        story_names = [frame["name"] for frame in story["frames"]]
+        self.assertEqual(
+            hil.EXPECTED_DEMO_FRAMES[-19:],
+            [f"a{index:02d}" for index in range(1, 20)],
+        )
+        self.assertEqual(hil.EXPECTED_DEMO_FRAMES[-19:], story_names)
+        self.assertEqual(len(hil.EXPECTED_DEMO_FRAMES), 35)
 
     def test_visual_retries_one_transport_loss_after_a_proven_reboot(self):
         capture_one = mock.MagicMock()
@@ -335,6 +391,9 @@ class HilRunnerTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             with (
                 mock.patch.object(hil, "resolve_role", return_value=device),
+                mock.patch.object(
+                    hil, "find_meshtastic_cli", return_value="/venv/bin/meshtastic"
+                ),
                 mock.patch.dict(hil.os.environ, {}, clear=True),
                 mock.patch.object(hil.subprocess, "run", side_effect=export) as run,
             ):
@@ -349,6 +408,7 @@ class HilRunnerTests(unittest.TestCase):
         self.assertEqual(len(set(destinations)), 2)
         command = run.call_args.args[0]
         self.assertEqual(command[command.index("--port") + 1], device["port"])
+        self.assertEqual(run.call_args.kwargs["env"]["MESHTASTIC_CLI"], "/venv/bin/meshtastic")
         self.assertIs(run.call_args.kwargs["stdout"], hil.subprocess.DEVNULL)
         self.assertIs(run.call_args.kwargs["stderr"], hil.subprocess.DEVNULL)
 
@@ -366,6 +426,9 @@ class HilRunnerTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             with (
                 mock.patch.object(hil, "resolve_role", return_value={"port": "/dev/dut"}),
+                mock.patch.object(
+                    hil, "find_meshtastic_cli", return_value="/venv/bin/meshtastic"
+                ),
                 mock.patch.object(hil.subprocess, "run", side_effect=export) as run,
             ):
                 digest = hil.capture_config_fingerprint({}, Path(directory), "before")
@@ -387,10 +450,99 @@ class HilRunnerTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             with (
                 mock.patch.object(hil, "resolve_role", return_value={"port": "/dev/dut"}),
+                mock.patch.object(
+                    hil, "find_meshtastic_cli", return_value="/venv/bin/meshtastic"
+                ),
                 mock.patch.object(hil.subprocess, "run", side_effect=export),
             ):
                 with self.assertRaisesRegex(hil.HilError, "was not stable"):
                     hil.capture_config_fingerprint({}, Path(directory), "after")
+
+    def test_config_fingerprint_re_resolves_identity_between_samples(self):
+        payload = b"same"
+        devices = [
+            {"port": "/dev/dut-a"},
+            {"port": "/dev/dut-a"},
+            {"port": "/dev/dut-b"},
+            {"port": "/dev/dut-b"},
+        ]
+
+        def export(command, **_kwargs):
+            destination = Path(command[command.index("--out") + 1])
+            destination.mkdir(parents=True)
+            config = destination / "config-fixture.yaml"
+            config.write_bytes(payload)
+            config.chmod(0o600)
+            return mock.Mock(returncode=0)
+
+        with tempfile.TemporaryDirectory() as directory:
+            with (
+                mock.patch.object(hil, "resolve_role", side_effect=devices) as resolve,
+                mock.patch.object(
+                    hil, "find_meshtastic_cli", return_value="/venv/bin/meshtastic"
+                ),
+                mock.patch.object(hil.subprocess, "run", side_effect=export) as run,
+            ):
+                digest = hil.capture_config_fingerprint({}, Path(directory), "before")
+
+        self.assertEqual(digest, hashlib.sha256(payload).digest())
+        self.assertEqual(resolve.call_count, 4)
+        self.assertEqual(
+            [call.args[0][call.args[0].index("--port") + 1] for call in run.call_args_list],
+            ["/dev/dut-a", "/dev/dut-b"],
+        )
+
+    def test_config_fingerprint_rejects_identity_change_during_export(self):
+        def export(command, **_kwargs):
+            destination = Path(command[command.index("--out") + 1])
+            destination.mkdir(parents=True)
+            config = destination / "config-fixture.yaml"
+            config.write_bytes(b"complete")
+            config.chmod(0o600)
+            return mock.Mock(returncode=0)
+
+        with tempfile.TemporaryDirectory() as directory:
+            with (
+                mock.patch.object(
+                    hil,
+                    "resolve_role",
+                    side_effect=({"port": "/dev/dut-a"}, {"port": "/dev/dut-b"}),
+                ),
+                mock.patch.object(
+                    hil, "find_meshtastic_cli", return_value="/venv/bin/meshtastic"
+                ),
+                mock.patch.object(hil.subprocess, "run", side_effect=export) as run,
+            ):
+                with self.assertRaisesRegex(hil.HilError, "port changed during"):
+                    hil.capture_config_fingerprint({}, Path(directory), "before")
+        self.assertEqual(run.call_count, 1)
+
+    def test_config_fingerprint_removes_each_private_sample_export_immediately(self):
+        payload = b"same"
+
+        def export(command, **_kwargs):
+            destination = Path(command[command.index("--out") + 1])
+            destination.mkdir(parents=True)
+            config = destination / "config-fixture.yaml"
+            config.write_bytes(payload)
+            config.chmod(0o600)
+            return mock.Mock(returncode=0)
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            device = {"port": "/dev/dut"}
+            with (
+                mock.patch.object(hil, "resolve_role", return_value=device),
+                mock.patch.object(
+                    hil, "find_meshtastic_cli", return_value="/venv/bin/meshtastic"
+                ),
+                mock.patch.object(hil.subprocess, "run", side_effect=export),
+            ):
+                self.assertEqual(
+                    hil.capture_config_fingerprint({}, root, "before"),
+                    hashlib.sha256(payload).digest(),
+                )
+            self.assertEqual(list(root.glob("before-*")), [])
 
     def test_config_fingerprint_ignores_only_live_top_level_location(self):
         first = b"""channel_url: secret\nconfig:\n  lora:\n    region: US\nlocation:\n  lat: 1.0\n  lon: 2.0\n  alt: 3\nmodule_config:\n  mqtt:\n    enabled: false\nowner: fixture\n"""
@@ -588,6 +740,7 @@ class HilRunnerTests(unittest.TestCase):
             with (
                 mock.patch.object(hil, "stage_release_image", return_value=(Path("/staged.bin"), "a" * 64)),
                 mock.patch.object(hil, "capture_config_fingerprint", return_value=b"same"),
+                mock.patch.object(hil, "write_flash_marker"),
                 mock.patch.object(
                     hil, "flash", side_effect=[hil.HilError("upload failed"), {"role": "dut"}]
                 ) as flash,
@@ -609,6 +762,7 @@ class HilRunnerTests(unittest.TestCase):
             with (
                 mock.patch.object(hil, "stage_release_image", return_value=(Path("/staged.bin"), "b" * 64)),
                 mock.patch.object(hil, "capture_config_fingerprint", return_value=b"before"),
+                mock.patch.object(hil, "write_flash_marker"),
                 mock.patch.object(
                     hil,
                     "flash",
@@ -624,27 +778,31 @@ class HilRunnerTests(unittest.TestCase):
             self.assertEqual(summary["failure_type"], "HilError")
             self.assertEqual(summary["restore_failure_type"], "HilError")
 
-    def test_full_run_fails_when_restored_node_configuration_drifted(self):
+    def test_full_run_restores_verified_backup_when_configuration_drifted(self):
         report = mock.Mock(failed=0)
         with tempfile.TemporaryDirectory() as directory:
             artifacts = Path(directory) / "artifacts"
             with (
                 mock.patch.object(hil, "stage_release_image", return_value=(Path("/staged.bin"), "c" * 64)),
                 mock.patch.object(
-                    hil, "capture_config_fingerprint", side_effect=[b"before", b"after"]
+                    hil, "capture_config_fingerprint", side_effect=[b"before", b"after", b"before"]
                 ),
+                mock.patch.object(hil, "write_flash_marker"),
                 mock.patch.object(hil, "flash", return_value={"role": "dut"}),
+                mock.patch.object(hil, "restore_config_backup") as restore_config,
                 mock.patch.object(hil, "smoke", return_value=report),
                 mock.patch.object(hil, "message_flow", return_value=report),
                 mock.patch.object(hil, "visual", return_value=report),
             ):
-                with self.assertRaisesRegex(hil.HilError, "configuration changed"):
+                with self.assertRaisesRegex(hil.HilError, "verified backup restored"):
                     hil.full_run({"schema": 1}, artifacts, timeout=1, skip_build=True)
 
             summary = json.loads((artifacts / "summary.json").read_text())
+            restore_config.assert_called_once()
             self.assertTrue(summary["hil_flash_attempted"])
             self.assertTrue(summary["production_restored"])
             self.assertFalse(summary["configuration_preserved"])
+            self.assertTrue(summary["configuration_restored"])
             self.assertEqual(summary["configuration_check_failure_type"], "HilError")
             self.assertNotIn("configuration_sha", summary)
             self.assertNotIn("configuration_path", summary)
@@ -668,6 +826,40 @@ class HilRunnerTests(unittest.TestCase):
             self.assertFalse(summary["production_restored"])
             self.assertIsNone(summary["configuration_preserved"])
             self.assertEqual(summary["configuration_check_failure_type"], "HilError")
+            self.assertFalse((artifacts / "private" / "hil-flash-started").exists())
+
+    def test_full_run_durably_marks_flash_only_after_verified_backup(self):
+        events = []
+
+        def capture(*_args, **_kwargs):
+            events.append("backup")
+            return b"same"
+
+        def mark(path, image):
+            events.append("marker")
+            self.assertEqual(image, Path("/staged.bin"))
+            return path.parent / "hil-flash-started"
+
+        def flash(*_args, **kwargs):
+            events.append("production" if kwargs.get("release") else "hil")
+            if not kwargs.get("release"):
+                raise hil.HilError("upload failed")
+            return {"role": "dut"}
+
+        with tempfile.TemporaryDirectory() as directory:
+            artifacts = Path(directory) / "artifacts"
+            with (
+                mock.patch.object(
+                    hil, "stage_release_image", return_value=(Path("/staged.bin"), "e" * 64)
+                ),
+                mock.patch.object(hil, "capture_config_fingerprint", side_effect=capture),
+                mock.patch.object(hil, "write_flash_marker", side_effect=mark),
+                mock.patch.object(hil, "flash", side_effect=flash),
+            ):
+                with self.assertRaisesRegex(hil.HilError, "upload failed"):
+                    hil.full_run({"schema": 1}, artifacts, timeout=1, skip_build=True)
+
+        self.assertEqual(events[:4], ["backup", "marker", "hil", "production"])
 
     def test_external_release_image_requires_valid_esp_app(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -675,6 +867,394 @@ class HilRunnerTests(unittest.TestCase):
             bad.write_bytes(b"wrong")
             with self.assertRaisesRegex(hil.HilError, "invalid ESP magic"):
                 hil.validate_app_image(bad)
+
+    def test_restore_cli_uses_only_the_explicit_validated_release_image(self):
+        with tempfile.TemporaryDirectory() as directory:
+            image = Path(directory) / "release.bin"
+            image.write_bytes(b"\xe9" + b"\0" * (64 * 1024 - 1))
+            fixture = {"schema": 1}
+            with (
+                mock.patch.object(hil, "load_fixture", return_value=fixture),
+                mock.patch.object(hil, "flash") as flash,
+                mock.patch.object(
+                    hil.sys, "argv", ["hil.py", "restore", "--fixture", "fixture.json", "--image", str(image)]
+                ),
+            ):
+                self.assertEqual(hil.main(), 0)
+            flash.assert_called_once_with(fixture, True, image_override=image.resolve())
+
+    def test_restore_recovery_requires_backup_and_matching_durable_marker(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            image = root / "release.bin"
+            image.write_bytes(b"\xe9" + b"\0" * (64 * 1024 - 1))
+            backup = root / "config-before.yaml"
+            backup.write_bytes(
+                b"channel_url: secret\nconfig:\nmodule_config:\nowner: fixture\n"
+                b"  privateKey: 1234567890abcdef\n"
+            )
+            backup.chmod(0o600)
+            marker = root / "hil-flash-started"
+            marker.write_bytes(b"invalid\n")
+            marker.chmod(0o600)
+            fixture = {"schema": 1}
+            argv = [
+                "hil.py", "restore", "--fixture", "fixture.json", "--image", str(image),
+                "--config-backup", str(backup), "--flash-marker", str(marker),
+            ]
+            with (
+                mock.patch.object(hil, "load_fixture", return_value=fixture),
+                mock.patch.object(hil, "flash") as flash,
+                mock.patch.object(hil.sys, "argv", argv),
+            ):
+                self.assertEqual(hil.main(), 2)
+            flash.assert_not_called()
+
+    def test_flash_marker_is_owner_only_exclusive_and_bound_to_backup_and_image(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            backup = root / "config-before.yaml"
+            other_backup = root / "other.yaml"
+            image_a = root / "release-a.bin"
+            image_b = root / "release-b.bin"
+            payload = (
+                b"channel_url: secret\nconfig:\nmodule_config:\nowner: fixture\n"
+                b"  privateKey: 1234567890abcdef\n"
+            )
+            backup.write_bytes(payload)
+            backup.chmod(0o600)
+            other_backup.write_bytes(payload.replace(b"fixture", b"other"))
+            other_backup.chmod(0o600)
+            image_a.write_bytes(b"\xe9" + b"\0" * (64 * 1024 - 1))
+            image_b.write_bytes(b"\xe9" + b"\1" * (64 * 1024 - 1))
+            marker = hil.write_flash_marker(backup, image_a)
+            self.assertEqual(marker, (root / "hil-flash-started").resolve())
+            self.assertEqual(stat.S_IMODE(marker.stat().st_mode), 0o600)
+            marker_payload = json.loads(marker.read_text())
+            self.assertEqual(marker_payload["schema"], 2)
+            self.assertEqual(marker_payload["release_app_size"], image_a.stat().st_size)
+            self.assertEqual(
+                marker_payload["release_app_sha256"],
+                hashlib.sha256(image_a.read_bytes()).hexdigest(),
+            )
+            self.assertEqual(
+                hil.validate_flash_marker(marker, backup, image_a), marker.resolve()
+            )
+            with self.assertRaisesRegex(hil.HilError, "not exclusive"):
+                hil.write_flash_marker(backup, image_a)
+            with self.assertRaises(hil.HilError):
+                hil.validate_flash_marker(marker, other_backup, image_a)
+            with self.assertRaisesRegex(hil.HilError, "marker is invalid"):
+                hil.validate_flash_marker(marker, backup, image_b)
+            backup.write_bytes(payload.replace(b"fixture", b"changed"))
+            backup.chmod(0o600)
+            with self.assertRaises(hil.HilError):
+                hil.validate_flash_marker(marker, backup, image_a)
+
+    def test_flash_marker_accepts_canonical_equivalent_path_with_symlink_ancestor(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            real = root / "real"
+            vault = real / "vault"
+            vault.mkdir(parents=True, mode=0o700)
+            alias = root / "alias"
+            alias.symlink_to(real, target_is_directory=True)
+            backup = alias / "vault" / "config-before.yaml"
+            backup.write_bytes(
+                b"channel_url: secret\nconfig:\nmodule_config:\nowner: fixture\n"
+                b"  privateKey: 1234567890abcdef\n"
+            )
+            backup.chmod(0o600)
+            image = vault / "release.bin"
+            image.write_bytes(b"\xe9" + b"\0" * (64 * 1024 - 1))
+            marker = hil.write_flash_marker(backup, image)
+            lexical_marker = alias / "vault" / "hil-flash-started"
+            self.assertEqual(
+                hil.validate_flash_marker(lexical_marker, backup, image), marker.resolve()
+            )
+
+    def test_restore_recovery_rejects_valid_but_unbound_release_image_before_flash(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            backup = root / "config-before.yaml"
+            backup.write_bytes(
+                b"channel_url: secret\nconfig:\nmodule_config:\nowner: fixture\n"
+                b"  privateKey: 1234567890abcdef\n"
+            )
+            backup.chmod(0o600)
+            image_a = root / "release-a.bin"
+            image_b = root / "release-b.bin"
+            image_a.write_bytes(b"\xe9" + b"\0" * (64 * 1024 - 1))
+            image_b.write_bytes(b"\xe9" + b"\1" * (64 * 1024 - 1))
+            marker = hil.write_flash_marker(backup, image_a)
+            with (
+                mock.patch.object(hil, "load_fixture", return_value={"schema": 1}),
+                mock.patch.object(hil, "flash") as flash,
+                mock.patch.object(
+                    hil.sys,
+                    "argv",
+                    [
+                        "hil.py", "restore", "--fixture", "fixture.json",
+                        "--image", str(image_b), "--config-backup", str(backup),
+                        "--flash-marker", str(marker),
+                    ],
+                ),
+            ):
+                self.assertEqual(hil.main(), 2)
+                flash.assert_not_called()
+
+    def test_flash_marker_rejects_legacy_schema(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            backup = root / "config-before.yaml"
+            payload = (
+                b"channel_url: secret\nconfig:\nmodule_config:\nowner: fixture\n"
+                b"  privateKey: 1234567890abcdef\n"
+            )
+            backup.write_bytes(payload)
+            backup.chmod(0o600)
+            image = root / "release.bin"
+            image.write_bytes(b"\xe9" + b"\0" * (64 * 1024 - 1))
+            marker = root / "hil-flash-started"
+            marker.write_text(
+                json.dumps(
+                    {
+                        "schema": 1,
+                        "backup": backup.name,
+                        "sha256": hashlib.sha256(payload).hexdigest(),
+                    },
+                    sort_keys=True,
+                    separators=(",", ":"),
+                )
+                + "\n"
+            )
+            marker.chmod(0o600)
+            with self.assertRaisesRegex(hil.HilError, "marker is invalid"):
+                hil.validate_flash_marker(marker, backup, image)
+
+    def test_restore_recovery_rejects_one_sided_backup_marker_pair(self):
+        fixture = {"schema": 1}
+        cases = (
+            ["--config-backup", "/private/config-before.yaml"],
+            ["--flash-marker", "/private/hil-flash-started"],
+        )
+        for extra in cases:
+            with self.subTest(extra=extra):
+                with (
+                    mock.patch.object(hil, "load_fixture", return_value=fixture),
+                    mock.patch.object(
+                        hil, "validate_app_image", return_value=Path("/release.bin")
+                    ),
+                    mock.patch.object(hil, "flash") as flash,
+                    mock.patch.object(
+                        hil.sys,
+                        "argv",
+                        [
+                            "hil.py", "restore", "--fixture", "fixture.json",
+                            "--image", "/release.bin", *extra,
+                        ],
+                    ),
+                ):
+                    self.assertEqual(hil.main(), 2)
+                    flash.assert_not_called()
+
+    def test_paired_recovery_requires_exact_image_before_flash(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            backup = root / "config-before.yaml"
+            backup.write_bytes(
+                b"channel_url: secret\nconfig:\nmodule_config:\nowner: fixture\n"
+                b"  privateKey: 1234567890abcdef\n"
+            )
+            backup.chmod(0o600)
+            image = root / "release.bin"
+            image.write_bytes(b"\xe9" + b"\0" * (64 * 1024 - 1))
+            marker = hil.write_flash_marker(backup, image)
+            with (
+                mock.patch.object(hil, "load_fixture", return_value={"schema": 1}),
+                mock.patch.object(hil, "flash") as flash,
+                mock.patch.object(
+                    hil.sys,
+                    "argv",
+                    [
+                        "hil.py", "restore", "--fixture", "fixture.json",
+                        "--config-backup", str(backup), "--flash-marker", str(marker),
+                    ],
+                ),
+            ):
+                self.assertEqual(hil.main(), 2)
+                flash.assert_not_called()
+
+    def test_meshtastic_cli_is_pinned_to_active_interpreter_and_invalid_override_fails(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            python = root / "python"
+            python.touch()
+            cli = root / "meshtastic"
+            cli.write_text("#!/bin/sh\nexit 0\n")
+            cli.chmod(0o700)
+            with (
+                mock.patch.dict(hil.os.environ, {}, clear=True),
+                mock.patch.object(hil.sys, "executable", str(python)),
+                mock.patch.object(hil.shutil, "which") as which,
+            ):
+                self.assertEqual(hil.find_meshtastic_cli(), str(cli.resolve()))
+            which.assert_not_called()
+
+            with (
+                mock.patch.dict(
+                    hil.os.environ, {"MESHTASTIC_CLI": str(root / "missing")}, clear=True
+                ),
+                mock.patch.object(hil.shutil, "which") as which,
+            ):
+                with self.assertRaisesRegex(hil.HilError, "not an executable"):
+                    hil.find_meshtastic_cli()
+            which.assert_not_called()
+
+    def test_restore_config_uses_the_same_explicit_pinned_cli(self):
+        payload = (
+            b"channel_url: secret\nconfig:\nmodule_config:\nowner: fixture\n"
+            b"  privateKey: 1234567890abcdef\n"
+        )
+        device = {"port": "/dev/dut", "usb_serial": "AA:BB"}
+        with tempfile.TemporaryDirectory() as directory:
+            backup = Path(directory) / "config-before.yaml"
+            backup.write_bytes(payload)
+            backup.chmod(0o600)
+            with (
+                mock.patch.object(hil, "resolve_role", return_value=device),
+                mock.patch.object(hil, "wait_for_usb_serial", return_value=device),
+                mock.patch.object(
+                    hil, "find_meshtastic_cli", return_value="/venv/bin/meshtastic"
+                ),
+                mock.patch.object(hil.time, "sleep"),
+                mock.patch.object(
+                    hil.subprocess, "run", return_value=mock.Mock(returncode=0)
+                ) as run,
+            ):
+                hil.restore_config_backup({}, backup)
+
+        self.assertEqual(run.call_args.args[0][0], "/venv/bin/meshtastic")
+
+    def test_config_backup_is_owner_only_complete_and_restorable(self):
+        payload = b"""channel_url: https://example.invalid/#secret
+config:
+  lora:
+    region: US
+module_config:
+  mqtt:
+    enabled: false
+owner: fixture
+  privateKey: 1234567890abcdef
+"""
+        device = {"port": "/dev/dut", "usb_serial": "AA:BB"}
+
+        def export(command, **_kwargs):
+            destination = Path(command[command.index("--out") + 1])
+            destination.mkdir(parents=True)
+            source = destination / "config-fixture.yaml"
+            source.write_bytes(payload)
+            source.chmod(0o600)
+            return mock.Mock(returncode=0)
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            backup = root / "private" / "config-before.yaml"
+            backup.parent.mkdir(mode=0o700)
+            with (
+                mock.patch.object(hil, "resolve_role", return_value=device),
+                mock.patch.object(
+                    hil, "find_meshtastic_cli", return_value="/venv/bin/meshtastic"
+                ),
+                mock.patch.object(hil.subprocess, "run", side_effect=export),
+            ):
+                digest = hil.capture_config_fingerprint({}, root / "tmp", "before", preserve=backup)
+            self.assertEqual(digest, hashlib.sha256(payload).digest())
+            self.assertEqual(backup.read_bytes(), payload)
+            self.assertEqual(stat.S_IMODE(backup.stat().st_mode), 0o600)
+            self.assertEqual(hil.validate_config_backup(backup), backup.resolve())
+
+    def test_external_config_backup_destination_is_exclusive_and_outside_ci_ephemeral_roots(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            artifacts = root / "workspace" / "artifacts"
+            artifacts.mkdir(parents=True)
+            (artifacts / "private").mkdir(mode=0o700)
+            runner_temp = root / "runner-temp"
+            runner_temp.mkdir()
+            vault = root / "vault"
+            vault.mkdir(mode=0o700)
+            destination = vault / "config-before.yaml"
+            environment = {
+                "GITHUB_ACTIONS": "true",
+                "GITHUB_WORKSPACE": str(root / "workspace"),
+                "RUNNER_TEMP": str(runner_temp),
+            }
+            with mock.patch.dict(hil.os.environ, environment, clear=True):
+                self.assertEqual(
+                    hil.prepare_config_backup_destination(artifacts, destination), destination
+                )
+                with self.assertRaisesRegex(hil.HilError, "ephemeral job directory"):
+                    hil.prepare_config_backup_destination(
+                        artifacts, artifacts / "private" / "config-before.yaml"
+                    )
+                with self.assertRaisesRegex(hil.HilError, "requires an external"):
+                    hil.prepare_config_backup_destination(artifacts, None)
+
+            destination.write_text("stale")
+            with self.assertRaisesRegex(hil.HilError, "already exists"):
+                hil.prepare_config_backup_destination(artifacts, destination)
+
+    def test_external_config_backup_rejects_symlink_and_non_private_parent(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            artifacts = root / "artifacts"
+            target = root / "target"
+            target.mkdir(mode=0o700)
+            linked = root / "linked"
+            linked.symlink_to(target, target_is_directory=True)
+            with self.assertRaisesRegex(hil.HilError, "existing real directory"):
+                hil.prepare_config_backup_destination(
+                    artifacts, linked / "config-before.yaml"
+                )
+
+            target.chmod(0o755)
+            with self.assertRaisesRegex(hil.HilError, "not owner-only"):
+                hil.prepare_config_backup_destination(
+                    artifacts, target / "config-before.yaml"
+                )
+
+    def test_github_private_export_temp_directory_is_strictly_under_runner_temp(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            runner_temp = root / "runner-temp"
+            runner_temp.mkdir(mode=0o700)
+            environment = {
+                "GITHUB_ACTIONS": "true",
+                "RUNNER_TEMP": str(runner_temp),
+            }
+            with mock.patch.dict(hil.os.environ, environment, clear=True):
+                with hil.configuration_temporary_directory("private-export-") as created:
+                    created_path = Path(created)
+                    self.assertEqual(created_path.parent.resolve(), runner_temp.resolve())
+                    self.assertTrue(created_path.is_dir())
+                self.assertFalse(created_path.exists())
+
+            with mock.patch.dict(
+                hil.os.environ, {"GITHUB_ACTIONS": "true"}, clear=True
+            ):
+                with self.assertRaisesRegex(hil.HilError, "RUNNER_TEMP is required"):
+                    hil.configuration_temporary_directory("private-export-")
+
+            alias = root / "runner-temp-alias"
+            alias.symlink_to(runner_temp, target_is_directory=True)
+            with mock.patch.dict(
+                hil.os.environ,
+                {"GITHUB_ACTIONS": "true", "RUNNER_TEMP": str(alias)},
+                clear=True,
+            ):
+                with self.assertRaisesRegex(hil.HilError, "not a safe"):
+                    hil.configuration_temporary_directory("private-export-")
 
     def test_release_image_is_staged_outside_mutable_build_tree(self):
         with tempfile.TemporaryDirectory() as directory:

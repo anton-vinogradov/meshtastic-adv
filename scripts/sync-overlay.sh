@@ -124,6 +124,52 @@ if [ -f "$RI" ] && ! grep -q 'advui-inject-hil-rx-only' "$RI"; then
   echo "injected immutable HIL radio-TX guard into RadioLibInterface.cpp"
 fi
 
+# Router.cpp: RadioLibInterface is the final LoRa hop, but Router fans packets
+# out to MQTT and UDP before it calls the radio interface. HIL may boot with a
+# saved production broker/channel configuration, so guard every network fanout
+# at its source as well. Production builds compile the exact upstream path.
+ROUTER="$FW/src/mesh/Router.cpp"
+if [ -f "$ROUTER" ]; then
+  router_hil_guards=$(grep -c 'advui-inject-hil-network-silence' "$ROUTER" || true)
+  if [ "$router_hil_guards" -eq 0 ]; then
+    perl -0pi -e 's{#if !MESHTASTIC_EXCLUDE_MQTT\n(        // Only publish to MQTT if[^\n]*)}{#if !MESHTASTIC_EXCLUDE_MQTT \&\& !defined(ADVUI_HIL) // advui-inject-hil-network-silence\n$1}' "$ROUTER"
+    perl -0pi -e 's{#if HAS_UDP_MULTICAST\n(    if \(udpHandler \&\& config\.network\.enabled_protocols)}{#if HAS_UDP_MULTICAST \&\& !defined(ADVUI_HIL) // advui-inject-hil-network-silence\n$1}' "$ROUTER"
+    perl -0pi -e 's{#if !MESHTASTIC_EXCLUDE_MQTT\n(        if \(p_encrypted == nullptr\))}{#if !MESHTASTIC_EXCLUDE_MQTT \&\& !defined(ADVUI_HIL) // advui-inject-hil-network-silence\n$1}' "$ROUTER"
+    echo "injected immutable HIL MQTT/UDP guards into Router.cpp"
+  fi
+  test "$(grep -c 'advui-inject-hil-network-silence' "$ROUTER" || true)" -eq 3
+fi
+
+# Do not even construct autonomous MQTT or WiFi threads in HIL. This closes
+# map reports, proxy traffic and direct debug publication outside Router while
+# leaving the production build preprocessor path identical to upstream.
+if [ -f "$MC" ] && ! grep -q 'advui-inject-hil-no-mqtt-init' "$MC"; then
+  perl -0pi -e 's{#if !MESHTASTIC_EXCLUDE_MQTT\n(    mqttInit\(\);)}{#if !MESHTASTIC_EXCLUDE_MQTT \&\& !defined(ADVUI_HIL) // advui-inject-hil-no-mqtt-init\n$1}' "$MC"
+  echo "injected immutable HIL MQTT-init guard into main.cpp"
+fi
+test "$(grep -c 'advui-inject-hil-no-mqtt-init' "$MC" || true)" -eq 1
+if [ -f "$MC" ] && ! grep -q 'advui-inject-hil-no-wifi-init' "$MC"; then
+  perl -0pi -e 's{#if HAS_WIFI\n(    initWifi\(\);)}{#if HAS_WIFI \&\& !defined(ADVUI_HIL) // advui-inject-hil-no-wifi-init\n$1}' "$MC"
+  echo "injected immutable HIL WiFi-init guard into main.cpp"
+fi
+test "$(grep -c 'advui-inject-hil-no-wifi-init' "$MC" || true)" -eq 1
+
+# The stock Meshtastic PhoneAPI is a BLE peripheral independent of ADV's
+# companion-central transport. A bonded phone could otherwise connect during
+# HIL, read live config/NodeDB and send persistent admin writes. Keep the whole
+# stock BLE enable path inert in HIL before NimBLE is constructed or advertises;
+# production builds compile the upstream body unchanged.
+ESP32_MAIN="$FW/src/platform/esp32/main-esp32.cpp"
+if [ -f "$ESP32_MAIN" ] && ! grep -q 'advui-inject-hil-no-stock-ble' "$ESP32_MAIN"; then
+  perl -0pi -e 's{(void setBluetoothEnable\(bool enable\)\n\{\n)}{$1#ifdef ADVUI_HIL
+    (void)enable;
+    return; // advui-inject-hil-no-stock-ble: no BLE advertising or PhoneAPI in release HIL
+#endif
+}' "$ESP32_MAIN"
+  echo "injected immutable HIL stock-BLE guard into main-esp32.cpp"
+fi
+test "$(grep -c 'advui-inject-hil-no-stock-ble' "$ESP32_MAIN" || true)" -eq 1
+
 # WebServer.cpp + ContentHandler.cpp: drop the HTTPS/TLS server, keep HTTP:80.
 # The self-signed RSA-2048 cert plus mbedTLS session state costs tens of KB of
 # heap on this no-PSRAM board — the stock code already logs "skipping HTTPS

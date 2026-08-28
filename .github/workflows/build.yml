@@ -9,7 +9,8 @@ on:
 # Cancel superseded runs on the same ref.
 concurrency:
   group: build-${{ github.ref }}
-  cancel-in-progress: true
+  # Never interrupt a tag while the identity-bound lab may contain the HIL app.
+  cancel-in-progress: ${{ !startsWith(github.ref, 'refs/tags/v') }}
 
 permissions:
   contents: read
@@ -23,7 +24,9 @@ jobs:
       - name: Validate workflow definitions
         uses: docker://rhysd/actionlint@sha256:b1934ee5f1c509618f2508e6eb47ee0d3520686341fec936f3b79331f9315667 # 1.7.12
         with:
-          args: -color
+          # GitHub added concurrency.queue after actionlint 1.7.12. Keep the
+          # suppression exact so every other workflow/schema error still fails.
+          args: -color -ignore 'unexpected key "queue" for "concurrency" section'
       - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
         with:
           python-version: '3.11'
@@ -45,7 +48,7 @@ jobs:
 
   firmware:
     runs-on: ubuntu-latest
-    timeout-minutes: 45
+    timeout-minutes: 90
     steps:
       - name: Checkout (with the pinned upstream firmware submodule)
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -72,6 +75,9 @@ jobs:
           # `pio run` does not use PlatformIO Home. Install the hash-pinned CLI
           # without its vulnerable, incompatible web-server dependency ceiling.
           python -m pip install --require-hashes --no-deps -r requirements/platformio.txt
+
+      - name: Exercise the real GIF/PNG encoder with synthetic frames
+        run: python -m unittest discover -s tests/python -p test_demo_media.py -v
 
       - name: Firmware verification
         run: python scripts/verify.py --firmware-only --artifacts hil-artifacts/ci-firmware
@@ -105,16 +111,29 @@ jobs:
     if: startsWith(github.ref, 'refs/tags/v')
     needs: [host-tests, firmware]
     runs-on: [self-hosted, macOS, meshtastic-adv-hil]
-    timeout-minutes: 45
+    # Keep enough room for stable config exports plus the always-run exact-image
+    # recovery path. GitHub's hard job timeout would otherwise kill recovery too.
+    timeout-minutes: 150
     environment: release-hil
     concurrency:
       group: meshtastic-adv-physical-hil
+      queue: max
       cancel-in-progress: false
+    env:
+      HIL_RECOVERY_ROOT: ${{ vars.HIL_RECOVERY_ROOT }}
+      HIL_CONFIG_BACKUP: ${{ vars.HIL_RECOVERY_ROOT }}/run-${{ github.run_id }}-attempt-${{ github.run_attempt }}/config-before.yaml
+      HIL_FLASH_MARKER: ${{ vars.HIL_RECOVERY_ROOT }}/run-${{ github.run_id }}-attempt-${{ github.run_attempt }}/hil-flash-started
     steps:
       - name: Checkout release source and pinned firmware
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
+          fetch-depth: 0
           submodules: recursive
+
+      - name: Require the release tag to come from main
+        run: |
+          git fetch --no-tags origin main:refs/remotes/origin/main
+          git merge-base --is-ancestor HEAD origin/main
 
       # setup-python's downloaded macOS builds are intentionally non-relocatable
       # and require a writable /Users/runner/hostedtoolcache.  The trusted lab
@@ -132,6 +151,18 @@ jobs:
           python -m pip install --require-hashes -r hil/requirements.txt
           python -m pip install --require-hashes --no-deps -r requirements/platformio.txt
 
+      - name: Prepare persistent configuration recovery vault
+        run: |
+          umask 077
+          test -n "$HIL_RECOVERY_ROOT"
+          case "$HIL_RECOVERY_ROOT" in /*) ;; *) echo "HIL_RECOVERY_ROOT must be absolute"; exit 1 ;; esac
+          case "$HIL_RECOVERY_ROOT" in */) echo "HIL_RECOVERY_ROOT must not end in slash"; exit 1 ;; esac
+          test -d "$HIL_RECOVERY_ROOT" && test ! -L "$HIL_RECOVERY_ROOT"
+          python -c 'import os,pathlib,stat,sys; root=pathlib.Path(os.environ["HIL_RECOVERY_ROOT"]).resolve(strict=True); workspace=pathlib.Path(os.environ["GITHUB_WORKSPACE"]).resolve(); temporary=pathlib.Path(os.environ["RUNNER_TEMP"]).resolve(); mode=stat.S_IMODE(root.stat().st_mode); bad=root.stat().st_uid != os.getuid() or bool(mode & 0o077) or root == workspace or workspace in root.parents or root == temporary or temporary in root.parents; sys.exit("recovery vault must be owner-only and outside checkout/temp") if bad else None'
+          recovery_dir=$(dirname "$HIL_CONFIG_BACKUP")
+          test ! -e "$recovery_dir" && test ! -L "$recovery_dir"
+          mkdir -m 700 -- "$recovery_dir"
+
       - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
           name: firmware-factory
@@ -147,35 +178,91 @@ jobs:
           echo "path=$app" >> "$GITHUB_OUTPUT"
 
       - name: Materialize the identity-bound lab fixture
+        id: fixture
         env:
-          HIL_FIXTURE: ${{ runner.temp }}/meshtastic-adv-fixture-${{ github.run_id }}.json
+          HIL_FIXTURE: ${{ runner.temp }}/meshtastic-adv-fixture-${{ github.run_id }}-attempt-${{ github.run_attempt }}.json
           HIL_FIXTURE_JSON: ${{ secrets.HIL_FIXTURE_JSON }}
         run: |
           umask 077
           test -n "$HIL_FIXTURE_JSON"
-          python -c 'import os,pathlib; p=pathlib.Path(os.environ["HIL_FIXTURE"]); p.write_text(os.environ["HIL_FIXTURE_JSON"]); p.chmod(0o600)'
+          python -c 'import os,pathlib; p=pathlib.Path(os.environ["HIL_FIXTURE"]); flags=os.O_WRONLY|os.O_CREAT|os.O_EXCL|getattr(os,"O_NOFOLLOW",0); fd=os.open(p,flags,0o600); f=os.fdopen(fd,"wb"); f.write(os.environ["HIL_FIXTURE_JSON"].encode()); f.flush(); os.fsync(f.fileno()); f.close()'
 
       - name: Release behavioral HIL
+        id: hil
         env:
-          HIL_FIXTURE: ${{ runner.temp }}/meshtastic-adv-fixture-${{ github.run_id }}.json
+          HIL_FIXTURE: ${{ runner.temp }}/meshtastic-adv-fixture-${{ github.run_id }}-attempt-${{ github.run_attempt }}.json
         run: |
           python scripts/verify.py \
             --usb \
             --release-image "${{ steps.release_app.outputs.path }}" \
+            --config-backup "$HIL_CONFIG_BACKUP" \
             --fixture "$HIL_FIXTURE" \
             --artifacts hil-artifacts/release-hil
 
-      - name: Upload behavioral HIL evidence
+      # Python's finally restores during ordinary failures. This separate,
+      # identity-bound exact-image pass also runs after a cancelled/interrupted
+      # test step when Actions still has control of the persistent runner.
+      - name: Recover production firmware after HIL interruption
+        id: recovery
+        if: always() && steps.hil.outcome != 'success' && steps.release_app.outcome == 'success' && steps.fixture.outcome == 'success'
+        env:
+          HIL_FIXTURE: ${{ runner.temp }}/meshtastic-adv-fixture-${{ github.run_id }}-attempt-${{ github.run_attempt }}.json
+        run: |
+          python scripts/hil.py restore \
+            --fixture "$HIL_FIXTURE" \
+            --image "${{ steps.release_app.outputs.path }}" \
+            --config-backup "$HIL_CONFIG_BACKUP" \
+            --flash-marker "$HIL_FLASH_MARKER"
+
+      - name: Build deterministic release-demo media
+        run: |
+          python scripts/demo_media.py build \
+            --story docs/img/demo-story.json \
+            --frames hil-artifacts/release-hil/usb/visual/frames \
+            --mockup docs/img/mockup.json \
+            --output hil-artifacts/release-hil/marketing-media
+
+      # Raw framebuffers and screenshots remain private runner diagnostics.  The
+      # public artifact contains redacted text evidence, hashes and the
+      # generator-verified marketing media only.  On a failed HIL run there may
+      # be no complete media set, but the available failure reports are still
+      # sanitized and uploaded for diagnosis.
+      - name: Stage privacy-safe public HIL evidence
+        if: always()
+        env:
+          HIL_FIXTURE: ${{ runner.temp }}/meshtastic-adv-fixture-${{ github.run_id }}-attempt-${{ github.run_attempt }}.json
+        run: |
+          media_args=()
+          if [ -d hil-artifacts/release-hil/marketing-media ]; then
+            media_args=(--media hil-artifacts/release-hil/marketing-media)
+          fi
+          python scripts/demo_media.py stage-evidence \
+            --source hil-artifacts/release-hil \
+            --fixture "$HIL_FIXTURE" \
+            --output hil-artifacts/release-hil-public \
+            "${media_args[@]}"
+
+      - name: Upload privacy-safe behavioral HIL evidence
         if: always()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: release-hil-evidence
-          path: hil-artifacts/release-hil
+          path: hil-artifacts/release-hil-public
+
+      - name: Remove private configuration backup after verified recovery
+        if: always() && (steps.hil.outcome == 'success' || steps.recovery.outcome == 'success')
+        run: |
+          expected="$HIL_RECOVERY_ROOT/run-${GITHUB_RUN_ID}-attempt-${GITHUB_RUN_ATTEMPT}/config-before.yaml"
+          marker="$HIL_RECOVERY_ROOT/run-${GITHUB_RUN_ID}-attempt-${GITHUB_RUN_ATTEMPT}/hil-flash-started"
+          test "$HIL_CONFIG_BACKUP" = "$expected"
+          test "$HIL_FLASH_MARKER" = "$marker"
+          rm -f -- "$HIL_CONFIG_BACKUP" "$HIL_FLASH_MARKER"
+          rmdir -- "$(dirname "$HIL_CONFIG_BACKUP")"
 
       - name: Remove the identity-bound temporary fixture
         if: always()
         env:
-          HIL_FIXTURE: ${{ runner.temp }}/meshtastic-adv-fixture-${{ github.run_id }}.json
+          HIL_FIXTURE: ${{ runner.temp }}/meshtastic-adv-fixture-${{ github.run_id }}-attempt-${{ github.run_attempt }}.json
         run: |
           case "$HIL_FIXTURE" in "$RUNNER_TEMP"/meshtastic-adv-fixture-*.json) ;; *) exit 2 ;; esac
           rm -f -- "$HIL_FIXTURE"
@@ -185,15 +272,17 @@ jobs:
     if: startsWith(github.ref, 'refs/tags/v')
     needs: [host-tests, firmware, release-hil]
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    timeout-minutes: 90
     concurrency:
       group: meshtastic-adv-release-publish
+      queue: max
       cancel-in-progress: false
     permissions:
       contents: write
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
+          fetch-depth: 0
           submodules: recursive
 
       - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
@@ -204,6 +293,12 @@ jobs:
         with:
           name: firmware-factory
           path: release-input
+
+      - name: Download exact-tag privacy-safe HIL media
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: release-hil-evidence
+          path: release-hil-public
 
       - name: Stage exact tagged release inputs
         id: tagged
@@ -217,97 +312,111 @@ jobs:
           cp scripts/mkm5burner.sh /tmp/mkm5burner.sh
           cp scripts/m5burner_publish.py /tmp/m5burner_publish.py
           cp scripts/verify_web_publish.py /tmp/verify_web_publish.py
+          cp scripts/verify_release_ref.py /tmp/verify_release_ref.py
+          cp scripts/verify_github_release.py /tmp/verify_github_release.py
+          cp scripts/site_release_mode.py /tmp/site_release_mode.py
+          cp scripts/update_social_image.py /tmp/update_social_image.py
+          cp scripts/demo_media.py /tmp/demo_media.py
+          cp scripts/mkcover.py /tmp/mkcover.py
+          cp docs/img/demo-story.json /tmp/demo-story.json
+          cp docs/img/mockup.json /tmp/mockup.json
+          cp docs/img/device.png /tmp/device.png
+          cp docs/m5burner-card.txt /tmp/m5burner-card.txt
           cp requirements/release.txt /tmp/release-requirements.txt
           # Stable notes are rendered before checking out main, so a concurrent
           # docs commit cannot change what the exact tag says was released.
           python scripts/release_notes.py "$GITHUB_REF_NAME" --output /tmp/release-notes.md
           engine=$(python -c 'import configparser; c=configparser.ConfigParser(); c.read("firmware/version.properties"); v=c["VERSION"]; print("{}.{}.{}".format(v["major"], v["minor"], v["build"]))')
           echo "engine=$engine" >> "$GITHUB_OUTPUT"
+          tag_commit=$(git rev-parse 'HEAD^{commit}')
+          test "$tag_commit" = "$GITHUB_SHA"
+          echo "tag_commit=$tag_commit" >> "$GITHUB_OUTPUT"
+
+      - name: Verify exact-tag HIL media before main checkout
+        run: |
+          python /tmp/demo_media.py verify \
+            --story /tmp/demo-story.json \
+            --mockup /tmp/mockup.json \
+            --photo /tmp/device.png \
+            --media release-hil-public/media
 
       - name: Install hash-locked release tooling
         run: |
           python -m pip install --require-hashes --no-deps -r requirements/pip.txt
           python -m pip install --require-hashes -r /tmp/release-requirements.txt
 
-      - name: Refresh the installer image on main
-        if: steps.tagged.outputs.prerelease == 'false'
+      - name: Build exact release assets
         run: |
-          ver="${{ steps.tagged.outputs.version }}"
-          engine="${{ steps.tagged.outputs.engine }}"
-          git config user.name  "github-actions[bot]"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git fetch origin main
-          git checkout -B main origin/main
-          cp /tmp/fw.bin docs/firmware.factory.bin
-          cp /tmp/unifont.bin docs/unifont.bin
-          tmp=$(mktemp)
-          jq --arg v "$ver (advui · engine $engine)" '.version=$v' docs/manifest.json > "$tmp" && mv "$tmp" docs/manifest.json
-          # Archive this version for the installer's version picker. Images must be
-          # same-origin (GitHub Releases lack CORS), so they live under docs/; only
-          # the 6 newest stay archived — older ones remain on the Releases page.
-          mkdir -p "docs/versions/${GITHUB_REF_NAME}"
-          cp /tmp/fw.bin "docs/versions/${GITHUB_REF_NAME}/firmware.factory.bin"
-          # the font part resolves relative to the manifest: point the archived
-          # copy back at the single site-root unifont.bin (2 MB, not per-version)
-          jq '.builds[0].parts |= map(if .path == "unifont.bin" then .path = "../../unifont.bin" else . end)' \
-            docs/manifest.json > "docs/versions/${GITHUB_REF_NAME}/manifest.json"
-          # Prune only direct, validated SemVer directories. Passing repository
-          # names through `xargs rm -rf` could reinterpret a crafted name as an
-          # option or a parent path before the post-build validator ever ran.
-          python /tmp/check-installer.py --prune docs
-          git add docs/firmware.factory.bin docs/unifont.bin docs/manifest.json docs/versions
-          if git diff --cached --quiet; then
-            echo "installer already contains ${GITHUB_REF_NAME}"
-          else
-            git commit -m "ci: web installer image for ${GITHUB_REF_NAME} [skip ci]"
-            git push origin HEAD:main
-          fi
-
-      - name: Verify public web installer
-        if: steps.tagged.outputs.prerelease == 'false'
-        run: |
-          python /tmp/verify_web_publish.py \
-            --base-url https://anton-vinogradov.github.io/meshtastic-adv/ \
-            --version "${{ steps.tagged.outputs.version }} (advui · engine ${{ steps.tagged.outputs.engine }})" \
-            --firmware /tmp/fw.bin \
-            --font /tmp/unifont.bin
-
-      - name: Create the GitHub release
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          release_flags=(--verify-tag)
-          notes_flags=(--generate-notes)
-          if [ -f /tmp/release-notes.md ]; then
-            notes_flags=(--notes-file /tmp/release-notes.md)
-          fi
-          if [ "${{ steps.tagged.outputs.prerelease }}" = true ]; then
-            release_flags+=(--prerelease --latest=false)
-          else
-            release_flags+=(--latest)
-          fi
           cp /tmp/fw.bin "meshtastic-adv-${GITHUB_REF_NAME}.factory.bin"
+          cp release-hil-public/media/hero.gif meshtastic-adv-hero.gif
+          cp release-hil-public/media/demo.gif meshtastic-adv-demo.gif
+          python /tmp/mkcover.py \
+            --source release-hil-public/media/demo.gif \
+            --output /tmp/m5burner-cover.png
           # One-file merged image (firmware + partition table + Unicode font) for
-          # M5Burner and the Launcher catalog, which greps releases for a stable
-          # asset name; flash it at 0x0.
+          # M5Burner and the Launcher catalog; flash it at 0x0.
           MESHTASTIC_FACTORY=/tmp/fw.bin \
             MESHTASTIC_FONT=/tmp/unifont.bin \
             MESHTASTIC_MERGED_OUT="$GITHUB_WORKSPACE/meshtastic-adv-cardputer-adv-merged.bin" \
             MESHTASTIC_REPO_ROOT="$GITHUB_WORKSPACE" \
             bash /tmp/mkm5burner.sh "${{ steps.tagged.outputs.version }}"
-          if gh release view "${GITHUB_REF_NAME}" >/dev/null 2>&1; then
-            gh release upload "${GITHUB_REF_NAME}" "meshtastic-adv-${GITHUB_REF_NAME}.factory.bin" /tmp/unifont.bin meshtastic-adv-cardputer-adv-merged.bin --clobber
-            if [ -f /tmp/release-notes.md ]; then
-              # A safe rerun must repair stale notes as well as stale assets.
-              gh release edit "${GITHUB_REF_NAME}" --notes-file /tmp/release-notes.md
+
+      # Assets are prepared in a non-public draft. The release becomes visible
+      # only after M5Burner and the public web installer pass their postconditions.
+      - name: Prepare or repair the draft GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          python /tmp/verify_release_ref.py \
+            --tag "$GITHUB_REF_NAME" --commit "${{ steps.tagged.outputs.tag_commit }}"
+          notes_flags=(--generate-notes)
+          if [ -f /tmp/release-notes.md ]; then
+            notes_flags=(--notes-file /tmp/release-notes.md)
+          fi
+          release_flags=(--verify-tag --draft --latest=false)
+          if [ "${{ steps.tagged.outputs.prerelease }}" = true ]; then
+            release_flags+=(--prerelease)
+          fi
+          if gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1; then
+            existing_draft=$(gh release view "$GITHUB_REF_NAME" --json isDraft --jq .isDraft)
+            if [ "$existing_draft" = true ]; then
+              gh release upload "$GITHUB_REF_NAME" \
+                "meshtastic-adv-${GITHUB_REF_NAME}.factory.bin" /tmp/unifont.bin \
+                meshtastic-adv-cardputer-adv-merged.bin \
+                meshtastic-adv-hero.gif meshtastic-adv-demo.gif --clobber
+              if [ -f /tmp/release-notes.md ]; then
+                gh release edit "$GITHUB_REF_NAME" --notes-file /tmp/release-notes.md
+              fi
+            else
+              echo "release is already public; refusing to mutate its assets or notes"
             fi
           else
-            gh release create "${GITHUB_REF_NAME}" \
+            gh release create "$GITHUB_REF_NAME" \
               --title "Meshtastic ADV ${GITHUB_REF_NAME}" \
-              "${notes_flags[@]}" \
-              "${release_flags[@]}" \
-              "meshtastic-adv-${GITHUB_REF_NAME}.factory.bin" /tmp/unifont.bin meshtastic-adv-cardputer-adv-merged.bin
+              "${notes_flags[@]}" "${release_flags[@]}" \
+              "meshtastic-adv-${GITHUB_REF_NAME}.factory.bin" /tmp/unifont.bin \
+              meshtastic-adv-cardputer-adv-merged.bin \
+              meshtastic-adv-hero.gif meshtastic-adv-demo.gif
           fi
+
+      - name: Verify exact draft assets before distribution
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          notes_args=()
+          if [ -f /tmp/release-notes.md ]; then
+            notes_args=(--notes /tmp/release-notes.md)
+          fi
+          python /tmp/verify_github_release.py \
+            --tag "$GITHUB_REF_NAME" --state either \
+            --title "Meshtastic ADV $GITHUB_REF_NAME" \
+            --prerelease "${{ steps.tagged.outputs.prerelease }}" \
+            "${notes_args[@]}" \
+            --asset "meshtastic-adv-${GITHUB_REF_NAME}.factory.bin=meshtastic-adv-${GITHUB_REF_NAME}.factory.bin" \
+            --asset "unifont.bin=/tmp/unifont.bin" \
+            --asset "meshtastic-adv-cardputer-adv-merged.bin=meshtastic-adv-cardputer-adv-merged.bin" \
+            --asset "meshtastic-adv-hero.gif=meshtastic-adv-hero.gif" \
+            --asset "meshtastic-adv-demo.gif=meshtastic-adv-demo.gif"
 
       - name: Publish to M5Burner
         # Pushes the merged image as a new version of our M5Burner entry — the
@@ -318,11 +427,211 @@ jobs:
           M5B_EMAIL: ${{ secrets.M5BURNER_EMAIL }}
           M5B_PWD: ${{ secrets.M5BURNER_PASSWORD }}
         run: |
+          python /tmp/verify_release_ref.py \
+            --tag "$GITHUB_REF_NAME" --commit "${{ steps.tagged.outputs.tag_commit }}"
+          git fetch --no-tags origin main:refs/remotes/origin/main
+          git merge-base --is-ancestor \
+            "${{ steps.tagged.outputs.tag_commit }}" refs/remotes/origin/main || {
+              echo "release tag is no longer reachable from current main"
+              exit 1
+            }
           if [ -z "$M5B_EMAIL" ] || [ -z "$M5B_PWD" ]; then
             echo "M5Burner secrets not set"
             exit 1
           fi
           python /tmp/m5burner_publish.py \
-            --email "$M5B_EMAIL" --password "$M5B_PWD" \
             --version "${{ steps.tagged.outputs.version }}" \
-            --bin meshtastic-adv-cardputer-adv-merged.bin
+            --bin meshtastic-adv-cardputer-adv-merged.bin \
+            --cover /tmp/m5burner-cover.png \
+            --listing /tmp/m5burner-card.txt
+
+      - name: Refresh or verify the installer image on main
+        id: site
+        if: steps.tagged.outputs.prerelease == 'false'
+        run: |
+          python /tmp/verify_release_ref.py \
+            --tag "$GITHUB_REF_NAME" --commit "${{ steps.tagged.outputs.tag_commit }}"
+          ver="${{ steps.tagged.outputs.version }}"
+          engine="${{ steps.tagged.outputs.engine }}"
+          git config user.name  "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git fetch --no-tags origin main:refs/remotes/origin/main
+          git merge-base --is-ancestor \
+            "${{ steps.tagged.outputs.tag_commit }}" refs/remotes/origin/main || {
+              echo "release tag is no longer reachable from current main"
+              exit 1
+            }
+          git checkout -B main origin/main
+          site_mode=$(python /tmp/site_release_mode.py \
+            --manifest docs/manifest.json --archives docs/versions --version "$ver" \
+            --retention-limit 6)
+          latest_stable_tag=$(python /tmp/site_release_mode.py \
+            --manifest docs/manifest.json --archives docs/versions --version "$ver" \
+            --retention-limit 6 --output latest-tag)
+          echo "site_mode=$site_mode" >> "$GITHUB_OUTPUT"
+          echo "latest_stable_tag=$latest_stable_tag" >> "$GITHUB_OUTPUT"
+          if [ "$site_mode" = historical ]; then
+            archive="docs/versions/${GITHUB_REF_NAME}"
+            test -f "$archive/manifest.json"
+            test -f "$archive/firmware.factory.bin"
+            cmp /tmp/fw.bin "$archive/firmware.factory.bin"
+            archived_font="$archive/unifont.bin"
+            if [ ! -f "$archived_font" ]; then
+              archived_font=docs/unifont.bin
+            fi
+            cmp /tmp/unifont.bin "$archived_font"
+            test "$(jq -r .version "$archive/manifest.json")" = "$ver (advui · engine $engine)"
+            cp "$archive/manifest.json" /tmp/site-manifest.json
+            python /tmp/check-installer.py docs
+            echo "historical installer archive verified without touching the newer root site"
+          elif [ "$site_mode" = retired ]; then
+            python /tmp/check-installer.py docs
+            cp docs/manifest.json /tmp/site-manifest.json
+            cp docs/index.html /tmp/site-index.html
+            echo "retired installer archive is outside the retained Pages window; current root verified without mutation"
+          else
+            cp /tmp/fw.bin docs/firmware.factory.bin
+            cp /tmp/unifont.bin docs/unifont.bin
+            cp release-hil-public/media/hero.gif docs/img/hero.gif
+            cp release-hil-public/media/demo.gif docs/img/demo.gif
+            cp release-hil-public/media/hero.png docs/img/hero.png
+            cp release-hil-public/media/manifest.json docs/img/demo-manifest.json
+            cp /tmp/m5burner-cover.png docs/img/m5burner-cover.png
+            python /tmp/update_social_image.py \
+              --html docs/index.html \
+              --image docs/img/hero.png \
+              --url https://anton-vinogradov.github.io/meshtastic-adv/img/hero.png
+            cp docs/index.html /tmp/site-index.html
+            tmp=$(mktemp)
+            jq --arg v "$ver (advui · engine $engine)" '.version=$v' docs/manifest.json > "$tmp" && mv "$tmp" docs/manifest.json
+            mkdir -p "docs/versions/${GITHUB_REF_NAME}"
+            cp /tmp/fw.bin "docs/versions/${GITHUB_REF_NAME}/firmware.factory.bin"
+            cp /tmp/unifont.bin "docs/versions/${GITHUB_REF_NAME}/unifont.bin"
+            cp docs/manifest.json "docs/versions/${GITHUB_REF_NAME}/manifest.json"
+            cp docs/manifest.json /tmp/site-manifest.json
+            python /tmp/check-installer.py --prune docs
+            git add docs/firmware.factory.bin docs/unifont.bin docs/manifest.json docs/index.html docs/versions \
+              docs/img/hero.gif docs/img/demo.gif docs/img/hero.png docs/img/m5burner-cover.png
+            git add docs/img/demo-manifest.json
+            if git diff --cached --quiet; then
+              echo "installer already contains ${GITHUB_REF_NAME}"
+            else
+              git commit -m "ci: web installer image for ${GITHUB_REF_NAME} [skip ci]"
+              git push origin HEAD:main
+            fi
+          fi
+
+      - name: Verify public web installer and media
+        if: steps.tagged.outputs.prerelease == 'false'
+        run: |
+          archive_args=()
+          version="${{ steps.tagged.outputs.version }} (advui · engine ${{ steps.tagged.outputs.engine }})"
+          firmware=/tmp/fw.bin
+          font=/tmp/unifont.bin
+          hero=release-hil-public/media/hero.gif
+          demo=release-hil-public/media/demo.gif
+          poster=release-hil-public/media/hero.png
+          demo_manifest=release-hil-public/media/manifest.json
+          cover=/tmp/m5burner-cover.png
+          if [ "${{ steps.site.outputs.site_mode }}" = historical ]; then
+            archive_args=(--archive-tag "$GITHUB_REF_NAME")
+          elif [ "${{ steps.site.outputs.site_mode }}" = retired ]; then
+            archive_args=(--index /tmp/site-index.html)
+            version=$(jq -r .version /tmp/site-manifest.json)
+            firmware=docs/firmware.factory.bin
+            font=docs/unifont.bin
+            hero=docs/img/hero.gif
+            demo=docs/img/demo.gif
+            poster=docs/img/hero.png
+            demo_manifest=docs/img/demo-manifest.json
+            cover=docs/img/m5burner-cover.png
+          else
+            archive_args=(--index /tmp/site-index.html)
+          fi
+          python /tmp/verify_web_publish.py \
+            --base-url https://anton-vinogradov.github.io/meshtastic-adv/ \
+            --version "$version" \
+            --manifest /tmp/site-manifest.json \
+            --firmware "$firmware" \
+            --font "$font" \
+            "${archive_args[@]}" \
+            --hero "$hero" \
+            --demo "$demo" \
+            --poster "$poster" \
+            --demo-manifest "$demo_manifest" \
+            --cover "$cover"
+
+      - name: Publish the GitHub release after every distribution gate
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          python /tmp/verify_release_ref.py \
+            --tag "$GITHUB_REF_NAME" --commit "${{ steps.tagged.outputs.tag_commit }}"
+          git fetch --no-tags origin main:refs/remotes/origin/main
+          git merge-base --is-ancestor \
+            "${{ steps.tagged.outputs.tag_commit }}" refs/remotes/origin/main || {
+              echo "release tag is no longer reachable from current main"
+              exit 1
+            }
+          notes_args=()
+          if [ -f /tmp/release-notes.md ]; then
+            notes_args=(--notes /tmp/release-notes.md)
+          fi
+          python /tmp/verify_github_release.py \
+            --tag "$GITHUB_REF_NAME" --state either \
+            --title "Meshtastic ADV $GITHUB_REF_NAME" \
+            --prerelease "${{ steps.tagged.outputs.prerelease }}" \
+            "${notes_args[@]}" \
+            --asset "meshtastic-adv-${GITHUB_REF_NAME}.factory.bin=meshtastic-adv-${GITHUB_REF_NAME}.factory.bin" \
+            --asset "unifont.bin=/tmp/unifont.bin" \
+            --asset "meshtastic-adv-cardputer-adv-merged.bin=meshtastic-adv-cardputer-adv-merged.bin" \
+            --asset "meshtastic-adv-hero.gif=meshtastic-adv-hero.gif" \
+            --asset "meshtastic-adv-demo.gif=meshtastic-adv-demo.gif"
+          canonical_latest=""
+          if [ "${{ steps.tagged.outputs.prerelease }}" = false ]; then
+            canonical_latest="${{ steps.site.outputs.latest_stable_tag }}"
+            test -n "$canonical_latest"
+            if [ "$GITHUB_REF_NAME" != "$canonical_latest" ]; then
+              # A historical rerun must not become public while the newer
+              # canonical release is still a draft or prerelease.
+              canonical_state=$(gh release view "$canonical_latest" --json isDraft,isPrerelease)
+              test "$(jq -r .isDraft <<<"$canonical_state")" = false
+              test "$(jq -r .isPrerelease <<<"$canonical_state")" = false
+            fi
+          fi
+          state=$(gh release view "$GITHUB_REF_NAME" --json isDraft,isPrerelease)
+          test "$(jq -r .isPrerelease <<<"$state")" = "${{ steps.tagged.outputs.prerelease }}"
+          if [ "$(jq -r .isDraft <<<"$state")" = true ]; then
+            if [ "${{ steps.tagged.outputs.prerelease }}" = true ]; then
+              gh release edit "$GITHUB_REF_NAME" --draft=false --prerelease --latest=false
+            else
+              # Latest is repaired only after the now-public release and all of
+              # its exact assets have been verified below.
+              gh release edit "$GITHUB_REF_NAME" --draft=false --latest=false
+            fi
+          else
+            echo "release already public; all distribution gates repaired and verified"
+          fi
+          python /tmp/verify_github_release.py \
+            --tag "$GITHUB_REF_NAME" --state public \
+            --title "Meshtastic ADV $GITHUB_REF_NAME" \
+            --prerelease "${{ steps.tagged.outputs.prerelease }}" \
+            "${notes_args[@]}" \
+            --asset "meshtastic-adv-${GITHUB_REF_NAME}.factory.bin=meshtastic-adv-${GITHUB_REF_NAME}.factory.bin" \
+            --asset "unifont.bin=/tmp/unifont.bin" \
+            --asset "meshtastic-adv-cardputer-adv-merged.bin=meshtastic-adv-cardputer-adv-merged.bin" \
+            --asset "meshtastic-adv-hero.gif=meshtastic-adv-hero.gif" \
+            --asset "meshtastic-adv-demo.gif=meshtastic-adv-demo.gif"
+          if [ "${{ steps.tagged.outputs.prerelease }}" = false ]; then
+            test -n "$canonical_latest"
+            # Re-establish the same postcondition immediately before changing
+            # the repository-wide latest marker.
+            canonical_state=$(gh release view "$canonical_latest" --json isDraft,isPrerelease)
+            test "$(jq -r .isDraft <<<"$canonical_state")" = false
+            test "$(jq -r .isPrerelease <<<"$canonical_state")" = false
+            if [ "$GITHUB_REF_NAME" != "$canonical_latest" ]; then
+              gh release edit "$GITHUB_REF_NAME" --latest=false
+            fi
+            gh release edit "$canonical_latest" --latest
+            test "$(gh api "repos/${GITHUB_REPOSITORY}/releases/latest" --jq .tag_name)" = "$canonical_latest"
+          fi

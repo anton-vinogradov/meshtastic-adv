@@ -243,8 +243,8 @@ class RfHilCleanupTests(unittest.TestCase):
 
     def test_rf_exchange_retries_a_lost_ack(self):
         peers = [
-            {"name": "fca", "host": "192.0.2.10", "node_id": "!10203040"},
-            {"name": "fc1", "host": "192.0.2.11", "node_id": "!50607080"},
+            {"name": "alpha", "host": "192.0.2.10", "node_id": "!10203040"},
+            {"name": "bravo", "host": "192.0.2.11", "node_id": "!50607080"},
         ]
         with (
             mock.patch.object(
@@ -260,20 +260,20 @@ class RfHilCleanupTests(unittest.TestCase):
 
     def test_report_writes_secret_free_json_and_junit(self):
         peers = [
-            {"name": "fca", "host": "192.0.2.10", "node_id": "!10203040"},
-            {"name": "fc1", "host": "192.0.2.11", "node_id": "!50607080"},
+            {"name": "alpha", "host": "192.0.2.10", "node_id": "!10203040"},
+            {"name": "bravo", "host": "192.0.2.11", "node_id": "!50607080"},
         ]
         report = {
             "suite": "meshtastic-private-rf-smoke",
-            "prepared": [{"name": "fca"}, {"name": "fc1"}],
+            "prepared": [{"name": "alpha"}, {"name": "bravo"}],
             "exchange": [
-                {"from": "fca", "to": "fc1", "received": True, "routing_ack": True},
-                {"from": "fc1", "to": "fca", "received": True, "routing_ack": True},
+                {"from": "alpha", "to": "bravo", "received": True, "routing_ack": True},
+                {"from": "bravo", "to": "alpha", "received": True, "routing_ack": True},
             ],
             "restored": [
-                {"name": "fca", "restored": True},
+                {"name": "alpha", "restored": True},
                 {
-                    "name": "fc1",
+                    "name": "bravo",
                     "restored": False,
                     "error": "restore at 192.0.2.11 for !50607080 failed",
                 },
@@ -300,7 +300,7 @@ class RfHilCleanupTests(unittest.TestCase):
             self.assertNotIn(private_value.lower(), junit_text.lower())
         self.assertEqual(payload["diagnostic"]["host"], "<peer-host>")
         self.assertEqual(payload["diagnostic"]["node_id"], "<peer-node>")
-        failure = suite.find("./testcase[@name='restore/fc1']/failure")
+        failure = suite.find("./testcase[@name='restore/bravo']/failure")
         self.assertIsNotNone(failure)
         self.assertIn("<peer-host>", failure.attrib["message"])
         self.assertIn("<peer-node>", failure.attrib["message"])

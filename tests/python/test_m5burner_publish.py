@@ -56,17 +56,23 @@ class FakeSession:
             "name": "Meshtastic ADV",
             "description": "fixture",
             "category": "cardputer",
-            "author": "fixture",
-            "github": "https://example.invalid",
+            "author": "randoom",
+            "github": "https://github.com/anton-vinogradov/meshtastic-adv",
+            "cover": "ready.png",
             "versions": [dict(item) for item in versions],
         }
         self.uploads = 0
+        self.updates = 0
         self.publishes = 0
+        self.uploaded_cover = None
 
     def post(self, url, **kwargs):
         if url == m5.LOGIN_API:
             return Response({"status": 1})
         self.uploads += 1
+        if "cover" in kwargs["files"]:
+            self.uploaded_cover = kwargs["files"]["cover"].read()
+            self.firmware["cover"] = "uploaded.png"
         self.firmware["versions"].append(
             {"version": kwargs["data"]["version"], "file": "uploaded.bin", "published": False}
         )
@@ -76,6 +82,16 @@ class FakeSession:
         return Response([self.firmware])
 
     def put(self, url, **_kwargs):
+        if "/version/" in url:
+            self.updates += 1
+            if "cover" in _kwargs.get("files", {}):
+                self.uploaded_cover = _kwargs["files"]["cover"].read()
+                self.firmware["cover"] = "updated.png"
+            old_file_id = url.rsplit("/", 1)[-1]
+            for version in self.firmware["versions"]:
+                if version.get("file") == old_file_id:
+                    version["file"] = "updated.bin"
+            return Response({"status": 1})
         self.publishes += 1
         file_id = url.split("/")[-2]
         for version in self.firmware["versions"]:
@@ -85,14 +101,26 @@ class FakeSession:
 
 
 class M5BurnerPublisherTests(unittest.TestCase):
+    @staticmethod
+    def public_get(session, firmware_bytes, cover_bytes):
+        def get(url, **_kwargs):
+            if url == m5.PUBLIC_API:
+                return Response([session.firmware])
+            if url.startswith(m5.COVER_CDN + "/"):
+                return BinaryResponse(cover_bytes, url=url)
+            return BinaryResponse(firmware_bytes, url=url)
+        return get
+
     def publish(self, session, version="1.0.1"):
         with tempfile.TemporaryDirectory() as directory:
             binary = Path(directory) / "firmware.bin"
             binary.write_bytes(b"firmware")
+            cover = Path(directory) / "cover.png"
+            cover.write_bytes(b"\x89PNG\r\n\x1a\n" + b"\0\0\0\rIHDR" + (1000).to_bytes(4, "big") * 2)
             with mock.patch.object(
                 m5.requests,
                 "get",
-                return_value=BinaryResponse(b"firmware"),
+                side_effect=self.public_get(session, b"firmware", cover.read_bytes()),
                 create=True,
             ):
                 return m5.publish(
@@ -101,30 +129,215 @@ class M5BurnerPublisherTests(unittest.TestCase):
                     password="secret",
                     version=version,
                     binary=binary,
+                    cover=cover,
+                    listing_title="Meshtastic ADV",
+                    listing_description="fixture",
                 )
 
     def test_existing_published_version_is_verified_without_mutation(self):
         session = FakeSession([{"version": "1.0.1", "file": "ready.bin", "published": True}])
         self.assertEqual(self.publish(session), "ready.bin")
         self.assertEqual(session.uploads, 0)
+        self.assertEqual(session.updates, 0)
         self.assertEqual(session.publishes, 0)
 
     def test_half_published_version_is_resumed_instead_of_skipped(self):
         session = FakeSession([{"version": "1.0.1", "file": "pending.bin", "published": False}])
-        self.assertEqual(self.publish(session), "pending.bin")
+        self.assertEqual(self.publish(session), "updated.bin")
         self.assertEqual(session.uploads, 0)
+        self.assertEqual(session.updates, 1)
         self.assertEqual(session.publishes, 1)
+        self.assertIsNotNone(session.uploaded_cover)
+
+    def test_wrong_pending_binary_is_never_published(self):
+        session = FakeSession([{"version": "1.0.1", "file": "pending.bin", "published": False}])
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            binary = root / "firmware.bin"
+            binary.write_bytes(b"expected")
+            cover = root / "cover.png"
+            cover.write_bytes(b"\x89PNG\r\n\x1a\n" + b"\0\0\0\rIHDR" + (1000).to_bytes(4, "big") * 2)
+            public_get = self.public_get(session, b"stale-or-corrupt", cover.read_bytes())
+            with mock.patch.object(
+                m5.requests,
+                "get",
+                side_effect=public_get,
+                create=True,
+            ):
+                with self.assertRaisesRegex(RuntimeError, "public binary did not converge"):
+                    m5.publish(
+                        session,
+                        email="fixture@example.invalid",
+                        password="secret",
+                        version="1.0.1",
+                        binary=binary,
+                        cover=cover,
+                        listing_title="Meshtastic ADV",
+                        listing_description="fixture",
+                    )
+        self.assertEqual(session.uploads, 0)
+        self.assertEqual(session.updates, 1)
+        self.assertEqual(session.publishes, 0)
 
     def test_missing_version_is_uploaded_published_and_verified(self):
         session = FakeSession()
         self.assertEqual(self.publish(session), "uploaded.bin")
         self.assertEqual(session.uploads, 1)
+        self.assertEqual(session.updates, 0)
         self.assertEqual(session.publishes, 1)
+
+    def test_exact_square_png_cover_is_uploaded(self):
+        session = FakeSession()
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            binary = root / "firmware.bin"
+            binary.write_bytes(b"firmware")
+            cover = root / "cover.png"
+            cover.write_bytes(b"\x89PNG\r\n\x1a\n" + b"\0\0\0\rIHDR" + (1000).to_bytes(4, "big") * 2)
+            with mock.patch.object(
+                m5.requests,
+                "get",
+                side_effect=self.public_get(session, b"firmware", cover.read_bytes()),
+                create=True,
+            ):
+                m5.publish(
+                    session,
+                    email="fixture@example.invalid",
+                    password="secret",
+                    version="1.0.1",
+                    binary=binary,
+                    cover=cover,
+                    listing_title="Meshtastic ADV",
+                    listing_description="fixture",
+                )
+            self.assertEqual(session.uploaded_cover, cover.read_bytes())
+
+    def test_invalid_cover_fails_before_login(self):
+        session = FakeSession()
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            binary = root / "firmware.bin"
+            binary.write_bytes(b"firmware")
+            cover = root / "cover.png"
+            cover.write_bytes(b"not a png")
+            with self.assertRaisesRegex(RuntimeError, "not a PNG"):
+                m5.publish(
+                    session,
+                    email="fixture@example.invalid",
+                    password="secret",
+                    version="1.0.1",
+                    binary=binary,
+                    cover=cover,
+                    listing_title="Meshtastic ADV",
+                    listing_description="fixture",
+                )
+        self.assertEqual(session.uploads, 0)
+
+    def test_duplicate_version_fails_before_any_mutation(self):
+        session = FakeSession(
+            [
+                {"version": "1.0.1", "file": "one.bin", "published": False},
+                {"version": "1.0.1", "file": "two.bin", "published": False},
+            ]
+        )
+        with self.assertRaisesRegex(RuntimeError, "duplicate version"):
+            self.publish(session)
+        self.assertEqual(session.uploads, 0)
+        self.assertEqual(session.updates, 0)
+        self.assertEqual(session.publishes, 0)
+
+    def test_historical_absent_or_pending_version_cannot_be_published(self):
+        for older in (None, {"version": "1.0.1", "file": "old.bin", "published": False}):
+            versions = [{"version": "1.0.2", "file": "new.bin", "published": True}]
+            if older:
+                versions.append(older)
+            session = FakeSession(versions)
+            with self.assertRaisesRegex(RuntimeError, "historical"):
+                self.publish(session)
+            self.assertEqual(session.uploads, 0)
+            self.assertEqual(session.updates, 0)
+            self.assertEqual(session.publishes, 0)
+
+    def test_historical_already_published_version_is_verify_only(self):
+        session = FakeSession(
+            [
+                {"version": "1.0.2", "file": "new.bin", "published": True},
+                {"version": "1.0.1", "file": "ready.bin", "published": True},
+            ]
+        )
+        self.assertEqual(self.publish(session), "ready.bin")
+        self.assertEqual(session.uploads, 0)
+        self.assertEqual(session.updates, 0)
+        self.assertEqual(session.publishes, 0)
+
+    def test_historical_public_rerun_ignores_current_global_listing_and_cover(self):
+        session = FakeSession(
+            [
+                {"version": "1.0.2", "file": "new.bin", "published": True},
+                {"version": "1.0.1", "file": "ready.bin", "published": True},
+            ]
+        )
+        session.firmware["description"] = "copy for a newer release"
+        session.firmware["cover"] = "newer.png"
+        self.assertEqual(self.publish(session), "ready.bin")
+
+    def test_latest_listing_drift_fails_before_login_or_mutation(self):
+        session = FakeSession()
+        session.firmware["description"] = "stale"
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            binary = root / "firmware.bin"
+            binary.write_bytes(b"firmware")
+            cover = root / "cover.png"
+            cover.write_bytes(b"\x89PNG\r\n\x1a\n" + b"\0\0\0\rIHDR" + (1000).to_bytes(4, "big") * 2)
+            with mock.patch.object(
+                m5.requests, "get", return_value=Response([session.firmware]), create=True
+            ):
+                with self.assertRaisesRegex(RuntimeError, "listing metadata differs"):
+                    m5.publish(
+                        session,
+                        email="fixture@example.invalid",
+                        password="secret",
+                        version="1.0.1",
+                        binary=binary,
+                        cover=cover,
+                        listing_title="Meshtastic ADV",
+                        listing_description="fixture",
+                    )
+        self.assertEqual(session.uploads, 0)
+        self.assertEqual(session.updates, 0)
+
+    def test_latest_public_cover_requires_exact_bytes(self):
+        session = FakeSession([{"version": "1.0.1", "file": "ready.bin", "published": True}])
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            binary = root / "firmware.bin"
+            binary.write_bytes(b"firmware")
+            cover = root / "cover.png"
+            cover.write_bytes(b"\x89PNG\r\n\x1a\n" + b"\0\0\0\rIHDR" + (1000).to_bytes(4, "big") * 2)
+            with mock.patch.object(
+                m5.requests,
+                "get",
+                side_effect=self.public_get(session, b"firmware", b"stale-cover"),
+                create=True,
+            ):
+                with self.assertRaisesRegex(RuntimeError, "public cover did not converge"):
+                    m5.publish(
+                        session,
+                        email="fixture@example.invalid",
+                        password="secret",
+                        version="1.0.1",
+                        binary=binary,
+                        cover=cover,
+                        listing_title="Meshtastic ADV",
+                        listing_description="fixture",
+                    )
 
     def test_public_verification_requires_exact_file_and_published_flag(self):
         session = FakeSession([{"version": "1.0.1", "file": "wrong.bin", "published": True}])
-        with self.assertRaisesRegex(RuntimeError, "public catalog"):
-            m5.verify_public_version(session, "1.0.1", "expected.bin", attempts=1, delay=0)
+        with mock.patch.object(m5.requests, "get", return_value=Response([session.firmware]), create=True):
+            with self.assertRaisesRegex(RuntimeError, "public catalog"):
+                m5.verify_public_version("1.0.1", "expected.bin", attempts=1, delay=0)
 
     def test_public_binary_requires_exact_bytes(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -147,6 +360,42 @@ class M5BurnerPublisherTests(unittest.TestCase):
             with mock.patch.object(m5.requests, "get", return_value=response, create=True):
                 with self.assertRaisesRegex(RuntimeError, "public binary did not converge"):
                     m5.verify_public_binary("ready.bin", binary, attempts=1, delay=0)
+
+    def test_listing_copy_parser_is_strict(self):
+        with tempfile.TemporaryDirectory() as directory:
+            listing = Path(directory) / "listing.txt"
+            listing.write_text("Title: Exact title\nnotes\n---\nExact body\n", encoding="utf-8")
+            self.assertEqual(m5.parse_listing_copy(listing), ("Exact title", "Exact body"))
+            listing.write_text("Title: Exact title\n---\none\n---\ntwo\n", encoding="utf-8")
+            with self.assertRaisesRegex(RuntimeError, "exactly one"):
+                m5.parse_listing_copy(listing)
+
+    def test_listing_only_cli_is_credential_free_and_read_only(self):
+        session = FakeSession()
+        with tempfile.TemporaryDirectory() as directory:
+            listing = Path(directory) / "listing.txt"
+            listing.write_text("Title: Meshtastic ADV\nnotes\n---\nfixture\n", encoding="utf-8")
+            with (
+                mock.patch.object(m5.sys, "argv", ["m5burner_publish.py", "--check-listing-only", "--listing", str(listing)]),
+                mock.patch.object(m5.requests, "get", return_value=Response([session.firmware]), create=True),
+                mock.patch.object(m5.requests, "Session", side_effect=AssertionError("must not login"), create=True),
+                mock.patch.dict(m5.os.environ, {}, clear=True),
+            ):
+                self.assertIsNone(m5.main())
+        self.assertEqual(session.uploads, 0)
+        self.assertEqual(session.updates, 0)
+        self.assertEqual(session.publishes, 0)
+
+    def test_malformed_listing_only_cli_fails_before_network(self):
+        with tempfile.TemporaryDirectory() as directory:
+            listing = Path(directory) / "listing.txt"
+            listing.write_text("not reviewed", encoding="utf-8")
+            with (
+                mock.patch.object(m5.sys, "argv", ["m5burner_publish.py", "--check-listing-only", "--listing", str(listing)]),
+                mock.patch.object(m5.requests, "get", side_effect=AssertionError("must not use network"), create=True),
+            ):
+                with self.assertRaises(SystemExit):
+                    m5.main()
 
 
 if __name__ == "__main__":

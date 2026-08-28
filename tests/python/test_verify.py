@@ -22,6 +22,7 @@ def args(**overrides):
         "rf": False,
         "usb": False,
         "release_image": None,
+        "config_backup": None,
         "backup_root": None,
         "capture_rf_backups": False,
         "rf_profile_from": None,
@@ -61,6 +62,18 @@ class VerifyRunnerTests(unittest.TestCase):
         )
         command = next(stage.command for stage in plan if stage.name == "hardware/usb-cardputer")
         self.assertEqual(command[command.index("--release-image") + 1], str(image))
+
+    def test_external_config_backup_is_usb_only_and_forwarded(self):
+        backup = Path("/persistent/recovery/config.yaml")
+        plan = verify.build_plan(
+            args(usb=True, skip_build=True, config_backup=backup), Path("/tmp/evidence")
+        )
+        command = next(stage.command for stage in plan if stage.name == "hardware/usb-cardputer")
+        self.assertEqual(command[command.index("--config-backup") + 1], str(backup))
+
+        source = verify.parser()
+        with self.assertRaises(SystemExit):
+            verify.validate_args(args(config_backup=backup), source)
 
     def test_rf_release_options_are_forwarded(self):
         plan = verify.build_plan(

@@ -3,204 +3,216 @@
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <title>Meshtastic ADV · installer</title>
-  <meta name="description" content="Keyboard-first Meshtastic client for the M5Stack Cardputer ADV. Flash it from your browser." />
+  <title>Meshtastic ADV for Cardputer · keyboard-first mesh messenger</title>
+  <meta name="description" content="Turn an M5Stack Cardputer ADV into a keyboard-first Meshtastic messenger. Use its LoRa cap or a BLE-capable stock node, and install from your browser." />
   <meta name="theme-color" content="#05060a" />
+  <meta name="robots" content="index,follow" />
+  <meta name="referrer" content="strict-origin-when-cross-origin" />
   <meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; font-src 'self'; connect-src 'self'; worker-src 'self' blob:; object-src 'none'; base-uri 'self'; form-action 'none'; upgrade-insecure-requests" />
+  <link rel="canonical" href="https://anton-vinogradov.github.io/meshtastic-adv/" />
+  <link rel="icon" href="./img/m5burner-cover.png" type="image/png" />
+  <link rel="stylesheet" href="./site.css" />
   <meta property="og:type" content="website" />
+  <meta property="og:site_name" content="Meshtastic ADV" />
+  <meta property="og:locale" content="en_US" />
   <meta property="og:title" content="Meshtastic ADV · keyboard-first mesh messenger" />
-  <meta property="og:description" content="Flash a chat-focused Meshtastic UI for the M5Stack Cardputer ADV directly from your browser." />
+  <meta property="og:description" content="Real QWERTY mesh messaging on the M5Stack Cardputer ADV — no phone required." />
   <meta property="og:url" content="https://anton-vinogradov.github.io/meshtastic-adv/" />
-  <meta property="og:image" content="https://anton-vinogradov.github.io/meshtastic-adv/img/hero.png" />
-  <meta property="og:image:alt" content="Meshtastic ADV recent chats and conversation UI on the Cardputer ADV" />
+  <meta property="og:image" content="https://anton-vinogradov.github.io/meshtastic-adv/img/hero.png?sha256=91ae5ea992f63d8da03655f4d23fe2aaaacf649af94ae58a94708e87a2877f37" />
+  <meta property="og:image:type" content="image/png" />
+  <meta property="og:image:width" content="900" />
+  <meta property="og:image:height" content="600" />
+  <meta property="og:image:alt" content="Meshtastic ADV running a real chat UI on the M5Stack Cardputer ADV" />
   <meta name="twitter:card" content="summary_large_image" />
+  <meta name="twitter:title" content="Meshtastic ADV · keyboard-first mesh messenger" />
+  <meta name="twitter:description" content="Real QWERTY mesh messaging on the M5Stack Cardputer ADV — no phone required." />
+  <meta name="twitter:image" content="https://anton-vinogradov.github.io/meshtastic-adv/img/hero.png?sha256=91ae5ea992f63d8da03655f4d23fe2aaaacf649af94ae58a94708e87a2877f37" />
+  <meta name="twitter:image:alt" content="Meshtastic ADV running a real chat UI on the M5Stack Cardputer ADV" />
   <script type="module" src="./vendor/esp-web-tools/install-button.js"></script>
   <script defer src="./installer.js"></script>
-  <style>
-    :root{
-      color-scheme: dark;
-      --bg:#05060a; --panel:#0b0f18; --ink:#e8ecf2; --dim:#8b93a7;
-      --cyan:#37e1ff; --cyanD:#0aa7c8; --amber:#ffcf3f; --red:#ff4d4d; --green:#42e06a;
-      --line:#1c2333;
-    }
-    *{ box-sizing:border-box; }
-    html,body{ margin:0; }
-    body{
-      background:var(--bg); color:var(--ink);
-      font-family:ui-monospace, "SFMono-Regular", Menlo, Consolas, monospace; font-size:20px; line-height:1.35;
-      min-height:100vh; padding:28px 16px 60px;
-      background-image:
-        radial-gradient(120% 80% at 50% -10%, rgba(55,225,255,.10), transparent 60%),
-        repeating-linear-gradient(0deg, rgba(255,255,255,.028) 0 2px, transparent 2px 4px);
-    }
-    main{ width:min(760px, 100%); margin:0 auto; }
-    .pixel{ font-family:ui-monospace, "SFMono-Regular", Menlo, Consolas, monospace; font-weight:900; }
-    img{ image-rendering: pixelated; }
-
-    /* --- header --- */
-    header{ text-align:center; margin:18px 0 26px; }
-    h1{ margin:0; line-height:1.25; }
-    h1 .m{ font-size:30px; color:var(--ink); text-shadow:3px 3px 0 #000; }
-    h1 .adv{ display:block; font-size:44px; color:var(--cyan); margin-top:10px;
-             text-shadow:3px 3px 0 #003743, 0 0 18px rgba(55,225,255,.35); }
-    .tag{ margin:16px auto 0; max-width:34ch; color:var(--dim); font-size:22px; }
-
-    /* --- panels (square, pixel-bevel) --- */
-    .panel{ background:var(--panel); border:3px solid var(--line);
-            box-shadow: 6px 6px 0 rgba(0,0,0,.6); padding:20px; margin:22px 0; }
-    .panel h2{ font-size:12px; margin:0 0 16px; color:var(--cyan);
-               letter-spacing:1px; text-transform:uppercase; }
-
-    /* --- install button --- */
-    esp-web-install-button{ display:block;
-      --esp-tools-button-color:var(--cyan); --esp-tools-button-text-color:#04121a;
-      --esp-tools-button-border-radius:0; }
-    button[slot="activate"]{
-      appearance:none; cursor:pointer; width:100%;
-      font-family:ui-monospace, "SFMono-Regular", Menlo, Consolas, monospace; font-size:15px; font-weight:900; color:#04121a;
-      background:var(--cyan); border:0; padding:20px 18px;
-      box-shadow: 0 6px 0 var(--cyanD), 0 6px 0 3px #04121a;
-      transition:transform .05s, box-shadow .05s;
-    }
-    button[slot="activate"]:hover{ background:#5eeaff; }
-    button[slot="activate"]:active{ transform:translateY(6px);
-      box-shadow: 0 0 0 var(--cyanD), 0 0 0 3px #04121a; }
-    .unsupported,.blocked{ display:block; color:var(--amber); font-size:20px; }
-
-    /* --- esp-web-tools install dialog → 8-bit theme ---
-       The dialog paints its theme on its own :host (a pseudo-class that
-       out-specificities a plain type selector), so we override the Material
-       design tokens on the host element with !important. It mounts in
-       document.body as <ewt-install-dialog>; custom props cascade into its
-       shadow tree and every ew-* child. */
-    ewt-install-dialog{
-      --roboto-font:ui-monospace, monospace !important;
-      --md-ref-typeface-plain:ui-monospace, monospace !important;
-      --md-ref-typeface-brand:ui-monospace, monospace !important;
-      --md-sys-typescale-title-font:ui-monospace, monospace !important;
-      --md-sys-typescale-headline-font:ui-monospace, monospace !important;
-
-      --md-sys-color-primary:var(--cyan) !important;
-      --md-sys-color-on-primary:#04121a !important;
-
-      --md-sys-color-surface:var(--panel) !important;
-      --md-sys-color-surface-container:var(--panel) !important;
-      --md-sys-color-surface-container-high:var(--panel) !important;
-      --md-sys-color-surface-container-highest:#0e1420 !important;
-      --md-sys-color-secondary-container:#12233d !important;
-      --md-sys-color-on-secondary-container:var(--ink) !important;
-
-      --md-sys-color-on-surface:var(--ink) !important;
-      --md-sys-color-on-surface-variant:var(--dim) !important;
-      --md-sys-color-outline:var(--line) !important;
-      --md-sys-color-outline-variant:var(--line) !important;
-
-      --text-color:var(--dim) !important;
-      --danger-color:var(--red) !important;
-
-      /* square corners to match the page's pixel panels */
-      --md-dialog-container-shape:0 !important;
-      --md-sys-shape-corner-large:0 !important;
-      --md-sys-shape-corner-medium:0 !important;
-      --md-sys-shape-corner-small:0 !important;
-      --md-sys-shape-corner-extra-small:0 !important;
-    }
-
-    /* --- version picker --- */
-    .verrow{ display:flex; align-items:center; gap:12px; margin-top:14px; }
-    .verrow label{ font-family:ui-monospace, monospace; font-size:11px; font-weight:900; color:var(--dim); }
-    .verrow select{
-      flex:1; min-width:0; appearance:none; cursor:pointer;
-      font-family:ui-monospace, monospace; font-size:20px; color:var(--ink);
-      background:#000; border:3px solid var(--line); padding:6px 10px;
-    }
-    .verrow select:focus{ outline:none; border-color:var(--cyanD); }
-
-    /* --- gallery --- */
-    .shots{ display:grid; grid-template-columns:1fr 1fr; gap:14px; }
-    .shots figure{ margin:0; border:3px solid var(--line); background:#000; box-shadow:5px 5px 0 rgba(0,0,0,.6); }
-    .shots img{ width:100%; display:block; }
-    .shots figcaption{ padding:6px 10px; color:var(--dim); font-size:19px; border-top:3px solid var(--line); }
-
-    /* --- lists --- */
-    ul{ margin:0; padding:0; list-style:none; }
-    li{ margin:10px 0; padding-left:26px; position:relative; }
-    li::before{ content:"▸"; position:absolute; left:0; color:var(--cyan); }
-    li.warn::before{ content:"!"; color:var(--red); font-family:ui-monospace, monospace; font-size:13px; font-weight:900; }
-    b{ color:var(--ink); }
-    kbd{ font-family:ui-monospace, monospace; font-size:11px; font-weight:900; background:#000; border:2px solid var(--line);
-         padding:3px 6px; color:var(--amber); }
-    a{ color:var(--cyan); text-decoration:none; border-bottom:2px dotted var(--cyanD); }
-    a:hover{ color:#7cf0ff; }
-    footer{ text-align:center; color:#5a6377; font-size:19px; margin-top:30px; line-height:1.5; }
-
-    @media (max-width:560px){
-      h1 .adv{ font-size:34px; } h1 .m{ font-size:22px; }
-      .shots{ grid-template-columns:1fr; }
-    }
-  </style>
+  <script defer src="./site.js"></script>
 </head>
 <body>
-  <main>
-    <header>
-      <h1 class="pixel"><span class="m">Meshtastic</span><span class="adv">ADV</span></h1>
-      <p class="tag">Keyboard-first Meshtastic for the M5Stack Cardputer ADV. Message the mesh — no phone.</p>
-    </header>
+  <a class="skip-link" href="#main">Skip to content</a>
 
-    <div class="panel">
-      <h2>▚ Flash it now</h2>
+  <header class="site-header">
+    <a class="wordmark" href="#top" aria-label="Meshtastic ADV home">
+      <span>Meshtastic</span><strong>ADV</strong>
+    </a>
+    <nav aria-label="Primary navigation">
+      <a href="#how">How it works</a>
+      <a href="#install">Install</a>
+      <a href="#faq">Help</a>
+      <a href="https://github.com/anton-vinogradov/meshtastic-adv">GitHub</a>
+    </nav>
+  </header>
+
+  <main id="main" tabindex="-1">
+    <section class="hero" id="top" aria-labelledby="hero-title">
+      <div class="hero-copy">
+        <p class="eyebrow">M5Stack Cardputer ADV</p>
+        <h1 id="hero-title">Message the mesh.<br><span>No phone required.</span></h1>
+        <p class="lede">A fast, keyboard-first Meshtastic client that boots straight into your conversations. Type, send, see delivery status — all on a pocket QWERTY device.</p>
+        <ul class="value-list" aria-label="Key benefits">
+          <li>Real chat UI with DMs, channels and persisted history</li>
+          <li>Cyrillic, Unicode, emoji, reactions and replies</li>
+          <li>Open source · no account or cloud required</li>
+        </ul>
+        <div class="hero-actions">
+          <a class="button primary" href="#install">Install stable firmware</a>
+          <a class="button secondary" href="#how">See how it works</a>
+        </div>
+      </div>
+
+      <figure class="hero-media">
+        <img id="hero-demo" src="./img/hero.png" data-animation="./img/hero.gif" data-poster="./img/hero.png" width="900" height="600" decoding="async" fetchpriority="high" alt="Meshtastic ADV on a Cardputer: opening an unread chat, typing with emoji, receiving an acknowledgement and reply, reacting, then sending a quoted Cyrillic reply" />
+        <figcaption>Device render © <a href="https://shop.m5stack.com/products/m5stack-cardputer-adv-version-esp32-s3">M5Stack</a>; every screen comes from real firmware using a synthetic conversation.</figcaption>
+        <button class="demo-toggle" id="demo-toggle" type="button" aria-controls="hero-demo" hidden>Play 16-second demo</button>
+      </figure>
+    </section>
+
+    <section class="install-card" id="install" aria-labelledby="install-title">
+      <div class="install-intro">
+        <p class="eyebrow">Browser installer</p>
+        <h2 id="install-title">Flash the latest stable release</h2>
+        <p>Use desktop Chrome or Edge and a data USB-C cable. The installer writes the firmware and its GNU Unifont glyph partition together.</p>
+      </div>
+
+      <div class="safety" id="install-safety" role="note" aria-label="Important safety information">
+        <p><strong><span aria-hidden="true">!</span> Attach the LoRa antenna before powering a Cap LoRa-1262.</strong> Running its PA without an antenna can permanently damage it.</p>
+        <p><strong><span aria-hidden="true">!</span> Back up your Meshtastic configuration first.</strong> A full erase removes settings and message history; use the official app's configuration export before continuing.</p>
+      </div>
+
       <esp-web-install-button manifest="./manifest.json">
-        <button slot="activate">CONNECT &amp; INSTALL</button>
-        <span slot="unsupported" class="unsupported">Web Serial isn't supported here — open this page in desktop <b>Chrome</b> or <b>Edge</b>.</span>
-        <span slot="not-allowed" class="blocked">Serial access was blocked by the browser.</span>
+        <button slot="activate" aria-describedby="install-safety install-requirements">CONNECT &amp; INSTALL</button>
+        <span slot="unsupported" class="unsupported">Web Serial is not available here. Open this page in desktop <b>Chrome</b> or <b>Edge</b>, or use the alternative install paths below.</span>
+        <span slot="not-allowed" class="blocked">Serial access was blocked. Allow access when the browser asks, then try again.</span>
       </esp-web-install-button>
-      <div class="verrow">
-        <label for="ver">version</label>
-        <select id="ver"><option value="">latest</option></select>
+
+      <div class="version-row">
+        <label for="ver">Firmware version</label>
+        <select id="ver"><option value="">latest stable</option></select>
       </div>
-    </div>
+      <p class="requirements" id="install-requirements">Connect directly to the computer without a hub. If the port does not appear, hold <kbd>G0</kbd> / <kbd>BOOT</kbd> while connecting, then release.</p>
 
-    <div class="panel">
-      <h2>▚ On the screen</h2>
-      <div class="shots">
-        <figure><img src="img/chats.png" alt="Recent chats"><figcaption>recent chats · preview · unread</figcaption></figure>
-        <figure><img src="img/chat.png" alt="Conversation"><figcaption>chat · cyrillic · emoji · status</figcaption></figure>
-        <figure><img src="img/nodes.png" alt="Node list"><figcaption>nodes · signal · hops · age</figcaption></figure>
-        <figure><img src="img/emoji.png" alt="Emoji palette"><figcaption>emoji palette · Tab</figcaption></figure>
+      <details class="ru-help" lang="ru">
+        <summary>Инструкция и предупреждения по-русски</summary>
+        <div>
+          <p><strong>Сначала подключите LoRa-антенну</strong> — питание усилителя без антенны может повредить кап. Перед полной очисткой <strong>сохраните конфигурацию Meshtastic</strong>.</p>
+          <ol>
+            <li>Откройте страницу в десктопном Chrome или Edge.</li>
+            <li>Подключите Cardputer data-кабелем USB-C и нажмите <b>Connect &amp; Install</b>.</li>
+            <li>После установки: долгое <kbd>ESC</kbd> → выставьте <b>Region</b> и <b>UTC</b>.</li>
+          </ol>
+          <p><a href="https://github.com/anton-vinogradov/meshtastic-adv/blob/main/README.ru.md#установка">Полная инструкция на русском →</a></p>
+        </div>
+      </details>
+    </section>
+
+    <section class="section" id="how" aria-labelledby="how-title">
+      <div class="section-heading">
+        <p class="eyebrow">Two ways to mesh</p>
+        <h2 id="how-title">Use the radio you already have</h2>
+        <p>The messenger stays the same; only the radio path changes.</p>
       </div>
-    </div>
+      <div class="mode-grid">
+        <article class="mode-card">
+          <span class="mode-number" aria-hidden="true">01</span>
+          <h3>Onboard LoRa</h3>
+          <p>Attach an M5Stack Cap LoRa-1262 and the Cardputer becomes a complete standalone Meshtastic node.</p>
+          <p class="mode-tag">Pocket messenger · one device</p>
+        </article>
+        <article class="mode-card">
+          <span class="mode-number" aria-hidden="true">02</span>
+          <h3>BLE companion</h3>
+          <p>No cap required. Pair with a BLE-capable stock Heltec, T-Beam, RAK or other Meshtastic node and drive its radio over Bluetooth.</p>
+          <p class="mode-tag">Your existing node · zero firmware changes</p>
+        </article>
+      </div>
+    </section>
 
-    <div class="panel">
-      <h2>▚ Before you click</h2>
-      <ul>
-        <li class="warn">Attach the <b>LoRa antenna</b> to the Cap first — never power the PA without it.</li>
-        <li class="warn"><b>Back up your Meshtastic configuration first.</b> Choosing a full erase removes settings and message history.</li>
-        <li>No LoRa cap? <b>Companion mode</b> pairs with any stock Meshtastic node over Bluetooth and uses its radio (Settings → Radio).</li>
-        <li>Desktop <b>Chrome</b> or <b>Edge</b> only (Web Serial API).</li>
-        <li>Use a <b>data</b> USB-C cable, straight into the computer — no hub.</li>
-        <li>Not listed? Hold <kbd>G0</kbd> / <kbd>BOOT</kbd> while connecting, then release.</li>
-        <li>Black screen after flashing? <b>Unplug and replug</b> the cable — the chip can stay in the bootloader until power is cycled.</li>
-        <li>After flashing: long-press <kbd>ESC</kbd> → set your <b>Region</b> &amp; <b>UTC</b>.</li>
-      </ul>
-    </div>
+    <section class="section" aria-labelledby="conversation-title">
+      <div class="section-heading">
+        <p class="eyebrow">Built around conversations</p>
+        <h2 id="conversation-title">A messenger, not a menu maze</h2>
+        <p>Recent chats are home. Type to find a contact, press Enter to open, then write.</p>
+      </div>
+      <div class="feature-grid">
+        <article><h3>Message naturally</h3><p>DMs and channels, delivery checks, replies, reactions, favourites and inline emoji.</p></article>
+        <article><h3>Write in your language</h3><p>Toggle Cyrillic input from the keyboard and render Unicode messages from the wider mesh.</p></article>
+        <article><h3>Keep the history</h3><p>Conversations survive reboots; older messages page back from a flash archive.</p></article>
+        <article><h3>Read the mesh</h3><p>Find nodes by name and see signal, hop count, role and last-heard age in fixed columns.</p></article>
+        <article><h3>Configure on-device</h3><p>Region, channels, radio, WiFi, MQTT, time and companion mode — no phone setup required.</p></article>
+        <article><h3>Stay compatible</h3><p>The stock Meshtastic Client API remains available, including the official phone app when Bluetooth is free.</p></article>
+      </div>
+      <p class="guide-link"><a href="https://github.com/anton-vinogradov/meshtastic-adv/blob/main/docs/interface.md">Explore every screen and shortcut →</a></p>
+    </section>
 
-    <div class="panel">
-      <h2>▚ Drive it</h2>
-      <ul>
-        <li><kbd>type</kbd> on the list to search · <kbd>ENTER</kbd> opens a chat</li>
-        <li><kbd>&larr;</kbd><kbd>&rarr;</kbd> favourite a contact · <kbd>&uarr;</kbd><kbd>&darr;</kbd> move / scroll</li>
-        <li>In a chat: <kbd>type</kbd> then <kbd>ENTER</kbd> to send · <kbd>Tab</kbd> for emoji · <kbd>Fn+L</kbd> for Cyrillic</li>
-        <li><kbd>&larr;</kbd> reply · <kbd>&rarr;</kbd> react on a received message</li>
-        <li>Long-press <kbd>ESC</kbd> anywhere → Settings (region, UTC, WiFi &amp; MQTT, Radio / companion)</li>
-      </ul>
-    </div>
+    <section class="trust" aria-labelledby="trust-title">
+      <div>
+        <p class="eyebrow">Release confidence</p>
+        <h2 id="trust-title">The download is tested on the real device</h2>
+      </div>
+      <p>Every stable tag must pass host tests, sanitizers, both firmware builds and memory budgets before a radio-silent hardware gate flashes a trusted Cardputer, replays synthetic production-format traffic through the real decoder, verifies the UI and storage, reboots, and restores and verifies the exact production application bytes.</p>
+      <div class="text-links">
+        <a href="https://github.com/anton-vinogradov/meshtastic-adv/blob/main/hil/README.md#coverage-matrix">Honest HIL coverage →</a>
+        <a href="https://github.com/anton-vinogradov/meshtastic-adv/blob/main/CHANGELOG.md">Changelog →</a>
+        <a href="https://github.com/anton-vinogradov/meshtastic-adv/releases/latest">Latest release →</a>
+      </div>
+    </section>
 
-    <footer>
-      <a href="https://github.com/anton-vinogradov/meshtastic-adv">github.com/anton-vinogradov/meshtastic-adv</a>
-      · <a href="https://github.com/anton-vinogradov/meshtastic-adv/blob/main/README.ru.md">документация по-русски</a><br>
-      Unofficial community project. Meshtastic® is a registered trademark of Meshtastic LLC.<br>
-      Device imagery © <a href="https://shop.m5stack.com/products/m5stack-cardputer-adv">M5Stack</a>.
-    </footer>
+    <section class="section" aria-labelledby="other-title">
+      <div class="section-heading">
+        <p class="eyebrow">Other install paths</p>
+        <h2 id="other-title">Browser optional</h2>
+      </div>
+      <div class="path-grid">
+        <article>
+          <h3>M5Launcher / M5Burner</h3>
+          <p>Find <b>Meshtastic ADV</b> in the Cardputer catalog. Its merged image already contains the firmware and Unicode font.</p>
+          <a href="https://github.com/anton-vinogradov/meshtastic-adv/blob/main/README.md#install">Catalog instructions →</a>
+        </article>
+        <article>
+          <h3>Release image / esptool</h3>
+          <p>Download the merged image for a full flash, or use the factory image and place <code>unifont.bin</code> at <code>0x340000</code>.</p>
+          <a href="https://github.com/anton-vinogradov/meshtastic-adv/releases/latest">Download latest release →</a>
+        </article>
+      </div>
+    </section>
+
+    <section class="section faq" id="faq" aria-labelledby="faq-title">
+      <div class="section-heading">
+        <p class="eyebrow">Troubleshooting</p>
+        <h2 id="faq-title">If something looks stuck</h2>
+      </div>
+      <details>
+        <summary>The Cardputer is not listed</summary>
+        <p>Use a data-capable cable and connect without a hub. Hold <kbd>G0</kbd> / <kbd>BOOT</kbd> while plugging it in, then release and try Connect again.</p>
+      </details>
+      <details>
+        <summary>The screen stays black after flashing</summary>
+        <p>Unplug and reconnect the cable. The ESP32-S3 can remain in its bootloader until it is power-cycled.</p>
+      </details>
+      <details>
+        <summary>I do not have a LoRa cap</summary>
+        <p>Install normally, then long-press <kbd>ESC</kbd> → <b>Settings</b> → <b>Radio</b> → <b>Companion via BLE</b>. Pair with any BLE-capable stock Meshtastic node and use its radio.</p>
+      </details>
+      <details>
+        <summary>What should I do on first boot?</summary>
+        <p>Long-press <kbd>ESC</kbd> and set the legal <b>Region</b> for your location plus your <b>UTC</b> offset. Restore other Meshtastic settings only from a backup you trust.</p>
+      </details>
+    </section>
   </main>
+
+  <footer>
+    <div class="footer-links">
+      <a href="https://github.com/anton-vinogradov/meshtastic-adv">Source</a>
+      <a href="https://github.com/anton-vinogradov/meshtastic-adv/blob/main/docs/interface.md">Interface guide</a>
+      <a href="https://github.com/anton-vinogradov/meshtastic-adv/blob/main/README.ru.md">Документация по-русски</a>
+      <a href="https://github.com/anton-vinogradov/meshtastic-adv/discussions">Questions &amp; ideas</a>
+    </div>
+    <p>Open source under GPL-3.0. Unofficial community project; not affiliated with or endorsed by Meshtastic LLC.</p>
+    <p>Meshtastic® is a registered trademark of Meshtastic LLC. Device imagery © <a href="https://shop.m5stack.com/products/m5stack-cardputer-adv-version-esp32-s3">M5Stack</a>.</p>
+  </footer>
 </body>
 </html>

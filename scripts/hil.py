@@ -31,7 +31,7 @@ RELEASE_ENV = "m5stack-cardputer-adv-advui"
 EXPECTED_DEMO_FRAMES = [
     "splash", "nodes", "chat", "react", "chats", "emoji", "settings", "lora", "utc",
     "wifi", "mqtt", "unicode", "stress", "bscan", "bpin", "blink",
-    *[f"a{i:02d}" for i in range(1, 14)],
+    *[f"a{i:02d}" for i in range(1, 20)],
 ]
 MAX_APP_IMAGE_BYTES = 3_000_000
 REGION_CODES = {"UNSET": 0, "US": 1}
@@ -457,6 +457,24 @@ def find_pio() -> str:
     raise HilError("PlatformIO not found; set PIO=/path/to/pio")
 
 
+def find_meshtastic_cli() -> str:
+    """Use one explicit/pinned CLI for both configuration export and restore."""
+    explicit = os.environ.get("MESHTASTIC_CLI")
+    if explicit:
+        candidate = Path(explicit)
+        if candidate.is_file() and os.access(candidate, os.X_OK):
+            return str(candidate.resolve())
+        raise HilError("MESHTASTIC_CLI is not an executable file")
+
+    sibling = Path(sys.executable).with_name("meshtastic")
+    if sibling.is_file() and os.access(sibling, os.X_OK):
+        return str(sibling.resolve())
+    discovered = shutil.which("meshtastic")
+    if discovered:
+        return str(Path(discovered).resolve())
+    raise HilError("meshtastic CLI not found in the active HIL environment")
+
+
 def run_checked(command: list[str], cwd: Path = ROOT, redact_output: bool = False) -> None:
     rendered = " ".join(command)
     print("+", redact_lab_details(rendered) if redact_output else rendered, flush=True)
@@ -598,8 +616,28 @@ def reuse_release_dependencies() -> None:
         print(f"reused {linked} release dependency entries for HIL", flush=True)
 
 
+def validate_hil_stock_ble_guard() -> None:
+    """Require the synced HIL guard to precede every stock BLE side effect."""
+    source = FIRMWARE / "src/platform/esp32/main-esp32.cpp"
+    expected = (
+        "void setBluetoothEnable(bool enable)\n"
+        "{\n"
+        "#ifdef ADVUI_HIL\n"
+        "    (void)enable;\n"
+        "    return; // advui-inject-hil-no-stock-ble: no BLE advertising or PhoneAPI in release HIL\n"
+        "#endif\n"
+    )
+    try:
+        body = source.read_text(encoding="utf-8")
+    except OSError as exc:
+        raise HilError(f"cannot validate synced stock-BLE HIL guard: {exc}") from exc
+    if body.count("advui-inject-hil-no-stock-ble") != 1 or body.count(expected) != 1:
+        raise HilError("synced stock-BLE HIL guard is missing, duplicated, or misplaced")
+
+
 def build(release: bool = False) -> None:
     run_checked(["bash", "scripts/sync-overlay.sh"])
+    validate_hil_stock_ble_guard()
     env_name = RELEASE_ENV if release else HIL_ENV
     if not release:
         reuse_release_dependencies()
@@ -649,60 +687,264 @@ def flash(
 
 
 def capture_config_fingerprint(
-    fixture: dict[str, object], temporary_root: Path, label: str
+    fixture: dict[str, object], temporary_root: Path, label: str, preserve: Path | None = None
 ) -> bytes:
-    """Export a stable DUT config fingerprint without retaining secret material."""
-    device = resolve_role(fixture, "dut")
+    """Export a stable DUT config fingerprint and optionally retain one private backup."""
+    if not re.fullmatch(r"[A-Za-z0-9_-]+", label):
+        raise HilError("unsafe configuration export label")
     environment = dict(os.environ)
+    environment["MESHTASTIC_CLI"] = find_meshtastic_cli()
     # Match backup-node.sh's field-proven retry policy. A self-hosted runner can
     # tune either value downward, but the outer timeout remains an absolute cap.
     environment.setdefault("MESHTASTIC_BACKUP_ATTEMPTS", "4")
     environment.setdefault("MESHTASTIC_BACKUP_TIMEOUT", "90")
     previous: bytes | None = None
     for sample in range(1, 4):
+        device = resolve_role(fixture, "dut")
+        sample_port = str(device["port"])
         destination = temporary_root / f"{label}-{sample}"
         try:
-            result = subprocess.run(
-                [
-                    "bash",
-                    str(ROOT / "scripts/backup-node.sh"),
-                    "--port",
-                    str(device["port"]),
-                    "--out",
-                    str(destination),
-                ],
-                cwd=ROOT,
-                env=environment,
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-                check=False,
-                timeout=480,
-            )
-        except subprocess.TimeoutExpired as exc:
-            raise HilError("verified node configuration export timed out") from exc
-        except OSError as exc:
-            raise HilError("verified node configuration export could not start") from exc
+            try:
+                result = subprocess.run(
+                    [
+                        "bash",
+                        str(ROOT / "scripts/backup-node.sh"),
+                        "--port",
+                        sample_port,
+                        "--out",
+                        str(destination),
+                    ],
+                    cwd=ROOT,
+                    env=environment,
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                    check=False,
+                    timeout=480,
+                )
+            except subprocess.TimeoutExpired as exc:
+                raise HilError("verified node configuration export timed out") from exc
+            except OSError as exc:
+                raise HilError("verified node configuration export could not start") from exc
 
-        exports = sorted(destination.glob("config-*.yaml"))
-        if result.returncode != 0 or len(exports) != 1:
-            raise HilError("verified node configuration export failed")
-        exported = exports[0]
-        try:
-            mode = stat.S_IMODE(exported.stat().st_mode)
-            payload = exported.read_bytes()
-        except OSError as exc:
-            raise HilError("verified node configuration export could not be read") from exc
-        if mode & 0o077:
-            raise HilError("verified node configuration export has unsafe permissions")
-        if not payload:
-            raise HilError("verified node configuration export is empty")
+            verified = resolve_role(fixture, "dut")
+            if str(verified["port"]) != sample_port:
+                raise HilError("identity-bound DUT port changed during configuration export")
+
+            exports = sorted(destination.glob("config-*.yaml"))
+            if result.returncode != 0 or len(exports) != 1:
+                raise HilError("verified node configuration export failed")
+            exported = exports[0]
+            try:
+                mode = stat.S_IMODE(exported.stat().st_mode)
+                payload = exported.read_bytes()
+            except OSError as exc:
+                raise HilError("verified node configuration export could not be read") from exc
+            if mode & 0o077:
+                raise HilError("verified node configuration export has unsafe permissions")
+            if not payload:
+                raise HilError("verified node configuration export is empty")
+        finally:
+            if destination.is_symlink():
+                raise HilError("configuration export directory became a symlink")
+            try:
+                shutil.rmtree(destination)
+            except FileNotFoundError:
+                pass
+            except OSError as exc:
+                raise HilError("private configuration export cleanup failed") from exc
 
         digest = hashlib.sha256(stable_config_payload(payload)).digest()
         if digest == previous:
+            if preserve is not None:
+                flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
+                if hasattr(os, "O_NOFOLLOW"):
+                    flags |= os.O_NOFOLLOW
+                try:
+                    descriptor = os.open(preserve, flags, 0o600)
+                except OSError as exc:
+                    raise HilError("configuration backup destination is not exclusive") from exc
+                try:
+                    with os.fdopen(descriptor, "wb") as output:
+                        output.write(payload)
+                        output.flush()
+                        os.fsync(output.fileno())
+                    os.chmod(preserve, 0o600)
+                    validate_config_backup(preserve)
+                except Exception:
+                    preserve.unlink(missing_ok=True)
+                    raise
             return digest
         previous = digest
 
     raise HilError("verified node configuration export was not stable")
+
+
+def prepare_config_backup_destination(artifacts: Path, requested: Path | None) -> Path:
+    """Choose a private, non-overwriting backup path before hardware is touched."""
+    github_actions = os.environ.get("GITHUB_ACTIONS", "").lower() == "true"
+    if github_actions and requested is None:
+        raise HilError("GitHub Actions HIL requires an external configuration backup destination")
+
+    if requested is None:
+        parent = artifacts / "private"
+        if parent.is_symlink():
+            raise HilError("local configuration backup directory is a symlink")
+        if parent.exists():
+            if not parent.is_dir() or parent.stat().st_uid != os.getuid():
+                raise HilError("local configuration backup directory is unsafe")
+        else:
+            parent.mkdir(parents=True, mode=0o700)
+        os.chmod(parent, 0o700)
+        destination = parent / "config-before.yaml"
+    else:
+        destination = requested
+        if not destination.is_absolute() or destination.suffix != ".yaml":
+            raise HilError("configuration backup destination must be an absolute .yaml path")
+        parent = destination.parent
+        if not parent.is_dir() or parent.is_symlink():
+            raise HilError("configuration backup parent must be an existing real directory")
+        parent_stat = parent.stat()
+        if parent_stat.st_uid != os.getuid() or stat.S_IMODE(parent_stat.st_mode) & 0o077:
+            raise HilError("configuration backup parent is not owner-only")
+
+    resolved = destination.resolve(strict=False)
+    if github_actions:
+        for variable in ("GITHUB_WORKSPACE", "RUNNER_TEMP"):
+            value = os.environ.get(variable)
+            if not value:
+                raise HilError(f"{variable} is required to validate the recovery vault")
+            unsafe_root = Path(value).resolve()
+            if resolved == unsafe_root or unsafe_root in resolved.parents:
+                raise HilError("configuration backup destination is inside an ephemeral job directory")
+
+    if destination.exists() or destination.is_symlink():
+        raise HilError("configuration backup destination already exists")
+    return destination
+
+
+def configuration_temporary_directory(prefix: str) -> tempfile.TemporaryDirectory[str]:
+    """Keep CI's transient private exports inside the runner-managed temp root."""
+    parent: Path | None = None
+    if os.environ.get("GITHUB_ACTIONS", "").lower() == "true":
+        value = os.environ.get("RUNNER_TEMP")
+        if not value:
+            raise HilError("RUNNER_TEMP is required for private configuration exports")
+        parent = Path(value)
+        if not parent.is_absolute() or parent.is_symlink() or not parent.is_dir():
+            raise HilError("RUNNER_TEMP is not a safe configuration export root")
+        if parent.stat().st_uid != os.getuid():
+            raise HilError("RUNNER_TEMP is not owned by the HIL runner")
+    return tempfile.TemporaryDirectory(prefix=prefix, dir=parent)
+
+
+def flash_marker_for(configuration_backup: Path) -> Path:
+    return configuration_backup.parent / "hil-flash-started"
+
+
+def flash_marker_payload(configuration_backup: Path, release_image: Path) -> bytes:
+    backup = validate_config_backup(configuration_backup)
+    image = validate_app_image(release_image)
+    payload = {
+        "schema": 2,
+        "backup": backup.name,
+        "sha256": hashlib.sha256(backup.read_bytes()).hexdigest(),
+        "release_app_sha256": hashlib.sha256(image.read_bytes()).hexdigest(),
+        "release_app_size": image.stat().st_size,
+    }
+    return (json.dumps(payload, sort_keys=True, separators=(",", ":")) + "\n").encode()
+
+
+def write_flash_marker(configuration_backup: Path, release_image: Path) -> Path:
+    backup = validate_config_backup(configuration_backup)
+    image = validate_app_image(release_image)
+    marker = flash_marker_for(backup)
+    payload = flash_marker_payload(backup, image)
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    try:
+        descriptor = os.open(marker, flags, 0o600)
+    except OSError as exc:
+        raise HilError("HIL flash marker destination is not exclusive") from exc
+    with os.fdopen(descriptor, "wb") as output:
+        output.write(payload)
+        output.flush()
+        os.fsync(output.fileno())
+    return marker
+
+
+def validate_flash_marker(
+    marker: Path, configuration_backup: Path, release_image: Path
+) -> Path:
+    backup = validate_config_backup(configuration_backup)
+    image = validate_app_image(release_image)
+    expected = flash_marker_for(backup)
+    if marker.is_symlink() or not marker.is_file():
+        raise HilError("valid HIL flash marker is missing")
+    try:
+        resolved = marker.resolve(strict=True)
+        resolved_expected = expected.resolve(strict=True)
+    except OSError as exc:
+        raise HilError("valid HIL flash marker is missing") from exc
+    if resolved != resolved_expected:
+        raise HilError("valid HIL flash marker is missing")
+    if stat.S_IMODE(resolved.stat().st_mode) & 0o077:
+        raise HilError("HIL flash marker has unsafe permissions")
+    if resolved.read_bytes() != flash_marker_payload(backup, image):
+        raise HilError("HIL flash marker is invalid")
+    return resolved
+
+
+def validate_config_backup(path: Path) -> Path:
+    if path.is_symlink() or not path.is_file():
+        raise HilError("restorable node configuration backup is missing or unsafe")
+    resolved = path.resolve()
+    if stat.S_IMODE(resolved.stat().st_mode) & 0o077:
+        raise HilError("restorable node configuration backup has unsafe permissions")
+    payload = resolved.read_bytes()
+    if not 1 <= len(payload) <= 2_000_000:
+        raise HilError("restorable node configuration backup has an invalid size")
+    required = (b"channel_url:", b"\nconfig:\n", b"\nmodule_config:\n", b"\nowner:")
+    if any(token not in b"\n" + payload for token in required) or not re.search(
+        rb"(?m)^\s+privateKey:\s+\S{16,}\s*$", payload
+    ):
+        raise HilError("restorable node configuration backup is incomplete")
+    return resolved
+
+
+def restore_config_backup(fixture: dict[str, object], backup: Path) -> None:
+    """Apply a previously validated full export to the identity-bound DUT only."""
+    backup = validate_config_backup(backup)
+    device = resolve_role(fixture, "dut")
+    expected_mac = str(device["usb_serial"])
+    live = wait_for_usb_serial(expected_mac)
+    cli = find_meshtastic_cli()
+    result = subprocess.run(
+        [cli, "--port", str(live["port"]), "--configure", str(backup)],
+        cwd=ROOT,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        timeout=300,
+        check=False,
+    )
+    if result.returncode != 0:
+        raise HilError("node configuration recovery command failed")
+    time.sleep(4)
+    wait_for_usb_serial(expected_mac, timeout=30)
+
+
+def recover_config_if_needed(fixture: dict[str, object], backup: Path, temporary_root: Path) -> bool:
+    """Restore config only after two stable exports prove a real drift."""
+    backup = validate_config_backup(backup)
+    expected = hashlib.sha256(stable_config_payload(backup.read_bytes())).digest()
+    current = capture_config_fingerprint(fixture, temporary_root, "recovery-check")
+    if current == expected:
+        return False
+    restore_config_backup(fixture, backup)
+    repaired = capture_config_fingerprint(fixture, temporary_root, "recovery-verify")
+    if repaired != expected:
+        raise HilError("node configuration still differs after recovery")
+    return True
 
 
 def stable_config_payload(payload: bytes) -> bytes:
@@ -1974,7 +2216,7 @@ def visual(fixture: dict[str, object], artifacts: Path, timeout: float) -> Repor
 
 def full_run(
     fixture: dict[str, object], artifacts: Path, timeout: float, skip_build: bool = False,
-    release_image: Path | None = None,
+    release_image: Path | None = None, config_backup: Path | None = None,
 ) -> int:
     """Run the complete safe suite and always put production firmware back."""
     exact_release = validate_app_image(release_image) if release_image is not None else None
@@ -1989,8 +2231,10 @@ def full_run(
     failure_type: str | None = None
     restore_failure_type: str | None = None
     configuration_preserved: bool | None = None
+    configuration_restored = False
     configuration_check_failure_type: str | None = None
-    with tempfile.TemporaryDirectory(prefix="meshtastic-adv-hil-config-") as temporary:
+    configuration_backup = prepare_config_backup_destination(artifacts, config_backup)
+    with configuration_temporary_directory("meshtastic-adv-hil-config-") as temporary:
         configuration_before: bytes | None = None
         staged_release: Path | None = None
         release_sha256: str | None = None
@@ -2001,12 +2245,15 @@ def full_run(
             staged_release, release_sha256 = stage_release_image(exact_release, Path(temporary))
             try:
                 configuration_before = capture_config_fingerprint(
-                    fixture, Path(temporary), "before"
+                    fixture, Path(temporary), "before", preserve=configuration_backup
                 )
             except Exception as exc:
                 configuration_check_failure_type = type(exc).__name__
                 raise
 
+            if staged_release is None:
+                raise HilError("production recovery image was not staged")
+            write_flash_marker(configuration_backup, staged_release)
             flash_attempted = True
             flash(fixture, release=False)
             before = smoke(fixture, artifacts / "smoke-before")
@@ -2043,7 +2290,17 @@ def full_run(
                         )
                         configuration_preserved = configuration_before == configuration_after
                         if not configuration_preserved:
-                            raise HilError("node configuration changed across HIL")
+                            print("restoring verified node configuration backup", flush=True)
+                            restore_config_backup(fixture, configuration_backup)
+                            repaired = capture_config_fingerprint(
+                                fixture, Path(temporary), "after-recovery"
+                            )
+                            configuration_restored = configuration_before == repaired
+                            if not configuration_restored:
+                                raise HilError("node configuration changed across HIL and recovery failed")
+                            # Recovery protects the lab device; it must not turn a
+                            # destructive firmware regression into a green release.
+                            raise HilError("node configuration changed across HIL; verified backup restored")
                     except Exception as exc:
                         configuration_check_failure_type = type(exc).__name__
                         configuration_error = exc
@@ -2057,6 +2314,7 @@ def full_run(
                 "production_restored": restored,
                 "restore_failure_type": restore_failure_type,
                 "configuration_preserved": configuration_preserved,
+                "configuration_restored": configuration_restored,
                 "configuration_check_failure_type": configuration_check_failure_type,
             }
             if release_sha256 is not None:
@@ -2104,6 +2362,19 @@ def make_parser() -> argparse.ArgumentParser:
                             ("restore", "flash production firmware back to the DUT")):
         cmd = commands.add_parser(name, help=help_text)
         cmd.add_argument("--fixture", type=Path, default=ROOT / "hil/fixture.local.json")
+        if name == "restore":
+            cmd.add_argument(
+                "--image", type=Path,
+                help="exact validated production app image (for cancellation recovery)",
+            )
+            cmd.add_argument(
+                "--config-backup", type=Path,
+                help="private full export to compare and restore only if drift is proven",
+            )
+            cmd.add_argument(
+                "--flash-marker", type=Path,
+                help="durable proof that HIL started after a verified backup",
+            )
         cmd.set_defaults(release=name == "restore")
 
     smoke_cmd = commands.add_parser("smoke", help="run fast state/render HIL checks")
@@ -2127,6 +2398,10 @@ def make_parser() -> argparse.ArgumentParser:
     run_cmd.add_argument(
         "--release-image", type=Path,
         help="exact production app image to restore after HIL (the release artifact's app bytes)",
+    )
+    run_cmd.add_argument(
+        "--config-backup", type=Path,
+        help="exclusive private backup destination outside the CI checkout/temp directories",
     )
     return parser
 
@@ -2183,7 +2458,21 @@ def main() -> int:
             return 0
         fixture = load_fixture(args.fixture)
         if args.command in ("flash", "restore"):
-            flash(fixture, args.release)
+            image = validate_app_image(args.image) if args.command == "restore" and args.image else None
+            if args.command == "restore" and bool(args.config_backup) != bool(args.flash_marker):
+                raise HilError("configuration backup and HIL flash marker must be supplied together")
+            if args.command == "restore" and args.config_backup:
+                if image is None:
+                    raise HilError("--image is required for interrupted-HIL recovery")
+                validate_config_backup(args.config_backup)
+                validate_flash_marker(args.flash_marker, args.config_backup, image)
+            flash(fixture, args.release, image_override=image)
+            if args.command == "restore" and args.config_backup:
+                with configuration_temporary_directory("meshtastic-adv-hil-recovery-") as temporary:
+                    recovered = recover_config_if_needed(
+                        fixture, args.config_backup, Path(temporary)
+                    )
+                print(f"configuration recovery: {'restored' if recovered else 'already exact'}")
             return 0
         if args.command == "smoke":
             artifacts = args.artifacts or default_artifacts("smoke")
@@ -2203,7 +2492,8 @@ def main() -> int:
         if args.command == "run":
             artifacts = args.artifacts or default_artifacts("full")
             failures = full_run(
-                fixture, artifacts, args.timeout, args.skip_build, release_image=args.release_image
+                fixture, artifacts, args.timeout, args.skip_build,
+                release_image=args.release_image, config_backup=args.config_backup,
             )
             print(f"artifacts: {artifacts}")
             return 1 if failures else 0

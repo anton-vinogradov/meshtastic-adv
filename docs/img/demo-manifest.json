@@ -1,0 +1,145 @@
+{
+  "schema": 1,
+  "story_sha256": "cace6819fd6bce216d03b16a17013fe55484cbdcb13246975430605aa8bc8e4c",
+  "mockup_sha256": "e008a01938df4a1810ae7b49aa849b9108b10ab13d560a21066be4bcb8b9c2e1",
+  "photo_sha256": "778c035d9259dac18b2eee4aefb44b498694ba7041affd352fe704d1c11f54f5",
+  "frames": [
+    {
+      "name": "a01",
+      "label": "chats-unread",
+      "delay_ms": 1600,
+      "sha256": "390c10265b74872afc699e566157e00434cc1f7d4b419e216393a1b5aa1880b8"
+    },
+    {
+      "name": "a02",
+      "label": "open-first-unread",
+      "delay_ms": 1200,
+      "sha256": "fb04091967a307b9cc4b39b40be88bf7fdf003186d7c366f994c9629cf66fc9d"
+    },
+    {
+      "name": "a03",
+      "label": "compose-o",
+      "delay_ms": 220,
+      "sha256": "f74852d875c26f580b97da66840788c1deebae50d77ff9a80688bc436bc4be2f"
+    },
+    {
+      "name": "a04",
+      "label": "compose-on-m",
+      "delay_ms": 220,
+      "sha256": "bca269e9873208d87533daf4b82a4d6190a3aa19afd0fafd95f4abc0eb55da69"
+    },
+    {
+      "name": "a05",
+      "label": "compose-on-my-w",
+      "delay_ms": 220,
+      "sha256": "820ad4816374e35ba0aa64c6d561fa00df1f4f5b5c93d8d770d971cb18b61461"
+    },
+    {
+      "name": "a06",
+      "label": "compose-on-my-way",
+      "delay_ms": 400,
+      "sha256": "2d89914c19a1c3580f792a2d8b142317848d3a6dd80aa90d21a7d1898abcc9b9"
+    },
+    {
+      "name": "a07",
+      "label": "emoji-palette",
+      "delay_ms": 900,
+      "sha256": "0d9a3a36abc57ad5b49cd1811b46c2845bc07a510206be9531b4ff8c2c611917"
+    },
+    {
+      "name": "a08",
+      "label": "compose-with-emoji",
+      "delay_ms": 600,
+      "sha256": "0e4e71b4309bed745fed71dd61216ff98c6b7ec3c3a5cd3c3839c5de843265ac"
+    },
+    {
+      "name": "a09",
+      "label": "sent-pending",
+      "delay_ms": 900,
+      "sha256": "3866a50dd60bf837aef46e76e3312dc23511a697b11589361de2dc7b5e2a026a"
+    },
+    {
+      "name": "a10",
+      "label": "routing-ack",
+      "delay_ms": 1100,
+      "sha256": "ed858f6797be9a7ab0979ffb1cb1eaa1d2647240b6886fef682395bf4b69755d"
+    },
+    {
+      "name": "a11",
+      "label": "incoming-reply",
+      "delay_ms": 1500,
+      "sha256": "af094f11b5866cfa9719190f983f5ef4daf3017af891ae78c5020b03dc78f1c3"
+    },
+    {
+      "name": "a12",
+      "label": "reaction-picker",
+      "delay_ms": 900,
+      "sha256": "a50d6a7b349ed0845de55278b87e3e2249fb3e91c47afd5106f39548c82db4ec"
+    },
+    {
+      "name": "a13",
+      "label": "reaction-applied",
+      "delay_ms": 1100,
+      "sha256": "1a5ad29f1c53c3ff015a762051c366b85a5ac91bead001ccc1ee842d0cab254b"
+    },
+    {
+      "name": "a14",
+      "label": "quoted-compose-start",
+      "delay_ms": 600,
+      "sha256": "ca655505e7e4a56d3e9200f0974a69389897b0aa1a757714ef6a2f4d04f84a58"
+    },
+    {
+      "name": "a15",
+      "label": "quoted-compose-cyrillic",
+      "delay_ms": 300,
+      "sha256": "6bbe79da9762146621748ffb68daf95b9cc3cb56b358c7b5aa17486f5936f81f"
+    },
+    {
+      "name": "a16",
+      "label": "quoted-compose-complete",
+      "delay_ms": 700,
+      "sha256": "2ed1afe451819661cb3fc437abea554fa6c3e9caf93c07b23b2f31241ddb4f90"
+    },
+    {
+      "name": "a17",
+      "label": "quoted-reply-pending",
+      "delay_ms": 800,
+      "sha256": "5d4146c3c43cc02429b73ff3f2dcef39cde32b1434d56d1503f3850c791f49ad"
+    },
+    {
+      "name": "a18",
+      "label": "quoted-reply-delivered",
+      "delay_ms": 1100,
+      "sha256": "4da574351eaaa7ebe945b9bf364dccd7ad7942964e0a0c2d0874716630fbac68"
+    },
+    {
+      "name": "a19",
+      "label": "chats-updated",
+      "delay_ms": 1800,
+      "sha256": "e38264dbbc4eb03fb7e5dc089206abd33a6fffa5d4f03a1573bfdc98cf8acd1f"
+    }
+  ],
+  "outputs": {
+    "hero": {
+      "filename": "hero.gif",
+      "sha256": "3fa23ceffba3cde3c096444171154ff7ce81274406b153a9384b1b29d40d8768",
+      "bytes": 405729,
+      "width": 900,
+      "height": 600
+    },
+    "screen": {
+      "filename": "demo.gif",
+      "sha256": "26ee131a27ec1cbf4493ad4dcddf4df02b4b8a8adce2a5975e34390c60be8ccc",
+      "bytes": 168315,
+      "width": 960,
+      "height": 540
+    },
+    "poster": {
+      "filename": "hero.png",
+      "sha256": "91ae5ea992f63d8da03655f4d23fe2aaaacf649af94ae58a94708e87a2877f37",
+      "bytes": 361799,
+      "width": 900,
+      "height": 600
+    }
+  }
+}

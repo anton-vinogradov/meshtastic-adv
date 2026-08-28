@@ -5,7 +5,51 @@ release notes remain available on the [GitHub Releases page](https://github.com/
 
 ## [Unreleased]
 
-No user-visible changes are pending after 1.0.4.
+No user-visible changes are pending after 1.0.5.
+
+## [1.0.5] - 2026-08-28
+
+### Added
+
+- Every tagged release now records a deterministic 19-frame conversation on the
+  real firmware: unread navigation, typing, emoji, send status, routing ACK,
+  incoming reply, reaction and a quoted Cyrillic reply. The release publishes a
+  device-composited hero GIF and a screen-focused GIF for the website, GitHub and
+  community posts.
+- Public HIL evidence is staged through a fail-closed privacy boundary. Raw
+  framebuffer captures stay on the trusted runner; uploaded text is redacted for
+  fixture identities, serial paths, local IPv4/IPv6 addresses, node IDs and
+  user-scoped home/temp paths, while generated media is hash-bound to the exact
+  tag, source frames, timing, mockup and device image. Text evidence also has
+  per-file and total byte budgets.
+
+### Changed
+
+- The project website is now a responsive, keyboard-accessible product page with
+  a clearer standalone/companion explanation, safety warnings before flashing,
+  user-controlled animation, release-confidence details and concise
+  troubleshooting. Legacy screenshots containing lab identities and a stale
+  RU/20 example are no longer published or embedded.
+- The release HIL visual matrix grows from 29 to 35 real framebuffer captures.
+  Interface documentation now describes the narrow Meshtastic integration
+  patches and channel acknowledgement semantics precisely, and the M5Burner card
+  avoids a time-sensitive release-cadence claim.
+- A public GitHub Release is now the final distribution marker: assets remain in
+  a draft until M5Burner and the exact-byte web installer/media postconditions
+  pass. Every external publication rechecks that the remote tag still peels to
+  the exact workflow commit, making a moved tag fail closed.
+
+### Fixed
+
+- Interrupted physical HIL recovery now keeps the verified node configuration in
+  an owner-only per-run vault outside checkout/temp cleanup, binds a durable
+  flash marker to that backup's filename and SHA-256, and refuses recovery
+  without the exact tagged app image. Export and restore use the same pinned
+  Meshtastic CLI and re-resolve the Cardputer identity around every export;
+  transient private samples are removed immediately.
+- The self-hosted fixture is attempt-scoped and created with exclusive,
+  no-symlink semantics. Successful HIL/recovery removes only the current attempt;
+  failed recovery retains its private vault with a documented repair runbook.
 
 ## [1.0.4] - 2026-08-28
 
@@ -120,7 +164,8 @@ The 1.0 release line delivered the following product and release-engineering sco
   cannot reuse stale output, and prereleases cannot enter stable distribution
   channels.
 
-[Unreleased]: https://github.com/anton-vinogradov/meshtastic-adv/compare/v1.0.4...HEAD
+[Unreleased]: https://github.com/anton-vinogradov/meshtastic-adv/compare/v1.0.5...HEAD
+[1.0.5]: https://github.com/anton-vinogradov/meshtastic-adv/compare/v1.0.4...v1.0.5
 [1.0.4]: https://github.com/anton-vinogradov/meshtastic-adv/compare/v1.0.3...v1.0.4
 [1.0.3]: https://github.com/anton-vinogradov/meshtastic-adv/compare/v1.0.2...v1.0.3
 [1.0.2]: https://github.com/anton-vinogradov/meshtastic-adv/compare/v0.5.2...v1.0.2

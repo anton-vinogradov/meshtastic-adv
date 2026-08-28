@@ -101,6 +101,39 @@ esac
         self.assertIn("$REPO_ROOT/hil-artifacts/backups/", script)
         self.assertNotIn("/claude/meshtastic-backups", script)
 
+    def test_invalid_explicit_cli_fails_instead_of_falling_back_to_path(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            port = root / "serial-port"
+            port.touch()
+            fallback = root / "meshtastic"
+            fallback.write_text("#!/bin/sh\ntouch \"$FALLBACK_USED\"\nexit 0\n")
+            fallback.chmod(0o700)
+            used = root / "fallback-used"
+            result = subprocess.run(
+                [
+                    "bash", str(SCRIPT), "--port", str(port), "--cli",
+                    str(root / "missing-cli"), "--out", str(root / "backup"),
+                ],
+                cwd=ROOT,
+                env={
+                    **os.environ,
+                    "PATH": f"{root}:{os.environ.get('PATH', '')}",
+                    "FALLBACK_USED": str(used),
+                },
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+        self.assertEqual(result.returncode, 2)
+        self.assertIn("MESHTASTIC_CLI is not executable", result.stderr)
+        self.assertFalse(used.exists())
+
+    def test_default_cli_comes_from_path_not_a_legacy_home_venv(self):
+        script = SCRIPT.read_text()
+        self.assertNotIn(".pio-core-venv", script)
+        self.assertIn("command -v meshtastic", script)
+
 
 if __name__ == "__main__":
     unittest.main()

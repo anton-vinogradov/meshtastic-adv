@@ -21,7 +21,7 @@ PORT="${MESHTASTIC_PORT:-}"
 HOST="${MESHTASTIC_HOST:-}"
 REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 OUT="${MESHTASTIC_BACKUP_DIR:-$REPO_ROOT/hil-artifacts/backups/$(date +%F)}"
-CLI="${MESHTASTIC_CLI:-$HOME/.pio-core-venv/bin/meshtastic}"
+CLI="${MESHTASTIC_CLI:-}"
 ATTEMPTS="${MESHTASTIC_BACKUP_ATTEMPTS:-4}"
 TIMEOUT="${MESHTASTIC_BACKUP_TIMEOUT:-90}"
 
@@ -63,8 +63,12 @@ else
     CONN=(--host "$HOST")
 fi
 
-[ -x "$CLI" ] || CLI=meshtastic
-command -v "$CLI" >/dev/null 2>&1 || { echo "meshtastic CLI not found (set MESHTASTIC_CLI)" >&2; exit 2; }
+if [ -n "$CLI" ]; then
+    [ -x "$CLI" ] || { echo "MESHTASTIC_CLI is not executable" >&2; exit 2; }
+else
+    CLI="$(command -v meshtastic || true)"
+    [ -n "$CLI" ] || { echo "meshtastic CLI not found (set MESHTASTIC_CLI)" >&2; exit 2; }
+fi
 command -v perl >/dev/null 2>&1 || { echo "perl is required to enforce backup timeouts" >&2; exit 2; }
 
 mkdir -p "$OUT"

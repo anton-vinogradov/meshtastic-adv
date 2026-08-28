@@ -1,0 +1,50 @@
+{
+  "schema": 1,
+  "source": {
+    "width": 720,
+    "height": 405
+  },
+  "frames": [
+    { "name": "a01", "label": "chats-unread", "delay_ms": 1600 },
+    { "name": "a02", "label": "open-first-unread", "delay_ms": 1200 },
+    { "name": "a03", "label": "compose-o", "delay_ms": 220 },
+    { "name": "a04", "label": "compose-on-m", "delay_ms": 220 },
+    { "name": "a05", "label": "compose-on-my-w", "delay_ms": 220 },
+    { "name": "a06", "label": "compose-on-my-way", "delay_ms": 400 },
+    { "name": "a07", "label": "emoji-palette", "delay_ms": 900 },
+    { "name": "a08", "label": "compose-with-emoji", "delay_ms": 600 },
+    { "name": "a09", "label": "sent-pending", "delay_ms": 900 },
+    { "name": "a10", "label": "routing-ack", "delay_ms": 1100 },
+    { "name": "a11", "label": "incoming-reply", "delay_ms": 1500 },
+    { "name": "a12", "label": "reaction-picker", "delay_ms": 900 },
+    { "name": "a13", "label": "reaction-applied", "delay_ms": 1100 },
+    { "name": "a14", "label": "quoted-compose-start", "delay_ms": 600 },
+    { "name": "a15", "label": "quoted-compose-cyrillic", "delay_ms": 300 },
+    { "name": "a16", "label": "quoted-compose-complete", "delay_ms": 700 },
+    { "name": "a17", "label": "quoted-reply-pending", "delay_ms": 800 },
+    { "name": "a18", "label": "quoted-reply-delivered", "delay_ms": 1100 },
+    { "name": "a19", "label": "chats-updated", "delay_ms": 1800 }
+  ],
+  "outputs": {
+    "hero": {
+      "filename": "hero.gif",
+      "width": 900,
+      "height": 600,
+      "max_bytes": 2000000
+    },
+    "screen": {
+      "filename": "demo.gif",
+      "width": 960,
+      "height": 540,
+      "max_bytes": 2000000
+    },
+    "poster": {
+      "filename": "hero.png",
+      "width": 900,
+      "height": 600,
+      "max_bytes": 1000000
+    }
+  },
+  "poster_frame": "a19",
+  "max_duration_ms": 18000
+}

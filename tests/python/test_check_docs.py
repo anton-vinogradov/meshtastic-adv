@@ -1,3 +1,4 @@
+import hashlib
 import importlib.util
 import json
 import sys
@@ -33,6 +34,19 @@ class DocumentationTests(unittest.TestCase):
         manifest = json.loads((ROOT / "docs/img/demo-manifest.json").read_text())
         demo_hash = manifest["outputs"]["screen"]["sha256"]
         poster_hash = manifest["outputs"]["poster"]["sha256"]
+        script_hash = hashlib.sha256((ROOT / "docs/site.js").read_bytes()).hexdigest()
+        style_hash = hashlib.sha256((ROOT / "docs/site.css").read_bytes()).hexdigest()
+        installer_hash = hashlib.sha256((ROOT / "docs/installer.js").read_bytes()).hexdigest()
+        web_tools_hash = hashlib.sha256(
+            (ROOT / "docs/vendor/esp-web-tools/install-button.js").read_bytes()
+        ).hexdigest()
+        self.assertIn(f'src="./site.js?sha256={script_hash}"', site)
+        self.assertIn(f'href="./site.css?sha256={style_hash}"', site)
+        self.assertIn(f'src="./installer.js?sha256={installer_hash}"', site)
+        self.assertIn(
+            f'src="./vendor/esp-web-tools/install-button.js?sha256={web_tools_hash}"',
+            site,
+        )
         self.assertIn(f'src="./img/hero.png?sha256={poster_hash}"', site)
         self.assertIn(f'data-animation="./img/demo.gif?sha256={demo_hash}"', site)
         self.assertIn(f'data-poster="./img/hero.png?sha256={poster_hash}"', site)

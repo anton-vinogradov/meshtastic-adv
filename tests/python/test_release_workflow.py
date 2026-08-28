@@ -9,6 +9,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[2]
 WORKFLOW = (ROOT / ".github/workflows/build.yml").read_text()
 REPAIR_WORKFLOW = (ROOT / ".github/workflows/repair-m5burner.yml").read_text()
+FINISH_WORKFLOW = (ROOT / ".github/workflows/finish-release.yml").read_text()
 
 
 def job(name: str) -> str:
@@ -399,13 +400,13 @@ class ReleaseWorkflowTests(unittest.TestCase):
             self.assertIn("release tag is no longer reachable from current main", stage)
 
     def test_external_actions_and_python_installs_are_immutable(self):
-        for workflow in (WORKFLOW, REPAIR_WORKFLOW):
+        for workflow in (WORKFLOW, REPAIR_WORKFLOW, FINISH_WORKFLOW):
             for reference in re.findall(r"(?m)^\s+uses:\s+([^\s#]+)", workflow):
                 if reference.startswith("docker://"):
                     self.assertIn("@sha256:", reference)
                 else:
                     self.assertRegex(reference, r"@[0-9a-f]{40}$")
-        self.assertNotRegex(WORKFLOW, r"pip install ['\"]?[^\n]*[<>=]")
+            self.assertNotRegex(workflow, r"pip install ['\"]?[^\n]*[<>=]")
         self.assertEqual(WORKFLOW.count("pip install --require-hashes -r"), 3)
         self.assertEqual(WORKFLOW.count("pip install --require-hashes --no-deps"), 5)
 
@@ -432,6 +433,67 @@ class ReleaseWorkflowTests(unittest.TestCase):
         self.assertIn("python scripts/m5burner_publish.py", REPAIR_WORKFLOW)
         self.assertNotIn("gh release edit", REPAIR_WORKFLOW)
         self.assertNotIn("gh release upload", REPAIR_WORKFLOW)
+
+    def test_finish_workflow_resumes_only_an_exact_failed_stable_release(self):
+        self.assertIn("workflow_dispatch:", FINISH_WORKFLOW)
+        self.assertIn("actions: read", FINISH_WORKFLOW)
+        self.assertIn("contents: write", FINISH_WORKFLOW)
+        self.assertIn("group: meshtastic-adv-release-publish", FINISH_WORKFLOW)
+        self.assertIn("ref: ${{ github.sha }}", FINISH_WORKFLOW)
+        self.assertIn('test "$DISPATCH_REF" = refs/heads/main', FINISH_WORKFLOW)
+        self.assertIn('test "$(git rev-parse HEAD)" = "$DISPATCH_SHA"', FINISH_WORKFLOW)
+        self.assertGreaterEqual(
+            FINISH_WORKFLOW.count(
+                'test "$(git rev-parse refs/remotes/origin/main)" = "$DISPATCH_SHA"'
+            ),
+            3,
+        )
+        self.assertIn('.path == ".github/workflows/build.yml"', FINISH_WORKFLOW)
+        self.assertIn('.head_sha == $sha', FINISH_WORKFLOW)
+        self.assertIn('.name == "release-hil" and .conclusion == "success"', FINISH_WORKFLOW)
+        self.assertGreaterEqual(FINISH_WORKFLOW.count("run-id: ${{ inputs.source_run_id }}"), 2)
+        self.assertIn("promote|repair) ;;", FINISH_WORKFLOW)
+        self.assertIn('git -C firmware show "$tag_firmware:version.properties"', FINISH_WORKFLOW)
+        self.assertIn('.release_image_sha256', FINISH_WORKFLOW)
+        self.assertIn('f[0x10000:0x10000+len(a)] != a', FINISH_WORKFLOW)
+        self.assertIn('.summary.tests == (.cases | length)', FINISH_WORKFLOW)
+        self.assertIn(
+            '([.results[].name] | unique | length) == (.results | length)',
+            FINISH_WORKFLOW,
+        )
+        self.assertIn('.data.frames == 35 and .data.unique == 35', FINISH_WORKFLOW)
+        self.assertIn('test ! -e finish-hil/usb/visual/frames', FINISH_WORKFLOW)
+        self.assertIn("python scripts/m5burner_publish.py", FINISH_WORKFLOW)
+        self.assertGreaterEqual(
+            FINISH_WORKFLOW.count("--verify-existing-latest-only"), 2
+        )
+        self.assertNotIn("M5B_EMAIL", FINISH_WORKFLOW)
+        self.assertNotIn("M5B_PASSWORD", FINISH_WORKFLOW)
+        self.assertNotIn("/tmp/tag-source/scripts/m5burner_publish.py", FINISH_WORKFLOW)
+        self.assertNotIn("gh release create", FINISH_WORKFLOW)
+        self.assertNotIn("gh release upload", FINISH_WORKFLOW)
+        self.assertGreaterEqual(FINISH_WORKFLOW.count("--no-newer-stable"), 4)
+        self.assertIn("git commit --allow-empty", FINISH_WORKFLOW)
+        self.assertIn("steps.pages.outputs.site_commit", FINISH_WORKFLOW)
+        self.assertGreaterEqual(FINISH_WORKFLOW.count("--versions-index"), 3)
+        self.assertGreaterEqual(FINISH_WORKFLOW.count("--site-script"), 3)
+        self.assertGreaterEqual(FINISH_WORKFLOW.count("--installer"), 3)
+        self.assertGreaterEqual(FINISH_WORKFLOW.count("--web-tools-dir"), 3)
+        self.assertGreaterEqual(FINISH_WORKFLOW.count("--archive-tag"), 2)
+        m5 = FINISH_WORKFLOW.index("Verify the exact public M5Burner distribution")
+        site = FINISH_WORKFLOW.index("Promote or repair the exact web installer on main")
+        web = FINISH_WORKFLOW.index("Verify the exact public web installer and media")
+        publish = FINISH_WORKFLOW.index(
+            "Publish the exact GitHub draft as the final distribution marker"
+        )
+        self.assertLess(m5, site)
+        self.assertLess(site, web)
+        self.assertLess(web, publish)
+        final = FINISH_WORKFLOW[publish:]
+        first_edit = final.index('gh release edit "$FINISH_TAG" --draft=false')
+        self.assertLess(final.index("--attempts 1 --delay 0"), first_edit)
+        self.assertLess(final.index("--verify-existing-latest-only"), first_edit)
+        self.assertLess(final.index("steps.pages.outputs.site_commit"), first_edit)
 
     def test_release_tooling_excludes_fixed_python_vulnerabilities(self):
         for relative in ("hil/requirements.txt", "requirements/release.txt"):

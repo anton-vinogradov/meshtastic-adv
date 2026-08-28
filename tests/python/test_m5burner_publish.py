@@ -177,6 +177,91 @@ class M5BurnerPublisherTests(unittest.TestCase):
         self.assertEqual(session.updates, 0)
         self.assertEqual(session.publishes, 0)
 
+    def test_existing_latest_only_is_credential_free_and_read_only(self):
+        session = FakeSession([{"version": "1.0.1", "file": "ready.bin", "published": True}])
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            binary = root / "firmware.bin"
+            binary.write_bytes(b"firmware")
+            cover = root / "cover.png"
+            cover.write_bytes(png((5, 6, 10)))
+            with mock.patch.object(
+                m5.requests,
+                "get",
+                side_effect=self.public_get(session, b"firmware", cover.read_bytes()),
+                create=True,
+            ):
+                self.assertEqual(
+                    m5.verify_existing_latest(
+                        "1.0.1", binary, cover, "Meshtastic ADV", "fixture"
+                    ),
+                    "ready.bin",
+                )
+        self.assertEqual(session.uploads, 0)
+        self.assertEqual(session.updates, 0)
+        self.assertEqual(session.publishes, 0)
+
+    def test_existing_latest_only_rejects_missing_pending_or_historical_target(self):
+        cases = (
+            FakeSession(),
+            FakeSession([{"version": "1.0.1", "file": "pending.bin", "published": False}]),
+            FakeSession(
+                [
+                    {"version": "1.0.1", "file": "ready.bin", "published": True},
+                    {"version": "1.0.2", "file": "new.bin", "published": True},
+                ]
+            ),
+        )
+        for session in cases:
+            with self.subTest(versions=session.firmware["versions"]):
+                with tempfile.TemporaryDirectory() as directory:
+                    root = Path(directory)
+                    binary = root / "firmware.bin"
+                    binary.write_bytes(b"firmware")
+                    cover = root / "cover.png"
+                    cover.write_bytes(png((5, 6, 10)))
+                    with mock.patch.object(
+                        m5.requests,
+                        "get",
+                        side_effect=self.public_get(session, b"firmware", cover.read_bytes()),
+                        create=True,
+                    ):
+                        with self.assertRaisesRegex(RuntimeError, "not already public|not the latest"):
+                            m5.verify_existing_latest(
+                                "1.0.1", binary, cover, "Meshtastic ADV", "fixture"
+                            )
+                self.assertEqual(session.uploads, 0)
+                self.assertEqual(session.updates, 0)
+                self.assertEqual(session.publishes, 0)
+
+    def test_existing_latest_only_rechecks_catalog_after_asset_downloads(self):
+        current = FakeSession(
+            [{"version": "1.0.1", "file": "ready.bin", "published": True}]
+        ).public_firmware
+        newer = copy.deepcopy(current)
+        newer["versions"].append(
+            {"version": "1.0.2", "file": "new.bin", "published": True}
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            binary = root / "firmware.bin"
+            binary.write_bytes(b"firmware")
+            cover = root / "cover.png"
+            cover.write_bytes(png((5, 6, 10)))
+            with (
+                mock.patch.object(
+                    m5,
+                    "get_public_firmware",
+                    side_effect=(current, current, current, newer),
+                ),
+                mock.patch.object(m5, "verify_public_cover"),
+                mock.patch.object(m5, "verify_public_binary"),
+            ):
+                with self.assertRaisesRegex(RuntimeError, "not the latest"):
+                    m5.verify_existing_latest(
+                        "1.0.1", binary, cover, "Meshtastic ADV", "fixture"
+                    )
+
     def test_half_published_version_is_resumed_instead_of_skipped(self):
         session = FakeSession([{"version": "1.0.1", "file": "pending.bin", "published": False}])
         self.assertEqual(self.publish(session), "updated.bin")

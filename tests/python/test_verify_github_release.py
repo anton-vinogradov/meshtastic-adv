@@ -119,6 +119,19 @@ class GitHubReleaseVerifierTests(unittest.TestCase):
                         {"firmware.bin": asset}, notes, "either", False
                     )
 
+    def test_newer_public_stable_is_rejected_but_drafts_and_prereleases_are_ignored(self):
+        allowed = [
+            {"tag_name": "v1.2.4", "draft": True, "prerelease": False},
+            {"tag_name": "v2.0.0-rc.1", "draft": False, "prerelease": True},
+            {"tag_name": "v1.2.3", "draft": False, "prerelease": False},
+        ]
+        release.verify_no_newer_public_stable("v1.2.3", allowed)
+        with self.assertRaisesRegex(RuntimeError, "newer public stable"):
+            release.verify_no_newer_public_stable(
+                "v1.2.3",
+                allowed + [{"tag_name": "v1.10.0", "draft": False, "prerelease": False}],
+            )
+
 
 if __name__ == "__main__":
     unittest.main()

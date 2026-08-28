@@ -415,6 +415,48 @@ def publish(session, *, email, password, version, binary, cover, listing_title, 
     return file_id
 
 
+def verify_existing_latest(version, binary, cover, listing_title, listing_description):
+    """Verify one already-public latest stable without login or mutation."""
+    validate_cover(cover)
+    target_version = stable_version_tuple(version)
+    if target_version is None:
+        raise RuntimeError(f"invalid stable M5Burner version: {version!r}")
+
+    def require_latest(firmware):
+        verify_listing_metadata(firmware, listing_title, listing_description)
+        item = exact_version_by_name(firmware, version)
+        if not item or item.get("published") is not True or not item.get("file"):
+            raise RuntimeError(f"M5Burner version {version} is not already public")
+        published = [
+            parsed
+            for entry in firmware.get("versions") or []
+            if entry.get("published") is True
+            and (parsed := stable_version_tuple(entry.get("version"))) is not None
+        ]
+        if not published or max(published) != target_version:
+            raise RuntimeError(f"M5Burner version {version} is not the latest public stable")
+        return item
+
+    public = get_public_firmware()
+    item = require_latest(public)
+    file_id = item["file"]
+    verify_public_version(version, file_id)
+    public = get_public_firmware()
+    item = require_latest(public)
+    if item.get("file") != file_id:
+        raise RuntimeError("M5Burner latest file changed during verification")
+    cover_id = public.get("cover")
+    if not isinstance(cover_id, str) or not COVER_ID_RE.fullmatch(cover_id):
+        raise RuntimeError(f"unsafe M5Burner cover id: {cover_id!r}")
+    verify_public_cover(cover_id, cover)
+    verify_public_binary(file_id, binary)
+    public = get_public_firmware()
+    item = require_latest(public)
+    if item.get("file") != file_id or public.get("cover") != cover_id:
+        raise RuntimeError("M5Burner latest assets changed during verification")
+    return file_id
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--email", default=os.environ.get("M5B_EMAIL"))
@@ -423,7 +465,9 @@ def main():
     parser.add_argument("--bin", type=Path, help="merged image to upload")
     parser.add_argument("--cover", type=Path, help="1000x1000 PNG listing cover")
     parser.add_argument("--listing", required=True, type=Path, help="reviewed M5Burner title/body copy")
-    parser.add_argument("--check-listing-only", action="store_true")
+    mode = parser.add_mutually_exclusive_group()
+    mode.add_argument("--check-listing-only", action="store_true")
+    mode.add_argument("--verify-existing-latest-only", action="store_true")
     args = parser.parse_args()
 
     try:
@@ -431,6 +475,18 @@ def main():
         if args.check_listing_only:
             verify_listing_metadata(get_public_firmware(), listing_title, listing_description)
             print("M5Burner public listing matches the reviewed copy")
+            return
+        if args.verify_existing_latest_only:
+            if args.bin is None or args.cover is None or not args.version:
+                raise RuntimeError("M5Burner verification requires --version, --bin, and --cover")
+            file_id = verify_existing_latest(
+                args.version,
+                args.bin,
+                args.cover,
+                listing_title,
+                listing_description,
+            )
+            print(f"verified public M5Burner {args.version} as {file_id}")
             return
         if not args.email or not args.password:
             raise RuntimeError("M5Burner credentials are required via environment or CLI")

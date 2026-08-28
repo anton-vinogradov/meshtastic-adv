@@ -509,7 +509,14 @@ jobs:
               --image docs/img/hero.png \
               --url https://anton-vinogradov.github.io/meshtastic-adv/img/hero.png \
               --demo docs/img/demo.gif \
-              --poster docs/img/hero.png
+              --poster docs/img/hero.png \
+              --story /tmp/demo-story.json \
+              --site-script docs/site.js \
+              --stylesheet docs/site.css \
+              --installer docs/installer.js \
+              --web-tools-entry docs/vendor/esp-web-tools/install-button.js \
+              --readme README.md \
+              --readme README.ru.md
             cp docs/index.html /tmp/site-index.html
             tmp=$(mktemp)
             jq --arg v "$ver (advui · engine $engine)" '.version=$v' docs/manifest.json > "$tmp" && mv "$tmp" docs/manifest.json
@@ -519,7 +526,7 @@ jobs:
             cp docs/manifest.json "docs/versions/${GITHUB_REF_NAME}/manifest.json"
             cp docs/manifest.json /tmp/site-manifest.json
             python /tmp/check-installer.py --prune docs
-            git add docs/firmware.factory.bin docs/unifont.bin docs/manifest.json docs/index.html docs/versions \
+            git add README.md README.ru.md docs/firmware.factory.bin docs/unifont.bin docs/manifest.json docs/index.html docs/versions \
               docs/img/hero.gif docs/img/demo.gif docs/img/hero.png docs/img/m5burner-cover.png
             git add docs/img/demo-manifest.json
             if git diff --cached --quiet; then
@@ -563,12 +570,17 @@ jobs:
             --manifest /tmp/site-manifest.json \
             --firmware "$firmware" \
             --font "$font" \
+            --versions-index docs/versions/index.json \
             "${archive_args[@]}" \
             --hero "$hero" \
             --demo "$demo" \
             --poster "$poster" \
             --demo-manifest "$demo_manifest" \
-            --cover "$cover"
+            --cover "$cover" \
+            --site-script docs/site.js \
+            --stylesheet docs/site.css \
+            --installer docs/installer.js \
+            --web-tools-dir docs/vendor/esp-web-tools
 
       - name: Publish the GitHub release after every distribution gate
         env:

@@ -1,0 +1,470 @@
+name: finish failed stable release
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Existing stable release tag to finish
+        required: true
+        type: string
+      source_run_id:
+        description: Failed tag run whose successful artifacts must be reused
+        required: true
+        type: string
+
+permissions:
+  actions: read
+  contents: write
+
+concurrency:
+  group: meshtastic-adv-release-publish
+  queue: max
+  cancel-in-progress: false
+
+jobs:
+  finish:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          ref: ${{ github.sha }}
+          submodules: recursive
+
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: '3.11'
+
+      - name: Bind finishing to an exact failed stable tag run
+        id: source
+        env:
+          GH_TOKEN: ${{ github.token }}
+          DISPATCH_REF: ${{ github.ref }}
+          DISPATCH_SHA: ${{ github.sha }}
+          FINISH_TAG: ${{ inputs.tag }}
+          SOURCE_RUN_ID: ${{ inputs.source_run_id }}
+        run: |
+          test "$DISPATCH_REF" = refs/heads/main
+          case "$SOURCE_RUN_ID" in *[!0-9]*|'') echo "source_run_id must be numeric"; exit 2 ;; esac
+          tag_outputs=$(python scripts/release_tag.py "$FINISH_TAG")
+          printf '%s\n' "$tag_outputs" >> "$GITHUB_OUTPUT"
+          test "$(printf '%s\n' "$tag_outputs" | sed -n 's/^prerelease=//p')" = false
+          tag_commit=$(git rev-parse "$FINISH_TAG^{commit}")
+          echo "tag_commit=$tag_commit" >> "$GITHUB_OUTPUT"
+          python scripts/verify_release_ref.py --tag "$FINISH_TAG" --commit "$tag_commit"
+          git fetch --no-tags origin main:refs/remotes/origin/main
+          test "$(git rev-parse HEAD)" = "$DISPATCH_SHA"
+          test "$(git rev-parse refs/remotes/origin/main)" = "$DISPATCH_SHA"
+          git merge-base --is-ancestor "$tag_commit" refs/remotes/origin/main
+
+          run_json=$(mktemp)
+          jobs_json=$(mktemp)
+          gh api "repos/$GITHUB_REPOSITORY/actions/runs/$SOURCE_RUN_ID" > "$run_json"
+          gh api "repos/$GITHUB_REPOSITORY/actions/runs/$SOURCE_RUN_ID/jobs?per_page=100" > "$jobs_json"
+          jq -e --arg tag "$FINISH_TAG" --arg sha "$tag_commit" '
+            .event == "push" and .head_branch == $tag and .head_sha == $sha and
+            .path == ".github/workflows/build.yml" and .status == "completed" and
+            .conclusion == "failure"
+          ' "$run_json" >/dev/null
+          jq -e '
+            ([.jobs[] | select(.name == "host-tests" and .conclusion == "success")] | length) == 1 and
+            ([.jobs[] | select(.name == "firmware" and .conclusion == "success")] | length) == 1 and
+            ([.jobs[] | select(.name == "release-hil" and .conclusion == "success")] | length) == 1 and
+            ([.jobs[] | select(.name == "release" and .conclusion == "failure")] | length) == 1
+          ' "$jobs_json" >/dev/null
+
+          tag_firmware=$(git ls-tree "$FINISH_TAG" firmware | awk '{print $3}')
+          test -n "$tag_firmware"
+          git -C firmware cat-file -e "$tag_firmware^{commit}" 2>/dev/null || \
+            git -C firmware fetch --no-tags origin "$tag_firmware"
+          git -C firmware show "$tag_firmware:version.properties" > /tmp/tag-version.properties
+          engine=$(python -c 'import configparser; c=configparser.ConfigParser(); c.read("/tmp/tag-version.properties"); v=c["VERSION"]; print("{}.{}.{}".format(v["major"], v["minor"], v["build"]))')
+          echo "engine=$engine" >> "$GITHUB_OUTPUT"
+
+      - name: Download the exact firmware artifacts
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: firmware-factory
+          path: finish-firmware
+          repository: ${{ github.repository }}
+          run-id: ${{ inputs.source_run_id }}
+          github-token: ${{ github.token }}
+
+      - name: Download the exact privacy-safe HIL evidence
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: release-hil-evidence
+          path: finish-hil
+          repository: ${{ github.repository }}
+          run-id: ${{ inputs.source_run_id }}
+          github-token: ${{ github.token }}
+
+      - name: Rebuild and verify the exact tagged distribution
+        env:
+          GH_TOKEN: ${{ github.token }}
+          FINISH_TAG: ${{ inputs.tag }}
+        run: |
+          mkdir -p /tmp/tag-source
+          git archive "$FINISH_TAG" -- \
+            CHANGELOG.md docs/unifont.bin docs/img/demo-story.json \
+            docs/img/mockup.json docs/img/device.png docs/m5burner-card.txt \
+            requirements/pip.txt requirements/release.txt \
+            scripts/demo_media.py scripts/mkcover.py scripts/mkm5burner.sh \
+            scripts/release_notes.py scripts/release_tag.py \
+            | tar -x -C /tmp/tag-source
+          python -m pip install --require-hashes --no-deps \
+            -r /tmp/tag-source/requirements/pip.txt
+          python -m pip install --require-hashes \
+            -r /tmp/tag-source/requirements/release.txt
+          python /tmp/tag-source/scripts/demo_media.py verify \
+            --story /tmp/tag-source/docs/img/demo-story.json \
+            --mockup /tmp/tag-source/docs/img/mockup.json \
+            --photo /tmp/tag-source/docs/img/device.png \
+            --media finish-hil/media
+          test -z "$(find finish-hil -type l -print -quit)"
+          test ! -e finish-hil/usb/visual/frames
+          test -z "$(find finish-hil -type f \( -iname '*.yaml' -o -iname '*.yml' -o \
+            -iname '*.rgb332' -o -iname '*config-before*' \) -print -quit)"
+          test -z "$(find finish-hil -type f -iname '*.png' \
+            ! -path 'finish-hil/media/hero.png' -print -quit)"
+          jq -e '
+            .status == "passed" and .planned == (.results | length) and
+            ([.results[].name] | unique | length) == (.results | length) and
+            all(.results[]; .status == "passed" and .returncode == 0) and
+            (["syntax/python", "syntax/shell", "host/unit", "host/sanitizers",
+              "firmware/build-hil", "firmware/build-release", "firmware/size-release",
+              "firmware/size-hil", "hardware/usb-cardputer"] - [.results[].name] | length) == 0
+          ' finish-hil/report.json >/dev/null
+          jq -e '
+            .failures == 0 and .hil_flash_attempted == true and
+            .production_restored == true and .configuration_preserved == true
+          ' finish-hil/usb/summary.json >/dev/null
+          for suite in smoke-before message-flow visual smoke-after; do
+            jq -e '
+              .summary.tests == (.cases | length) and .summary.failures == 0 and
+              ([.cases[].name] | unique | length) == (.cases | length) and
+              all(.cases[]; .status == "passed")
+            ' "finish-hil/usb/$suite/report.json" >/dev/null
+          done
+          for suite in smoke-before smoke-after; do
+            jq -e '
+              (["boot/protocol/peripherals", "ui/home", "ui/nodes/search/back",
+                "ui/settings/section", "ui/wifi/mqtt/read-only", "ui/about",
+                "display/distinct-renders"] - [.cases[].name] | length) == 0
+            ' "finish-hil/usb/$suite/report.json" >/dev/null
+          done
+          jq -e '
+            (["ingress/incoming-unicode-dm", "ingress/reply-link",
+              "ingress/reaction-without-bubble", "ingress/channel-broadcast",
+              "ui/send-routing-filters-and-positive-ack",
+              "ui/failed-reply-resend-preserves-wire-link",
+              "ingress/malformed-protobuf-rejected", "companion/bounded-66-node-db-mirror",
+              "storage/live-ring-to-flash-archive", "display/injected-conversation-render",
+              "settings/ui-preferences-atomic-save", "storage/reboot-recovery",
+              "storage/legacy-avs4-reaction-migrates-conservatively"] -
+              [.cases[].name] | length) == 0
+          ' finish-hil/usb/message-flow/report.json >/dev/null
+          jq -e '
+            ([.cases[] | select(.name == "visual/demo-matrix" and
+              .data.frames == 35 and .data.unique == 35 and
+              .data.post_reboot.radio_tx == "0" and
+              .data.post_reboot.backend == "onboard" and
+              .data.post_reboot.mode == "chats")] | length) == 1
+          ' finish-hil/usb/visual/report.json >/dev/null
+
+          mapfile -t factories < <(find finish-firmware -type f -name '*.factory.bin' -print)
+          mapfile -t apps < <(find finish-firmware -type f \
+            -name 'firmware-*.bin' ! -name '*.factory.bin' -print)
+          test "${#factories[@]}" -eq 1
+          test "${#apps[@]}" -eq 1
+          expected_app_sha=$(jq -er \
+            '.release_image_sha256 | select(test("^[0-9a-f]{64}$"))' \
+            finish-hil/usb/summary.json)
+          test "$(sha256sum "${apps[0]}" | awk '{print $1}')" = "$expected_app_sha"
+          FACTORY="${factories[0]}" APP="${apps[0]}" python -c 'import os,pathlib,sys; f=pathlib.Path(os.environ["FACTORY"]).read_bytes(); a=pathlib.Path(os.environ["APP"]).read_bytes(); mismatch=not a or f[0x10000:0x10000+len(a)] != a; sys.exit("factory/app byte mismatch") if mismatch else None'
+          cp "${factories[0]}" "meshtastic-adv-${FINISH_TAG}.factory.bin"
+          cp /tmp/tag-source/docs/unifont.bin unifont.bin
+          cp finish-hil/media/hero.gif meshtastic-adv-hero.gif
+          cp finish-hil/media/demo.gif meshtastic-adv-demo.gif
+          python /tmp/tag-source/scripts/mkcover.py \
+            --source finish-hil/media/demo.gif --output /tmp/m5burner-cover.png
+          MESHTASTIC_FACTORY="${factories[0]}" \
+            MESHTASTIC_FONT=/tmp/tag-source/docs/unifont.bin \
+            MESHTASTIC_MERGED_OUT="$GITHUB_WORKSPACE/meshtastic-adv-cardputer-adv-merged.bin" \
+            MESHTASTIC_REPO_ROOT="$GITHUB_WORKSPACE" \
+            bash /tmp/tag-source/scripts/mkm5burner.sh "${FINISH_TAG#v}"
+          python /tmp/tag-source/scripts/release_notes.py "$FINISH_TAG" \
+            --changelog /tmp/tag-source/CHANGELOG.md --output /tmp/release-notes.md
+
+          python scripts/verify_github_release.py \
+            --tag "$FINISH_TAG" --state either \
+            --no-newer-stable \
+            --title "Meshtastic ADV $FINISH_TAG" --prerelease false \
+            --notes /tmp/release-notes.md \
+            --asset "meshtastic-adv-${FINISH_TAG}.factory.bin=meshtastic-adv-${FINISH_TAG}.factory.bin" \
+            --asset "unifont.bin=unifont.bin" \
+            --asset "meshtastic-adv-cardputer-adv-merged.bin=meshtastic-adv-cardputer-adv-merged.bin" \
+            --asset "meshtastic-adv-hero.gif=meshtastic-adv-hero.gif" \
+            --asset "meshtastic-adv-demo.gif=meshtastic-adv-demo.gif"
+
+      - name: Verify the exact public M5Burner distribution
+        env:
+          DISPATCH_SHA: ${{ github.sha }}
+          FINISH_TAG: ${{ inputs.tag }}
+        run: |
+          python scripts/verify_release_ref.py \
+            --tag "$FINISH_TAG" --commit "${{ steps.source.outputs.tag_commit }}"
+          git fetch --no-tags origin main:refs/remotes/origin/main
+          test "$(git rev-parse refs/remotes/origin/main)" = "$DISPATCH_SHA"
+          git merge-base --is-ancestor \
+            "${{ steps.source.outputs.tag_commit }}" refs/remotes/origin/main
+          python scripts/m5burner_publish.py \
+            --verify-existing-latest-only \
+            --version "${{ steps.source.outputs.version }}" \
+            --bin meshtastic-adv-cardputer-adv-merged.bin \
+            --cover /tmp/m5burner-cover.png \
+            --listing /tmp/tag-source/docs/m5burner-card.txt
+
+      - name: Promote or repair the exact web installer on main
+        id: site
+        env:
+          DISPATCH_SHA: ${{ github.sha }}
+          FINISH_TAG: ${{ inputs.tag }}
+        run: |
+          python scripts/verify_release_ref.py \
+            --tag "$FINISH_TAG" --commit "${{ steps.source.outputs.tag_commit }}"
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git fetch --no-tags origin main:refs/remotes/origin/main
+          test "$(git rev-parse refs/remotes/origin/main)" = "$DISPATCH_SHA"
+          git merge-base --is-ancestor \
+            "${{ steps.source.outputs.tag_commit }}" refs/remotes/origin/main
+          git checkout -B main origin/main
+
+          ver="${{ steps.source.outputs.version }}"
+          engine="${{ steps.source.outputs.engine }}"
+          site_mode=$(python scripts/site_release_mode.py \
+            --manifest docs/manifest.json --archives docs/versions \
+            --version "$ver" --retention-limit 6)
+          case "$site_mode" in
+            promote|repair) ;;
+            *) echo "release can no longer promote or repair the canonical site: $site_mode"; exit 1 ;;
+          esac
+          latest_tag=$(python scripts/site_release_mode.py \
+            --manifest docs/manifest.json --archives docs/versions \
+            --version "$ver" --retention-limit 6 --output latest-tag)
+          test "$latest_tag" = "$FINISH_TAG"
+
+          cp "meshtastic-adv-${FINISH_TAG}.factory.bin" docs/firmware.factory.bin
+          cp unifont.bin docs/unifont.bin
+          cp finish-hil/media/hero.gif docs/img/hero.gif
+          cp finish-hil/media/demo.gif docs/img/demo.gif
+          cp finish-hil/media/hero.png docs/img/hero.png
+          cp finish-hil/media/manifest.json docs/img/demo-manifest.json
+          cp /tmp/m5burner-cover.png docs/img/m5burner-cover.png
+          python scripts/update_social_image.py \
+            --html docs/index.html \
+            --image docs/img/hero.png \
+            --url https://anton-vinogradov.github.io/meshtastic-adv/img/hero.png \
+            --demo docs/img/demo.gif \
+            --poster docs/img/hero.png \
+            --story /tmp/tag-source/docs/img/demo-story.json \
+            --site-script docs/site.js \
+            --stylesheet docs/site.css \
+            --installer docs/installer.js \
+            --web-tools-entry docs/vendor/esp-web-tools/install-button.js \
+            --readme README.md \
+            --readme README.ru.md
+          tmp=$(mktemp)
+          jq --arg v "$ver (advui · engine $engine)" \
+            '.version=$v' docs/manifest.json > "$tmp"
+          mv "$tmp" docs/manifest.json
+          mkdir -p "docs/versions/$FINISH_TAG"
+          cp "meshtastic-adv-${FINISH_TAG}.factory.bin" \
+            "docs/versions/$FINISH_TAG/firmware.factory.bin"
+          cp unifont.bin "docs/versions/$FINISH_TAG/unifont.bin"
+          cp docs/manifest.json "docs/versions/$FINISH_TAG/manifest.json"
+          python scripts/check-installer.py --prune docs
+          cp docs/manifest.json /tmp/site-manifest.json
+          cp docs/index.html /tmp/site-index.html
+
+          git add README.md README.ru.md docs/firmware.factory.bin docs/unifont.bin docs/manifest.json \
+            docs/index.html docs/versions docs/img/hero.gif docs/img/demo.gif \
+            docs/img/hero.png docs/img/demo-manifest.json docs/img/m5burner-cover.png
+          if git diff --cached --quiet; then
+            echo "installer already contains $FINISH_TAG"
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+          else
+            git commit -m "ci: web installer image for $FINISH_TAG [skip ci]"
+            git push origin HEAD:main
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+          fi
+          echo "site_commit=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+
+      - name: Retrigger a stale or failed Pages deployment without changing site bytes
+        id: pages
+        env:
+          FINISH_TAG: ${{ inputs.tag }}
+        run: |
+          site_commit="${{ steps.site.outputs.site_commit }}"
+          if [ "${{ steps.site.outputs.changed }}" = false ]; then
+            if python scripts/verify_web_publish.py \
+              --base-url https://anton-vinogradov.github.io/meshtastic-adv/ \
+              --version "${{ steps.source.outputs.version }} (advui · engine ${{ steps.source.outputs.engine }})" \
+              --manifest /tmp/site-manifest.json \
+              --index /tmp/site-index.html \
+              --versions-index docs/versions/index.json \
+              --firmware "meshtastic-adv-${FINISH_TAG}.factory.bin" \
+              --font unifont.bin \
+              --hero finish-hil/media/hero.gif \
+              --demo finish-hil/media/demo.gif \
+              --poster finish-hil/media/hero.png \
+              --demo-manifest finish-hil/media/manifest.json \
+              --cover /tmp/m5burner-cover.png \
+              --site-script docs/site.js \
+              --stylesheet docs/site.css \
+              --installer docs/installer.js \
+              --web-tools-dir docs/vendor/esp-web-tools \
+              --attempts 1 --delay 0; then
+              echo "exact Pages deployment is already public"
+            else
+              git commit --allow-empty \
+                -m "ci: retry Pages for $FINISH_TAG [skip ci]"
+              git push origin HEAD:main
+              site_commit=$(git rev-parse HEAD)
+            fi
+          fi
+          echo "site_commit=$site_commit" >> "$GITHUB_OUTPUT"
+
+      - name: Verify the exact public web installer and media
+        env:
+          FINISH_TAG: ${{ inputs.tag }}
+        run: |
+          python scripts/verify_web_publish.py \
+            --base-url https://anton-vinogradov.github.io/meshtastic-adv/ \
+            --version "${{ steps.source.outputs.version }} (advui · engine ${{ steps.source.outputs.engine }})" \
+            --manifest /tmp/site-manifest.json \
+            --index /tmp/site-index.html \
+            --versions-index docs/versions/index.json \
+            --firmware "meshtastic-adv-${FINISH_TAG}.factory.bin" \
+            --font unifont.bin \
+            --hero finish-hil/media/hero.gif \
+            --demo finish-hil/media/demo.gif \
+            --poster finish-hil/media/hero.png \
+            --demo-manifest finish-hil/media/manifest.json \
+            --cover /tmp/m5burner-cover.png \
+            --site-script docs/site.js \
+            --stylesheet docs/site.css \
+            --installer docs/installer.js \
+            --web-tools-dir docs/vendor/esp-web-tools
+          python scripts/verify_web_publish.py \
+            --base-url https://anton-vinogradov.github.io/meshtastic-adv/ \
+            --archive-tag "$FINISH_TAG" \
+            --version "${{ steps.source.outputs.version }} (advui · engine ${{ steps.source.outputs.engine }})" \
+            --manifest /tmp/site-manifest.json \
+            --firmware "meshtastic-adv-${FINISH_TAG}.factory.bin" \
+            --font unifont.bin \
+            --hero finish-hil/media/hero.gif \
+            --demo finish-hil/media/demo.gif \
+            --poster finish-hil/media/hero.png \
+            --demo-manifest finish-hil/media/manifest.json \
+            --cover /tmp/m5burner-cover.png
+
+      - name: Publish the exact GitHub draft as the final distribution marker
+        env:
+          GH_TOKEN: ${{ github.token }}
+          FINISH_TAG: ${{ inputs.tag }}
+        run: |
+          python scripts/verify_release_ref.py \
+            --tag "$FINISH_TAG" --commit "${{ steps.source.outputs.tag_commit }}"
+          git fetch --no-tags origin main:refs/remotes/origin/main
+          test "$(git rev-parse refs/remotes/origin/main)" = \
+            "${{ steps.pages.outputs.site_commit }}"
+          git merge-base --is-ancestor \
+            "${{ steps.source.outputs.tag_commit }}" refs/remotes/origin/main
+          python scripts/verify_github_release.py \
+            --tag "$FINISH_TAG" --state either \
+            --no-newer-stable \
+            --title "Meshtastic ADV $FINISH_TAG" --prerelease false \
+            --notes /tmp/release-notes.md \
+            --asset "meshtastic-adv-${FINISH_TAG}.factory.bin=meshtastic-adv-${FINISH_TAG}.factory.bin" \
+            --asset "unifont.bin=unifont.bin" \
+            --asset "meshtastic-adv-cardputer-adv-merged.bin=meshtastic-adv-cardputer-adv-merged.bin" \
+            --asset "meshtastic-adv-hero.gif=meshtastic-adv-hero.gif" \
+            --asset "meshtastic-adv-demo.gif=meshtastic-adv-demo.gif"
+
+          python scripts/verify_web_publish.py \
+            --base-url https://anton-vinogradov.github.io/meshtastic-adv/ \
+            --version "${{ steps.source.outputs.version }} (advui · engine ${{ steps.source.outputs.engine }})" \
+            --manifest /tmp/site-manifest.json \
+            --index /tmp/site-index.html \
+            --versions-index docs/versions/index.json \
+            --firmware "meshtastic-adv-${FINISH_TAG}.factory.bin" \
+            --font unifont.bin \
+            --hero finish-hil/media/hero.gif \
+            --demo finish-hil/media/demo.gif \
+            --poster finish-hil/media/hero.png \
+            --demo-manifest finish-hil/media/manifest.json \
+            --cover /tmp/m5burner-cover.png \
+            --site-script docs/site.js \
+            --stylesheet docs/site.css \
+            --installer docs/installer.js \
+            --web-tools-dir docs/vendor/esp-web-tools \
+            --attempts 1 --delay 0
+          python scripts/verify_web_publish.py \
+            --base-url https://anton-vinogradov.github.io/meshtastic-adv/ \
+            --archive-tag "$FINISH_TAG" \
+            --version "${{ steps.source.outputs.version }} (advui · engine ${{ steps.source.outputs.engine }})" \
+            --manifest /tmp/site-manifest.json \
+            --firmware "meshtastic-adv-${FINISH_TAG}.factory.bin" \
+            --font unifont.bin \
+            --hero finish-hil/media/hero.gif \
+            --demo finish-hil/media/demo.gif \
+            --poster finish-hil/media/hero.png \
+            --demo-manifest finish-hil/media/manifest.json \
+            --cover /tmp/m5burner-cover.png \
+            --attempts 1 --delay 0
+          python scripts/m5burner_publish.py \
+            --verify-existing-latest-only \
+            --version "${{ steps.source.outputs.version }}" \
+            --bin meshtastic-adv-cardputer-adv-merged.bin \
+            --cover /tmp/m5burner-cover.png \
+            --listing /tmp/tag-source/docs/m5burner-card.txt
+          python scripts/verify_github_release.py \
+            --tag "$FINISH_TAG" --state either \
+            --no-newer-stable \
+            --title "Meshtastic ADV $FINISH_TAG" --prerelease false \
+            --notes /tmp/release-notes.md \
+            --asset "meshtastic-adv-${FINISH_TAG}.factory.bin=meshtastic-adv-${FINISH_TAG}.factory.bin" \
+            --asset "unifont.bin=unifont.bin" \
+            --asset "meshtastic-adv-cardputer-adv-merged.bin=meshtastic-adv-cardputer-adv-merged.bin" \
+            --asset "meshtastic-adv-hero.gif=meshtastic-adv-hero.gif" \
+            --asset "meshtastic-adv-demo.gif=meshtastic-adv-demo.gif"
+          git fetch --no-tags origin main:refs/remotes/origin/main
+          test "$(git rev-parse refs/remotes/origin/main)" = \
+            "${{ steps.pages.outputs.site_commit }}"
+
+          state=$(gh release view "$FINISH_TAG" --json isDraft,isPrerelease)
+          test "$(jq -r .isPrerelease <<<"$state")" = false
+          if [ "$(jq -r .isDraft <<<"$state")" = true ]; then
+            git fetch --no-tags origin main:refs/remotes/origin/main
+            test "$(git rev-parse refs/remotes/origin/main)" = \
+              "${{ steps.pages.outputs.site_commit }}"
+            gh release edit "$FINISH_TAG" --draft=false --latest=false
+          fi
+          python scripts/verify_github_release.py \
+            --tag "$FINISH_TAG" --state public \
+            --no-newer-stable \
+            --title "Meshtastic ADV $FINISH_TAG" --prerelease false \
+            --notes /tmp/release-notes.md \
+            --asset "meshtastic-adv-${FINISH_TAG}.factory.bin=meshtastic-adv-${FINISH_TAG}.factory.bin" \
+            --asset "unifont.bin=unifont.bin" \
+            --asset "meshtastic-adv-cardputer-adv-merged.bin=meshtastic-adv-cardputer-adv-merged.bin" \
+            --asset "meshtastic-adv-hero.gif=meshtastic-adv-hero.gif" \
+            --asset "meshtastic-adv-demo.gif=meshtastic-adv-demo.gif"
+          gh release edit "$FINISH_TAG" --latest
+          git fetch --no-tags origin main:refs/remotes/origin/main
+          test "$(git rev-parse refs/remotes/origin/main)" = \
+            "${{ steps.pages.outputs.site_commit }}"
+          test "$(gh api "repos/$GITHUB_REPOSITORY/releases/latest" --jq .tag_name)" = "$FINISH_TAG"

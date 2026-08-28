@@ -52,15 +52,16 @@ class SocialImageTests(unittest.TestCase):
             html.write_text(
                 '<img src="./img/hero.png?old=1" '
                 'data-animation="./img/demo.gif" '
-                'data-poster="./img/hero.png">',
+                'data-poster="./img/hero.png" data-duration-ms="1">',
                 encoding="utf-8",
             )
-            demo_digest, poster_digest = social.bind_inline_demo(html, demo, poster)
+            demo_digest, poster_digest = social.bind_inline_demo(html, demo, poster, 1234)
             updated = html.read_text()
             self.assertEqual(demo_digest, hashlib.sha256(b"demo").hexdigest())
             self.assertEqual(poster_digest, hashlib.sha256(b"poster").hexdigest())
             self.assertEqual(updated.count(f"hero.png?sha256={poster_digest}"), 2)
             self.assertEqual(updated.count(f"demo.gif?sha256={demo_digest}"), 1)
+            self.assertIn('data-duration-ms="1234"', updated)
 
     def test_missing_inline_binding_fails_closed(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -70,6 +71,47 @@ class SocialImageTests(unittest.TestCase):
             demo.write_bytes(b"demo")
             poster.write_bytes(b"poster")
             html = root / "index.html"
-            html.write_text('<img src="./img/hero.png">', encoding="utf-8")
+            html.write_text('<img src="./img/hero.png" data-duration-ms="1">', encoding="utf-8")
             with self.assertRaisesRegex(RuntimeError, "exactly one"):
                 social.bind_inline_demo(html, demo, poster)
+
+    def test_readme_demo_url_is_bound_to_exact_bytes(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            demo = root / "demo.gif"
+            demo.write_bytes(b"demo")
+            readme = root / "README.md"
+            readme.write_text('<img src="docs/img/demo.gif?old=1">', encoding="utf-8")
+            digest = social.bind_readme_demo(readme, demo)
+            self.assertEqual(digest, hashlib.sha256(b"demo").hexdigest())
+            self.assertIn(f"docs/img/demo.gif?sha256={digest}", readme.read_text())
+
+    def test_site_code_urls_are_bound_to_exact_bytes(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            script = root / "site.js"
+            stylesheet = root / "site.css"
+            installer = root / "installer.js"
+            web_tools = root / "install-button.js"
+            script.write_bytes(b"script")
+            stylesheet.write_bytes(b"style")
+            installer.write_bytes(b"installer")
+            web_tools.write_bytes(b"web-tools")
+            html = root / "index.html"
+            html.write_text(
+                '<link rel="stylesheet" href="./site.css?old=1">'
+                '<script type="module" src="./vendor/esp-web-tools/install-button.js"></script>'
+                '<script defer src="./installer.js"></script>'
+                '<script defer src="./site.js"></script>',
+                encoding="utf-8",
+            )
+            digests = social.bind_site_code(
+                html, script, stylesheet, installer, web_tools
+            )
+            updated = html.read_text()
+            self.assertIn(f"site.js?sha256={digests['script']}", updated)
+            self.assertIn(f"site.css?sha256={digests['stylesheet']}", updated)
+            self.assertIn(f"installer.js?sha256={digests['installer']}", updated)
+            self.assertIn(
+                f"install-button.js?sha256={digests['web_tools']}", updated
+            )

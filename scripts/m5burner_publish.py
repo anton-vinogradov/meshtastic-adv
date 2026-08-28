@@ -4,6 +4,7 @@
 import argparse
 from contextlib import ExitStack
 import hashlib
+import io
 import os
 import re
 import struct
@@ -241,9 +242,73 @@ def verify_public_binary(file_id, binary, attempts=6, delay=5):
 
 
 def verify_public_cover(cover_id, cover, attempts=6, delay=5):
-    verify_public_asset(
-        cover_id, cover, pattern=COVER_ID_RE, cdn=COVER_CDN, label="cover", attempts=attempts, delay=delay
-    )
+    """Prove the public cover is visually exact, allowing lossless PNG rewrites."""
+    if not isinstance(cover_id, str) or not COVER_ID_RE.fullmatch(cover_id):
+        raise RuntimeError(f"unsafe M5Burner cover id: {cover_id!r}")
+    expected = cover.read_bytes()
+    expected_size, expected_hash = file_sha256(cover)
+    url = f"{COVER_CDN}/{cover_id}?sha256={expected_hash}"
+    expected_origin = ("https", "m5burner-cdn.m5stack.com")
+    last_error = None
+    for attempt in range(attempts):
+        try:
+            with requests.get(
+                url,
+                headers={"Cache-Control": "no-cache", "Pragma": "no-cache"},
+                timeout=30,
+                stream=True,
+            ) as response:
+                response.raise_for_status()
+                final = urlparse(response.url)
+                if (final.scheme, final.netloc) != expected_origin:
+                    raise RuntimeError("M5Burner cover redirected outside the public CDN origin")
+                public = bytearray()
+                for chunk in response.iter_content(chunk_size=1024 * 1024):
+                    if chunk:
+                        public.extend(chunk)
+                        if len(public) > 2_000_000:
+                            raise RuntimeError("public M5Burner cover exceeds 2 MB")
+            public = bytes(public)
+            if public == expected:
+                return
+            expected_pixels = normalized_cover_pixels(expected, "uploaded")
+            public_pixels = normalized_cover_pixels(public, "public")
+            if public_pixels == expected_pixels:
+                return
+            last_error = RuntimeError(
+                "public M5Burner cover pixels differ: "
+                f"size={len(public)}, sha256={hashlib.sha256(public).hexdigest()}, "
+                f"pixel_sha256={public_pixels}; expected_size={expected_size}, "
+                f"expected_sha256={expected_hash}, expected_pixel_sha256={expected_pixels}"
+            )
+        except (OSError, RuntimeError, requests.RequestException) as error:
+            last_error = error
+        if attempt + 1 < attempts:
+            time.sleep(delay)
+    raise RuntimeError(f"M5Burner public cover did not converge: {last_error}")
+
+
+def normalized_cover_pixels(payload, label):
+    """Return a lossless digest of dimensions plus normalized RGBA pixels."""
+    try:
+        from PIL import Image, UnidentifiedImageError
+    except ImportError as error:
+        raise RuntimeError(
+            "Pillow is required to verify a byte-different public M5Burner cover"
+        ) from error
+    try:
+        with Image.open(io.BytesIO(payload)) as image:
+            if image.format != "PNG" or getattr(image, "n_frames", 1) != 1:
+                raise RuntimeError(f"{label} M5Burner cover is not a single-frame PNG")
+            if image.size != (1000, 1000):
+                raise RuntimeError(f"{label} M5Burner cover is not 1000x1000")
+            rgba = image.convert("RGBA")
+            pixels = rgba.tobytes()
+    except (OSError, UnidentifiedImageError) as error:
+        raise RuntimeError(f"{label} M5Burner cover cannot be decoded") from error
+    digest = hashlib.sha256(struct.pack(">II", 1000, 1000))
+    digest.update(pixels)
+    return digest.hexdigest()
 
 
 def publish(session, *, email, password, version, binary, cover, listing_title, listing_description):
@@ -315,13 +380,6 @@ def publish(session, *, email, password, version, binary, cover, listing_title, 
         if not item or item.get("published") is True:
             raise RuntimeError(f"pending version {version} changed state during update")
 
-    cover_id = None
-    if not historical:
-        cover_id = firmware.get("cover")
-        if not isinstance(cover_id, str) or not COVER_ID_RE.fullmatch(cover_id):
-            raise RuntimeError(f"unsafe M5Burner cover id: {cover_id!r}")
-        verify_public_cover(cover_id, cover)
-
     file_id = item.get("file")
     if not file_id:
         raise RuntimeError(f"version {version} has no uploaded file")
@@ -339,8 +397,12 @@ def publish(session, *, email, password, version, binary, cover, listing_title, 
     public_firmware = get_public_firmware()
     if not historical:
         verify_listing_metadata(public_firmware, listing_title, listing_description)
-        if public_firmware.get("cover") != cover_id:
-            raise RuntimeError("M5Burner public catalog did not publish the reviewed cover id")
+        # M5Burner stages a pending version's cover privately and only promotes
+        # it when the version is published. Fetch the post-publish id instead of
+        # comparing the still-public previous cover before publication.
+        cover_id = public_firmware.get("cover")
+        if not isinstance(cover_id, str) or not COVER_ID_RE.fullmatch(cover_id):
+            raise RuntimeError(f"unsafe M5Burner cover id: {cover_id!r}")
         verify_public_cover(cover_id, cover)
         if any(
             entry.get("published") is True

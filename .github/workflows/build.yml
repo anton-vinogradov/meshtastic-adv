@@ -80,8 +80,11 @@ jobs:
           # without its vulnerable, incompatible web-server dependency ceiling.
           python -m pip install --require-hashes --no-deps -r requirements/platformio.txt
 
-      - name: Exercise the real GIF/PNG encoder with synthetic frames
-        run: python -m unittest discover -s tests/python -p test_demo_media.py -v
+      - name: Exercise the real GIF/PNG encoder and cover verifier
+        run: |
+          python -m unittest \
+            tests.python.test_demo_media \
+            tests.python.test_m5burner_publish -v
 
       - name: Firmware verification
         run: python scripts/verify.py --firmware-only --artifacts hil-artifacts/ci-firmware

@@ -1,0 +1,145 @@
+name: repair M5Burner publication
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Existing stable release tag to repair
+        required: true
+        type: string
+      source_run_id:
+        description: Failed build run whose successful HIL artifacts must be reused
+        required: true
+        type: string
+
+permissions:
+  actions: read
+  contents: read
+
+concurrency:
+  group: meshtastic-adv-release-publish
+  queue: max
+  cancel-in-progress: false
+
+jobs:
+  repair:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: '3.11'
+
+      - name: Bind the repair to an exact failed tag run
+        id: source
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPAIR_TAG: ${{ inputs.tag }}
+          SOURCE_RUN_ID: ${{ inputs.source_run_id }}
+        run: |
+          case "$SOURCE_RUN_ID" in *[!0-9]*|'') echo "source_run_id must be numeric"; exit 2 ;; esac
+          tag_outputs=$(python scripts/release_tag.py "$REPAIR_TAG")
+          printf '%s\n' "$tag_outputs" >> "$GITHUB_OUTPUT"
+          test "$(printf '%s\n' "$tag_outputs" | sed -n 's/^prerelease=//p')" = false
+          tag_commit=$(git rev-parse "$REPAIR_TAG^{commit}")
+          echo "tag_commit=$tag_commit" >> "$GITHUB_OUTPUT"
+          python scripts/verify_release_ref.py --tag "$REPAIR_TAG" --commit "$tag_commit"
+          git fetch --no-tags origin main:refs/remotes/origin/main
+          git merge-base --is-ancestor "$tag_commit" refs/remotes/origin/main
+
+          run_json=$(mktemp)
+          jobs_json=$(mktemp)
+          gh api "repos/$GITHUB_REPOSITORY/actions/runs/$SOURCE_RUN_ID" > "$run_json"
+          gh api "repos/$GITHUB_REPOSITORY/actions/runs/$SOURCE_RUN_ID/jobs?per_page=100" > "$jobs_json"
+          jq -e --arg tag "$REPAIR_TAG" --arg sha "$tag_commit" '
+            .event == "push" and .head_branch == $tag and .head_sha == $sha and
+            .path == ".github/workflows/build.yml" and .status == "completed" and
+            .conclusion == "failure"
+          ' "$run_json" >/dev/null
+          jq -e '
+            ([.jobs[] | select(.name == "host-tests" and .conclusion == "success")] | length) == 1 and
+            ([.jobs[] | select(.name == "firmware" and .conclusion == "success")] | length) == 1 and
+            ([.jobs[] | select(.name == "release-hil" and .conclusion == "success")] | length) == 1 and
+            ([.jobs[] | select(.name == "release" and .conclusion == "failure")] | length) == 1
+          ' "$jobs_json" >/dev/null
+
+      - name: Download the exact firmware artifacts
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: firmware-factory
+          path: repair-firmware
+          repository: ${{ github.repository }}
+          run-id: ${{ inputs.source_run_id }}
+          github-token: ${{ github.token }}
+
+      - name: Download the exact privacy-safe HIL evidence
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: release-hil-evidence
+          path: repair-hil
+          repository: ${{ github.repository }}
+          run-id: ${{ inputs.source_run_id }}
+          github-token: ${{ github.token }}
+
+      - name: Rebuild and verify the exact tagged distribution inputs
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPAIR_TAG: ${{ inputs.tag }}
+        run: |
+          mkdir -p /tmp/tag-source repair-draft
+          git archive "$REPAIR_TAG" -- \
+            docs/unifont.bin docs/img/demo-story.json docs/img/mockup.json \
+            docs/m5burner-card.txt scripts/demo_media.py scripts/mkcover.py \
+            scripts/mkm5burner.sh | tar -x -C /tmp/tag-source
+          python /tmp/tag-source/scripts/demo_media.py verify \
+            --story /tmp/tag-source/docs/img/demo-story.json \
+            --mockup /tmp/tag-source/docs/img/mockup.json \
+            --media repair-hil/media
+          jq -e '
+            .status == "passed" and .planned == 9 and
+            ([.results[] | select(.status == "passed" and .returncode == 0)] | length) == 9
+          ' repair-hil/report.json >/dev/null
+          jq -e '
+            .failures == 0 and .hil_flash_attempted == true and
+            .production_restored == true and .configuration_preserved == true
+          ' repair-hil/usb/summary.json >/dev/null
+          python /tmp/tag-source/scripts/mkcover.py \
+            --source repair-hil/media/demo.gif --output /tmp/m5burner-cover.png
+
+          mapfile -t factories < <(find repair-firmware -type f -name '*.factory.bin' -print)
+          test "${#factories[@]}" -eq 1
+          python -m pip install --require-hashes --no-deps -r requirements/pip.txt
+          python -m pip install --require-hashes -r requirements/release.txt
+          MESHTASTIC_FACTORY="${factories[0]}" \
+            MESHTASTIC_FONT=/tmp/tag-source/docs/unifont.bin \
+            MESHTASTIC_MERGED_OUT=/tmp/expected-merged.bin \
+            MESHTASTIC_REPO_ROOT="$GITHUB_WORKSPACE" \
+            bash /tmp/tag-source/scripts/mkm5burner.sh "${REPAIR_TAG#v}"
+
+          test "$(gh release view "$REPAIR_TAG" --json isDraft,isPrerelease,tagName \
+            --jq '[.isDraft,.isPrerelease,.tagName] | @tsv')" = $'true\tfalse\t'"$REPAIR_TAG"
+          gh release download "$REPAIR_TAG" \
+            --pattern meshtastic-adv-cardputer-adv-merged.bin --dir repair-draft
+          cmp /tmp/expected-merged.bin repair-draft/meshtastic-adv-cardputer-adv-merged.bin
+
+      - name: Publish and verify the repaired M5Burner version
+        env:
+          M5B_EMAIL: ${{ secrets.M5BURNER_EMAIL }}
+          M5B_PWD: ${{ secrets.M5BURNER_PASSWORD }}
+          REPAIR_TAG: ${{ inputs.tag }}
+        run: |
+          test -n "$M5B_EMAIL" && test -n "$M5B_PWD"
+          python scripts/verify_release_ref.py \
+            --tag "$REPAIR_TAG" --commit "${{ steps.source.outputs.tag_commit }}"
+          git fetch --no-tags origin main:refs/remotes/origin/main
+          git merge-base --is-ancestor \
+            "${{ steps.source.outputs.tag_commit }}" refs/remotes/origin/main
+          python scripts/m5burner_publish.py \
+            --version "${{ steps.source.outputs.version }}" \
+            --bin /tmp/expected-merged.bin \
+            --cover /tmp/m5burner-cover.png \
+            --listing /tmp/tag-source/docs/m5burner-card.txt

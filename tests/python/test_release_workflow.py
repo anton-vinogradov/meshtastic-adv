@@ -8,6 +8,7 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[2]
 WORKFLOW = (ROOT / ".github/workflows/build.yml").read_text()
+REPAIR_WORKFLOW = (ROOT / ".github/workflows/repair-m5burner.yml").read_text()
 
 
 def job(name: str) -> str:
@@ -167,6 +168,12 @@ class ReleaseWorkflowTests(unittest.TestCase):
         self.assertLess(install, cover)
         lock = (ROOT / "requirements/release.txt").read_text()
         self.assertRegex(lock, r"(?m)^pillow==12\.3\.0 .*sys_platform == 'linux'")
+
+    def test_firmware_job_exercises_pixel_exact_cover_verification_with_pillow(self):
+        block = job("firmware")
+        install = block.index("python -m pip install --require-hashes -r hil/requirements.txt")
+        cover_tests = block.index("tests.python.test_m5burner_publish")
+        self.assertLess(install, cover_tests)
 
     def test_release_assets_remain_bound_to_tag_after_main_checkout(self):
         block = job("release")
@@ -392,14 +399,32 @@ class ReleaseWorkflowTests(unittest.TestCase):
             self.assertIn("release tag is no longer reachable from current main", stage)
 
     def test_external_actions_and_python_installs_are_immutable(self):
-        for reference in re.findall(r"(?m)^\s+uses:\s+([^\s#]+)", WORKFLOW):
-            if reference.startswith("docker://"):
-                self.assertIn("@sha256:", reference)
-            else:
-                self.assertRegex(reference, r"@[0-9a-f]{40}$")
+        for workflow in (WORKFLOW, REPAIR_WORKFLOW):
+            for reference in re.findall(r"(?m)^\s+uses:\s+([^\s#]+)", workflow):
+                if reference.startswith("docker://"):
+                    self.assertIn("@sha256:", reference)
+                else:
+                    self.assertRegex(reference, r"@[0-9a-f]{40}$")
         self.assertNotRegex(WORKFLOW, r"pip install ['\"]?[^\n]*[<>=]")
         self.assertEqual(WORKFLOW.count("pip install --require-hashes -r"), 3)
         self.assertEqual(WORKFLOW.count("pip install --require-hashes --no-deps"), 5)
+
+    def test_m5burner_repair_is_exact_run_bound_and_cannot_mutate_github_release(self):
+        self.assertIn("workflow_dispatch:", REPAIR_WORKFLOW)
+        self.assertIn("actions: read", REPAIR_WORKFLOW)
+        self.assertIn("contents: read", REPAIR_WORKFLOW)
+        self.assertNotIn("contents: write", REPAIR_WORKFLOW)
+        self.assertIn("group: meshtastic-adv-release-publish", REPAIR_WORKFLOW)
+        self.assertIn('.path == ".github/workflows/build.yml"', REPAIR_WORKFLOW)
+        self.assertIn('.head_sha == $sha', REPAIR_WORKFLOW)
+        self.assertIn('.name == "release-hil" and .conclusion == "success"', REPAIR_WORKFLOW)
+        self.assertGreaterEqual(REPAIR_WORKFLOW.count("run-id: ${{ inputs.source_run_id }}"), 2)
+        self.assertIn('git archive "$REPAIR_TAG"', REPAIR_WORKFLOW)
+        self.assertIn("python /tmp/tag-source/scripts/demo_media.py verify", REPAIR_WORKFLOW)
+        self.assertIn("cmp /tmp/expected-merged.bin", REPAIR_WORKFLOW)
+        self.assertIn("python scripts/m5burner_publish.py", REPAIR_WORKFLOW)
+        self.assertNotIn("gh release edit", REPAIR_WORKFLOW)
+        self.assertNotIn("gh release upload", REPAIR_WORKFLOW)
 
     def test_release_tooling_excludes_fixed_python_vulnerabilities(self):
         for relative in ("hil/requirements.txt", "requirements/release.txt"):

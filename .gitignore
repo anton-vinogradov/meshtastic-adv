@@ -20,6 +20,7 @@ hil-artifacts/
 !docs/versions/*/firmware.factory.bin
 # ...and the SD unicode font served from the site
 !docs/unifont.bin
+!docs/versions/*/unifont.bin
 
 # Editors / OS
 .vscode/

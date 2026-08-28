@@ -525,6 +525,15 @@ class ReleaseWorkflowTests(unittest.TestCase):
             self.assertIn("meshtastic-adv-vX.Y.Z.factory.bin", text)
             self.assertIn("meshtastic-adv-cardputer-adv-merged.bin", text)
 
+    def test_versioned_installer_font_is_not_ignored(self):
+        ignore = (ROOT / ".gitignore").read_text()
+        self.assertIn("!docs/versions/*/unifont.bin", ignore)
+        for workflow in (WORKFLOW, FINISH_WORKFLOW):
+            self.assertRegex(
+                workflow,
+                r'cp (?:/tmp/)?unifont\.bin "?docs/versions/',
+            )
+
     def test_merged_image_builder_is_esptool5_safe_and_fail_closed(self):
         script = (ROOT / "scripts/mkm5burner.sh").read_text()
         self.assertIn("merge-bin", script)

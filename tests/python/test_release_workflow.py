@@ -95,9 +95,14 @@ class ReleaseWorkflowTests(unittest.TestCase):
 
     def test_host_ci_runs_actionlint(self):
         block = job("host-tests")
-        self.assertIn("docker://rhysd/actionlint@sha256:", block)
+        self.assertIn("docker run --rm", block)
+        self.assertIn('--volume "$GITHUB_WORKSPACE:/repo:ro" --workdir /repo', block)
         self.assertIn(
-            r"-ignore=unexpected[ ]key[ ]\x22queue\x22[ ]for[ ]\x22concurrency\x22[ ]section",
+            "rhysd/actionlint@sha256:b1934ee5f1c509618f2508e6eb47ee0d3520686341fec936f3b79331f9315667",
+            block,
+        )
+        self.assertIn(
+            "-ignore 'unexpected key \"queue\" for \"concurrency\" section'",
             block,
         )
 

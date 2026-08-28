@@ -422,6 +422,10 @@ class ReleaseWorkflowTests(unittest.TestCase):
         self.assertIn('git archive "$REPAIR_TAG"', REPAIR_WORKFLOW)
         self.assertIn("python /tmp/tag-source/scripts/demo_media.py verify", REPAIR_WORKFLOW)
         self.assertIn("docs/img/device.png", REPAIR_WORKFLOW)
+        self.assertLess(
+            REPAIR_WORKFLOW.index("python -m pip install --require-hashes -r requirements/release.txt"),
+            REPAIR_WORKFLOW.index("python /tmp/tag-source/scripts/mkcover.py"),
+        )
         self.assertIn("cmp /tmp/expected-merged.bin", REPAIR_WORKFLOW)
         self.assertIn("python scripts/m5burner_publish.py", REPAIR_WORKFLOW)
         self.assertNotIn("gh release edit", REPAIR_WORKFLOW)

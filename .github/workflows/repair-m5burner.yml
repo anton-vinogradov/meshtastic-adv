@@ -96,6 +96,8 @@ jobs:
             docs/img/device.png \
             docs/m5burner-card.txt scripts/demo_media.py scripts/mkcover.py \
             scripts/mkm5burner.sh | tar -x -C /tmp/tag-source
+          python -m pip install --require-hashes --no-deps -r requirements/pip.txt
+          python -m pip install --require-hashes -r requirements/release.txt
           python /tmp/tag-source/scripts/demo_media.py verify \
             --story /tmp/tag-source/docs/img/demo-story.json \
             --mockup /tmp/tag-source/docs/img/mockup.json \
@@ -113,8 +115,6 @@ jobs:
 
           mapfile -t factories < <(find repair-firmware -type f -name '*.factory.bin' -print)
           test "${#factories[@]}" -eq 1
-          python -m pip install --require-hashes --no-deps -r requirements/pip.txt
-          python -m pip install --require-hashes -r requirements/release.txt
           MESHTASTIC_FACTORY="${factories[0]}" \
             MESHTASTIC_FONT=/tmp/tag-source/docs/unifont.bin \
             MESHTASTIC_MERGED_OUT=/tmp/expected-merged.bin \

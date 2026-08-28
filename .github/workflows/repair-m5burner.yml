@@ -93,6 +93,7 @@ jobs:
           mkdir -p /tmp/tag-source repair-draft
           git archive "$REPAIR_TAG" -- \
             docs/unifont.bin docs/img/demo-story.json docs/img/mockup.json \
+            docs/img/device.png \
             docs/m5burner-card.txt scripts/demo_media.py scripts/mkcover.py \
             scripts/mkm5burner.sh | tar -x -C /tmp/tag-source
           python /tmp/tag-source/scripts/demo_media.py verify \

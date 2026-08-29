@@ -5013,8 +5013,11 @@ void AdvUI::drawNetPage()
             char ln[40];
             if (demoNetActive())
                 strcpy(ln, "192.0.2.10  -55dBm");
-            else
-                snprintf(ln, sizeof(ln), "%s  %ddBm", WiFi.localIP().toString().c_str(), (int)WiFi.RSSI());
+            else {
+                const IPAddress ip = WiFi.localIP();
+                snprintf(ln, sizeof(ln), "%u.%u.%u.%u  %ddBm", (unsigned)ip[0], (unsigned)ip[1],
+                         (unsigned)ip[2], (unsigned)ip[3], (int)WiFi.RSSI());
+            }
             g->setFont(&lgfx::fonts::Font0);
             g->setTextColor(0x9CD3);
             g->setCursor(6, sy + 16);

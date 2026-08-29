@@ -5,7 +5,22 @@ release notes remain available on the [GitHub Releases page](https://github.com/
 
 ## [Unreleased]
 
-No user-visible changes are pending after 1.0.8.
+No user-visible changes are pending after 1.0.9.
+
+## [1.0.9] - 2026-08-29
+
+### Fixed
+
+- Rolls forward the unpublished 1.0.8 candidate after its release gate caught a
+  real loss of the learned node cache: HIL now uses a private NodeDB filename as
+  well as disabling saves, so its reduced in-memory database cannot even open
+  production `nodes.proto`. The physical suite also proves that the USB DUT and
+  production WiFi endpoint expose the same mesh node identity.
+- Incoming WiFi PhoneAPI connections and listener startup now fail softly when
+  fragmented heap cannot allocate their thread/stream state, instead of letting
+  `std::bad_alloc` terminate and reboot the firmware. The network settings page
+  formats its IP address directly into a fixed buffer without a temporary
+  Arduino `String` allocation.
 
 ## [1.0.8] - 2026-08-29
 
@@ -237,7 +252,8 @@ The 1.0 release line delivered the following product and release-engineering sco
   cannot reuse stale output, and prereleases cannot enter stable distribution
   channels.
 
-[Unreleased]: https://github.com/anton-vinogradov/meshtastic-adv/compare/v1.0.8...HEAD
+[Unreleased]: https://github.com/anton-vinogradov/meshtastic-adv/compare/v1.0.9...HEAD
+[1.0.9]: https://github.com/anton-vinogradov/meshtastic-adv/compare/v1.0.8...v1.0.9
 [1.0.8]: https://github.com/anton-vinogradov/meshtastic-adv/compare/v1.0.7...v1.0.8
 [1.0.7]: https://github.com/anton-vinogradov/meshtastic-adv/compare/v1.0.6...v1.0.7
 [1.0.6]: https://github.com/anton-vinogradov/meshtastic-adv/compare/v1.0.5...v1.0.6

@@ -137,12 +137,18 @@ class HilRunnerTests(unittest.TestCase):
     def test_hil_cannot_persist_its_truncated_nodedb(self):
         sync = (ROOT / "scripts/sync-overlay.sh").read_text()
         patch = (ROOT / "overlay/patches/nodedb-hil-preserve-cache.patch").read_text()
+        isolated = (ROOT / "overlay/patches/nodedb-hil-isolated-cache.patch").read_text()
         self.assertIn("nodedb-hil-preserve-cache.patch", sync)
+        self.assertIn("nodedb-hil-isolated-cache.patch", sync)
         self.assertIn("advui-inject-hil-preserve-nodedb", patch)
         body = patch.split("bool NodeDB::saveNodeDatabaseToDisk()", 1)[1]
         guard = body.split("#endif", 1)[0]
         self.assertIn("#ifdef ADVUI_HIL", guard)
         self.assertIn("return true", guard)
+        self.assertIn("advui-inject-hil-isolated-nodedb", isolated)
+        self.assertIn('"/prefs/nodes_hil.proto"', isolated)
+        hil_branch = isolated.split("#ifdef ADVUI_HIL", 1)[1].split("#else", 1)[0]
+        self.assertNotIn('"/prefs/nodes.proto"', hil_branch)
 
     def test_optional_audio_and_ble_paths_fail_soft_without_heap_churn(self):
         sync = (ROOT / "scripts/sync-overlay.sh").read_text()
@@ -160,6 +166,23 @@ class HilRunnerTests(unittest.TestCase):
         self.assertNotIn("std::stable_sort", ui)
         self.assertIn("kSeenHotCap = 150", ui)
         self.assertNotIn("hotId[266]", ui)
+        self.assertNotIn("WiFi.localIP().toString()", ui)
+        self.assertIn("const IPAddress ip = WiFi.localIP();", ui)
+
+    def test_wifi_phoneapi_allocations_fail_soft_under_fragmented_heap(self):
+        sync = (ROOT / "scripts/sync-overlay.sh").read_text()
+        patch = (ROOT / "overlay/patches/serverapi-oom-failsoft.patch").read_text()
+        self.assertIn("serverapi-oom-failsoft.patch", sync)
+        self.assertIn("advui-inject-serverapi-oom-failsoft", patch)
+        self.assertIn("advui-inject-wifi-listener-oom-failsoft", patch)
+        self.assertGreaterEqual(patch.count("new (std::nothrow)"), 2)
+        self.assertGreaterEqual(patch.count("catch (const std::bad_alloc &)"), 2)
+        self.assertIn("client.stop();", patch)
+        self.assertIn("apiPort = nullptr;", patch)
+        self.assertNotIn("openAPI.reset(new T(client))", "\n".join(
+            line[1:] for line in patch.splitlines()
+            if line.startswith("+") and not line.startswith("+++")
+        ))
 
     def test_stream_patch_recovers_known_generated_residue_only(self):
         sync = (ROOT / "scripts/sync-overlay.sh").read_text()
@@ -941,6 +964,14 @@ class HilRunnerTests(unittest.TestCase):
             loaded["devices"]["dut"]["production_wifi"]["expected_node_id"],
             "!aabbccdd",
         )
+
+    def test_usb_hil_identity_must_match_the_production_wifi_endpoint(self):
+        dut = self.production_fixture()["devices"]["dut"]
+        hil.require_usb_wifi_node_identity(dut, {"node": "aabbccdd"})
+        with self.assertRaisesRegex(hil.HilError, "identities do not match"):
+            hil.require_usb_wifi_node_identity(dut, {"node": "01020304"})
+        with self.assertRaisesRegex(hil.HilError, "invalid node identity"):
+            hil.require_usb_wifi_node_identity(dut, {"node": "not-hex"})
 
     def test_production_wifi_fixture_rejects_ambiguous_or_weak_values(self):
         base = self.production_fixture()["devices"]["dut"]["production_wifi"]

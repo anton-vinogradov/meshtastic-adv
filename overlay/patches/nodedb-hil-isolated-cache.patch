@@ -1,0 +1,19 @@
+diff --git a/src/mesh/NodeDB.h b/src/mesh/NodeDB.h
+--- a/src/mesh/NodeDB.h
++++ b/src/mesh/NodeDB.h
+@@ -96,7 +96,15 @@ extern meshtastic_Position localPosition;
+ 
+ static constexpr const char *deviceStateFileName = "/prefs/device.proto";
+ static constexpr const char *legacyPrefFileName = "/prefs/db.proto";
++#ifdef ADVUI_HIL
++// The physical HIL deliberately uses a smaller in-memory database. Never even
++// open the production cache from that image: an upstream load/migration path
++// must not be able to truncate a user's learned nodes before production is
++// restored. HIL saves are disabled separately in saveNodeDatabaseToDisk().
++static constexpr const char *nodeDatabaseFileName = "/prefs/nodes_hil.proto"; // advui-inject-hil-isolated-nodedb
++#else
+ static constexpr const char *nodeDatabaseFileName = "/prefs/nodes.proto";
++#endif
+ static constexpr const char *configFileName = "/prefs/config.proto";
+ static constexpr const char *uiconfigFileName = "/prefs/uiconfig.proto";
+ static constexpr const char *moduleConfigFileName = "/prefs/module.proto";

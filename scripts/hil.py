@@ -447,6 +447,21 @@ def require_production_wifi_config(fixture: dict[str, object]) -> dict[str, obje
     return validate_production_wifi_config(config)
 
 
+def require_usb_wifi_node_identity(dut: dict[str, object], state: dict[str, str]) -> None:
+    """Bind the private production WiFi endpoint to the USB HIL application."""
+    production_wifi = dut.get("production_wifi")
+    if production_wifi is None:
+        return
+    config = validate_production_wifi_config(production_wifi)
+    try:
+        usb_node = int(state.get("node", "0"), 16)
+        wifi_node = int(str(config["expected_node_id"])[-8:], 16)
+    except (TypeError, ValueError):
+        raise HilError("HIL USB firmware reported an invalid node identity") from None
+    if usb_node == 0 or usb_node != wifi_node:
+        raise HilError("HIL USB DUT and production WiFi endpoint identities do not match")
+
+
 def resolve_role(fixture: dict[str, object], role: str) -> dict[str, object]:
     expected = fixture["devices"][role]
     visible = ports()
@@ -1713,6 +1728,7 @@ def smoke(fixture: dict[str, object], artifacts: Path) -> Report:
                 state = session.wait_state({"splash": "1"}, timeout=30)
                 report.protect_node_id(state.get("node"))
                 state_box["boot"] = state
+                require_usb_wifi_node_identity(dut, state)
                 expected_radio: dict[str, str] = {}
                 if "expected_region" in dut:
                     expected_radio["rf_region"] = str(REGION_CODES[str(dut["expected_region"])])

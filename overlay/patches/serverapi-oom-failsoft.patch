@@ -1,0 +1,70 @@
+diff --git a/src/mesh/api/ServerAPI.cpp b/src/mesh/api/ServerAPI.cpp
+--- a/src/mesh/api/ServerAPI.cpp
++++ b/src/mesh/api/ServerAPI.cpp
+@@ -2,6 +2,7 @@
+ #include "Throttle.h"
+ #include "configuration.h"
+ #include <Arduino.h>
++#include <new>
+ 
+ static constexpr uint32_t TCP_IDLE_TIMEOUT_MS = 15 * 60 * 1000UL;
+ 
+@@ -109,7 +110,22 @@ template <class T, class U> int32_t APIServerPort<T, U>::runOnce()
+             openAPI.reset();
+         }
+ 
+-        openAPI.reset(new T(client));
++        // A PhoneAPI connection arrives precisely when the config stream wants
++        // several buffers. On a fragmented ESP32 heap, throwing new used to
++        // escape this thread and terminate the firmware. Refuse only this
++        // connection; the listener and mesh remain alive for a later retry.
++        try {
++            T *next = new (std::nothrow) T(client); // advui-inject-serverapi-oom-failsoft
++            if (next) {
++                openAPI.reset(next);
++            } else {
++                LOG_ERROR("Insufficient heap for incoming API connection");
++                client.stop();
++            }
++        } catch (const std::bad_alloc &) {
++            LOG_ERROR("Insufficient heap while constructing incoming API connection");
++            client.stop();
++        }
+     }
+ 
+ #if RAK_4631
+diff --git a/src/mesh/api/WiFiServerAPI.cpp b/src/mesh/api/WiFiServerAPI.cpp
+--- a/src/mesh/api/WiFiServerAPI.cpp
++++ b/src/mesh/api/WiFiServerAPI.cpp
+@@ -4,5 +4,7 @@
+ #if HAS_WIFI
+ #include "WiFiServerAPI.h"
++#include <new>
++
+ #ifdef ARCH_ESP32
+ #include "concurrency/LockGuard.h"
+ 
+@@ -17,9 +19,20 @@ void initApiServer(int port)
+ {
+     // Start API server on port 4403
+     if (!apiPort) {
+-        apiPort = new WiFiServerPort(port);
+-        LOG_INFO("API server listen on TCP port %d", port);
+-        apiPort->init();
++        try {
++            apiPort = new (std::nothrow) WiFiServerPort(port); // advui-inject-wifi-listener-oom-failsoft
++            if (apiPort) {
++                LOG_INFO("API server listen on TCP port %d", port);
++                apiPort->init();
++            } else {
++                LOG_ERROR("Insufficient heap to start WiFi API server");
++            }
++        } catch (const std::bad_alloc &) {
++            // Constructor failure automatically releases its allocation. Keep
++            // the global null so a later WiFi reinitialization can retry.
++            apiPort = nullptr;
++            LOG_ERROR("Insufficient heap while starting WiFi API server");
++        }
+     }
+ }
+ void deInitApiServer()

@@ -228,6 +228,19 @@ stream_retained_ready
 grep -q 'delegate.availableForWrite()' "$FW/src/mesh/UsbSessionStream.h"
 grep -q 'resetStreamInput' "$SC"
 
+# Per-connection PhoneAPI objects and the WiFi listener are normally small, but
+# both constructors allocate thread/stream state from the fragmented internal
+# heap. Refuse that connection or listener start instead of allowing bad_alloc
+# to escape into std::terminate and reboot an otherwise healthy mesh node.
+WIFI_SERVER_API="$FW/src/mesh/api/WiFiServerAPI.cpp"
+if [ -f "$SERVER_API" ] && [ -f "$WIFI_SERVER_API" ] && \
+   ! grep -q 'advui-inject-serverapi-oom-failsoft' "$SERVER_API"; then
+  git -C "$FW" apply "$ROOT/overlay/patches/serverapi-oom-failsoft.patch"
+  echo "injected fail-soft PhoneAPI connection allocation"
+fi
+test "$(grep -c 'advui-inject-serverapi-oom-failsoft' "$SERVER_API" || true)" -eq 1
+test "$(grep -c 'advui-inject-wifi-listener-oom-failsoft' "$WIFI_SERVER_API" || true)" -eq 1
+
 # PhoneAPI.cpp/.h: upstream 2.7 keeps prefetched NodeInfo records in a
 # std::deque. Every time the deque needs another 308-byte block it calls the
 # throwing operator new; on an ESP32 without enough contiguous internal heap,
@@ -293,6 +306,12 @@ if [ -f "$ND" ] && ! grep -q 'advui-inject-hil-preserve-nodedb' "$ND"; then
   echo "injected immutable HIL NodeDB persistence guard"
 fi
 test "$(grep -c 'advui-inject-hil-preserve-nodedb' "$ND" || true)" -eq 1
+NDH="$FW/src/mesh/NodeDB.h"
+if [ -f "$NDH" ] && ! grep -q 'advui-inject-hil-isolated-nodedb' "$NDH"; then
+  git -C "$FW" apply "$ROOT/overlay/patches/nodedb-hil-isolated-cache.patch"
+  echo "isolated the HIL NodeDB cache path"
+fi
+test "$(grep -c 'advui-inject-hil-isolated-nodedb' "$NDH" || true)" -eq 1
 if [ -f "$ND" ] && ! grep -q 'advui-inject-oomsave' "$ND"; then
   # The 2.8 NodeDB projects four satellite maps into temporary protobuf
   # vectors before saving. The 2.7 release line stores a single monolithic
@@ -313,7 +332,6 @@ fi
 # only the rebuildable node cache; identity, channels and radio configuration
 # remain intact. Newer firmware has its own explicit v24 migration and must not
 # receive this downgrade-only guard.
-NDH="$FW/src/mesh/NodeDB.h"
 if [ -f "$ND" ] && [ -f "$NDH" ] && ! grep -q 'advui-inject-forward-nodedb' "$ND"; then
   if grep -q '^#define DEVICESTATE_CUR_VER 24$' "$NDH" && \
      grep -q 'if (nodeDatabase.version < DEVICESTATE_MIN_VER)' "$ND"; then

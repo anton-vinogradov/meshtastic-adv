@@ -216,8 +216,15 @@ class HilRunnerTests(unittest.TestCase):
         ui = (ROOT / "overlay/src/advui/AdvUI.cpp").read_text()
         self.assertIn("audio-rtttl-failsoft.patch", sync)
         self.assertGreaterEqual(audio.count("std::nothrow"), 4)
-        self.assertIn("catch (const std::bad_alloc &)", audio)
+        self.assertGreaterEqual(audio.count("catch (const std::bad_alloc &)"), 3)
+        begin_rttl = audio.split("void beginRttl", 1)[1].split("// Also handles", 1)[0]
+        read_aloud = audio.split("void readAloud", 1)[1].split("protected:", 1)[0]
+        init_output = audio.split("void initOutput", 1)[1].split("std::unique_ptr<AudioGeneratorRTTTL>", 1)[0]
+        self.assertIn("catch (const std::bad_alloc &)", begin_rttl)
+        self.assertIn("catch (const std::bad_alloc &)", read_aloud)
+        self.assertIn("catch (const std::bad_alloc &)", init_output)
         self.assertIn("!i2sRtttl->begin", audio)
+        self.assertLess(init_output.index("next->SetGain"), init_output.index("audioOut = std::move(next)"))
         self.assertIn("catch (const std::bad_alloc &)", ble)
         self.assertIn("g_client->deleteServices()", ble)
         self.assertIn("parseBleAddress(g_connAddr, peerOctets)", ble)
@@ -234,6 +241,38 @@ class HilRunnerTests(unittest.TestCase):
         screen_wake = ui.split("void AdvUI::screenWake()", 1)[1].split("void AdvUI::initHardware()", 1)[0]
         self.assertIn("if (!display.init())", screen_wake)
         self.assertIn("screenOn = false", screen_wake)
+
+    def test_optional_sd_font_and_atomic_files_fail_soft_on_oom(self):
+        sync = (ROOT / "scripts/sync-overlay.sh").read_text()
+        font = (ROOT / "overlay/src/advui/AdvFont.cpp").read_text()
+        safe_file = (ROOT / "overlay/patches/safefile-oom-failsoft.patch").read_text()
+        save_result = (ROOT / "overlay/patches/saveproto-commit-result.patch").read_text()
+
+        load = font.split("void sdFontLoadFromSd()", 1)[1].split("const char *sdFontState()", 1)[0]
+        self.assertIn("catch (const std::bad_alloc &)", load)
+        self.assertIn('releaseSdFont("sd no memory")', load)
+        self.assertLess(load.index("g_cache ="), load.index("g_ready = true"))
+        self.assertIn("safefile-oom-failsoft.patch", sync)
+        self.assertIn("saveproto-commit-result.patch", sync)
+        self.assertGreaterEqual(safe_file.count("catch (const std::bad_alloc &)"), 2)
+        self.assertIn("concurrency::LockGuard g(spiLock)", safe_file)
+        self.assertIn("filenameTmp.length() != strlen(filename)", safe_file)
+        self.assertNotIn("spiLock->lock()", "\n".join(
+            line[1:] for line in safe_file.splitlines()
+            if line.startswith("+") and not line.startswith("+++")
+        ))
+        self.assertIn("return okay && writeSucceeded", save_result)
+        self.assertIn("bool writeSucceeded = false", save_result)
+
+    def test_future_satellite_save_oom_cleanup_cannot_allocate(self):
+        patch = (ROOT / "overlay/patches/nodedb-oom-save.patch").read_text()
+        catch = patch.split("catch (const std::bad_alloc &)", 1)[1]
+        self.assertIn("decltype(nodeDatabase.positions){}.swap", catch)
+        self.assertIn("decltype(nodeDatabase.status){}.swap", catch)
+        self.assertNotIn("shrink_to_fit", "\n".join(
+            line[1:] for line in catch.splitlines()
+            if line.startswith("+") and not line.startswith("+++")
+        ))
 
     def test_wifi_phoneapi_allocations_fail_soft_under_fragmented_heap(self):
         sync = (ROOT / "scripts/sync-overlay.sh").read_text()

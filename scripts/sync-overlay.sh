@@ -106,6 +106,27 @@ if [ -f "$AUDIO_THREAD" ] && ! grep -q 'new (std::nothrow) AudioGeneratorRTTTL' 
 fi
 grep -q 'new (std::nothrow) AudioGeneratorRTTTL' "$AUDIO_THREAD"
 grep -q 'new (std::nothrow) AudioOutputI2S' "$AUDIO_THREAD"
+grep -q 'constructors/begin() may still throw' "$AUDIO_THREAD"
+
+# SafeFile.cpp: Arduino FS builds File handles with throwing shared_ptr
+# allocations. A low/fragmented heap must defer the persistence transaction,
+# retaining the previous atomic file, instead of rebooting the whole node.
+SAFE_FILE="$FW/src/SafeFile.cpp"
+if [ -f "$SAFE_FILE" ] && ! grep -q 'SafeFile open deferred: heap allocation failed' "$SAFE_FILE"; then
+  git -C "$FW" apply "$ROOT/overlay/patches/safefile-oom-failsoft.patch"
+  echo "injected fail-soft SafeFile allocation handling"
+fi
+grep -q 'SafeFile open deferred: heap allocation failed' "$SAFE_FILE"
+grep -q 'SafeFile close deferred: heap allocation failed' "$SAFE_FILE"
+
+# NodeDB must propagate the verified SafeFile close/rename result. Encoding into
+# an invalid or uncommittable File is not a successful persistence operation.
+SAVE_PROTO_DB="$FW/src/mesh/NodeDB.cpp"
+if [ -f "$SAVE_PROTO_DB" ] && ! grep -q 'advui-inject-safe-write-result' "$SAVE_PROTO_DB"; then
+  git -C "$FW" apply "$ROOT/overlay/patches/saveproto-commit-result.patch"
+  echo "injected verified saveProto commit result"
+fi
+test "$(grep -c 'advui-inject-safe-write-result' "$SAVE_PROTO_DB" || true)" -eq 1
 
 # RadioLibInterface.cpp: USB HIL is an isolated test transport, never a radio
 # transmitter. USERPREFS_LORA_TX_DISABLED makes the ordinary boot config

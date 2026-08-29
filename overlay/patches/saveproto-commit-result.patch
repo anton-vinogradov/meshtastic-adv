@@ -1,0 +1,34 @@
+diff --git a/src/mesh/NodeDB.cpp b/src/mesh/NodeDB.cpp
+index c26bc3202..31c304cfb 100644
+--- a/src/mesh/NodeDB.cpp
++++ b/src/mesh/NodeDB.cpp
+@@ -1466,7 +1466,8 @@ bool NodeDB::saveProto(const char *filename, size_t protoSize, const pb_msgdesc_t
+         return false;
+     }
+ 
+     bool okay = false;
++    bool writeSucceeded = false;
+ #ifdef FSCom
+     auto f = SafeFile(filename, fullAtomic);
+ 
+@@ -1478,16 +1479,18 @@ bool NodeDB::saveProto(const char *filename, size_t protoSize, const pb_msgdesc_t
+     } else {
+         okay = true;
+     }
+ 
+-    bool writeSucceeded = f.close();
++    writeSucceeded = f.close();
+ 
+     if (!okay || !writeSucceeded) {
+         LOG_ERROR("Can't write prefs!");
+     }
+ #else
+     LOG_ERROR("ERROR: Filesystem not implemented");
+ #endif
+-    return okay;
++    // advui-inject-safe-write-result: encoding alone is not persistence; the
++    // verified close/rename transaction must also have committed.
++    return okay && writeSucceeded;
+ }
+ 
+ bool NodeDB::saveChannelsToDisk()

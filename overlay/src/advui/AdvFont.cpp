@@ -5,6 +5,7 @@
 #include <SPI.h>
 #include <cstdlib>
 #include <cstring>
+#include <new>
 #include <esp_idf_version.h>
 #include <esp_partition.h>
 #if ESP_IDF_VERSION_MAJOR < 5
@@ -58,6 +59,19 @@ struct CacheEnt {
 constexpr int kCacheN = 96;
 CacheEnt *g_cache = nullptr;
 int g_hand = 0;
+
+void releaseSdFont(const char *state)
+{
+    if (g_font)
+        g_font.close();
+    free(g_cache);
+    g_cache = nullptr;
+    g_hand = 0;
+    SD.end();
+    g_ready = false;
+    g_v2 = false;
+    snprintf(g_state, sizeof(g_state), "%s", state);
+}
 
 CacheEnt *lookup(uint32_t cp) // SD path only; the mapped partition needs no cache
 {
@@ -140,34 +154,39 @@ void sdFontLoadFromSd()
     if (g_ready)
         return;
     concurrency::LockGuard guard(spiLock);
-    if (!SD.begin(kSdCs, SPI, kSdHz)) {
-        LOG_INFO("advui: no SD card, unicode font off");
-        return;
+    try {
+        if (!SD.begin(kSdCs, SPI, kSdHz)) {
+            LOG_INFO("advui: no SD card, unicode font off");
+            releaseSdFont("no card");
+            return;
+        }
+        g_font = SD.open(kFontPath, FILE_READ);
+        char magic[5] = {0};
+        bool ok = g_font && g_font.read((uint8_t *)magic, 4) == 4;
+        bool v2 = ok && strcmp(magic, "AUF2") == 0;
+        ok = ok && (v2 ? g_font.size() >= kFontSizeV2 : (strcmp(magic, "AUF1") == 0 && g_font.size() >= kFontSizeV1));
+        if (!ok) {
+            LOG_INFO("advui: %s missing/invalid, unicode font off", kFontPath);
+            releaseSdFont("invalid");
+            return;
+        }
+        g_v2 = v2;
+        g_cache = (CacheEnt *)calloc(kCacheN, sizeof(CacheEnt));
+        if (!g_cache) {
+            releaseSdFont("sd no memory");
+            return;
+        }
+        for (int i = 0; i < kCacheN; i++)
+            g_cache[i].cp = 0xFFFFFFFF;
+        g_ready = true;
+        snprintf(g_state, sizeof(g_state), "sd");
+        LOG_INFO("advui: unicode font ready (%s)", kFontPath);
+    } catch (const std::bad_alloc &) {
+        // SD.open() constructs a shared File implementation with throwing new.
+        // Keep the optional font off and release every partially acquired buffer.
+        releaseSdFont("sd no memory");
+        LOG_WARN("advui: unicode font disabled after heap allocation failure");
     }
-    g_font = SD.open(kFontPath, FILE_READ);
-    char magic[5] = {0};
-    bool ok = g_font && g_font.read((uint8_t *)magic, 4) == 4;
-    bool v2 = ok && strcmp(magic, "AUF2") == 0;
-    ok = ok && (v2 ? g_font.size() >= kFontSizeV2 : (strcmp(magic, "AUF1") == 0 && g_font.size() >= kFontSizeV1));
-    if (!ok) {
-        LOG_INFO("advui: %s missing/invalid, unicode font off", kFontPath);
-        if (g_font)
-            g_font.close();
-        SD.end(); // release FATFS/SPI buffers acquired by the successful mount
-        return;
-    }
-    g_v2 = v2;
-    g_cache = (CacheEnt *)calloc(kCacheN, sizeof(CacheEnt));
-    if (!g_cache) {
-        g_font.close();
-        SD.end(); // a failed optional feature must not keep its ~32 KB mount cost
-        return;
-    }
-    for (int i = 0; i < kCacheN; i++)
-        g_cache[i].cp = 0xFFFFFFFF;
-    g_ready = true;
-    snprintf(g_state, sizeof(g_state), "sd");
-    LOG_INFO("advui: unicode font ready (%s)", kFontPath);
 }
 
 const char *sdFontState()
@@ -188,14 +207,7 @@ void sdFontUnload()
     if (!g_ready || g_map)
         return;
     concurrency::LockGuard guard(spiLock);
-    if (g_font)
-        g_font.close();
-    free(g_cache);
-    g_cache = nullptr;
-    SD.end();
-    g_ready = false;
-    g_v2 = false;
-    snprintf(g_state, sizeof(g_state), "off");
+    releaseSdFont("off");
 }
 
 bool sdFontReady()

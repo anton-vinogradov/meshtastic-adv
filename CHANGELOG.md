@@ -5,7 +5,26 @@ release notes remain available on the [GitHub Releases page](https://github.com/
 
 ## [Unreleased]
 
-No user-visible changes are pending after 1.0.14.
+No user-visible changes are pending after 1.0.15.
+
+## [1.0.15] - 2026-08-29
+
+### Fixed
+
+- Optional RTTTL, speech and I2S initialization now catch allocation failures
+  from constructors and setup calls as well as allocation itself. A failed
+  alert leaves the mesh and UI running with the amplifier and CPU boost off.
+- Enabling the optional SD-backed Unicode font now releases every partially
+  acquired FATFS, file and glyph-cache resource when the fragmented heap cannot
+  construct the file handle; the built-in font remains usable.
+- Atomic `SafeFile` persistence now defers cleanly when Arduino FS cannot
+  allocate its shared file implementation or temporary path. Full-atomic
+  settings/history callers keep the previous committed file instead of an OOM
+  reboot interrupting the node, and NodeDB no longer reports success unless
+  the verified close/rename transaction actually committed.
+- The dormant Meshtastic 2.8 satellite-save compatibility patch releases
+  partial staging vectors without calling an allocator-capable compaction
+  operation from inside its `bad_alloc` handler.
 
 ## [1.0.14] - 2026-08-29
 
@@ -313,7 +332,8 @@ The 1.0 release line delivered the following product and release-engineering sco
   cannot reuse stale output, and prereleases cannot enter stable distribution
   channels.
 
-[Unreleased]: https://github.com/anton-vinogradov/meshtastic-adv/compare/v1.0.14...HEAD
+[Unreleased]: https://github.com/anton-vinogradov/meshtastic-adv/compare/v1.0.15...HEAD
+[1.0.15]: https://github.com/anton-vinogradov/meshtastic-adv/compare/v1.0.14...v1.0.15
 [1.0.14]: https://github.com/anton-vinogradov/meshtastic-adv/compare/v1.0.13...v1.0.14
 [1.0.13]: https://github.com/anton-vinogradov/meshtastic-adv/compare/v1.0.12...v1.0.13
 [1.0.12]: https://github.com/anton-vinogradov/meshtastic-adv/compare/v1.0.9...v1.0.12

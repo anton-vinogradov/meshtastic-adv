@@ -18,21 +18,19 @@ index 3e877a57c..9a6398d8f 100644
  #if !MESHTASTIC_EXCLUDE_POSITIONDB
      nodeDatabase.positions.clear();
      nodeDatabase.positions.reserve(nodePositions.size());
-@@ -2834,6 +2843,21 @@ bool NodeDB::saveNodeDatabaseToDisk()
+@@ -2834,6 +2843,19 @@ bool NodeDB::saveNodeDatabaseToDisk()
  #else
      nodeDatabase.status.clear();
  #endif
 +#if defined(__cpp_exceptions) || defined(__EXCEPTIONS)
 +    } catch (const std::bad_alloc &) {
 +        // advui-inject-oomsave: heap too tight to stage the satellite data.
-+        nodeDatabase.positions.clear();
-+        nodeDatabase.positions.shrink_to_fit();
-+        nodeDatabase.telemetry.clear();
-+        nodeDatabase.telemetry.shrink_to_fit();
-+        nodeDatabase.environment.clear();
-+        nodeDatabase.environment.shrink_to_fit();
-+        nodeDatabase.status.clear();
-+        nodeDatabase.status.shrink_to_fit();
++        // Empty-vector swap is non-allocating with the default allocator;
++        // the usual capacity-compaction request may itself throw here.
++        decltype(nodeDatabase.positions){}.swap(nodeDatabase.positions);
++        decltype(nodeDatabase.telemetry){}.swap(nodeDatabase.telemetry);
++        decltype(nodeDatabase.environment){}.swap(nodeDatabase.environment);
++        decltype(nodeDatabase.status){}.swap(nodeDatabase.status);
 +        LOG_WARN("NodeDB save deferred: heap too low to stage satellite data");
 +        return true;
 +    }

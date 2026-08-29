@@ -1,6 +1,6 @@
 {
   "name": "Meshtastic ADV",
-  "version": "1.0.1 (advui · engine 2.7.26)",
+  "version": "1.0.15 (advui · engine 2.7.26)",
   "new_install_prompt_erase": true,
   "builds": [
     {
@@ -11,7 +11,7 @@
           "offset": 0
         },
         {
-          "path": "../../unifont.bin",
+          "path": "unifont.bin",
           "offset": 3407872
         }
       ]

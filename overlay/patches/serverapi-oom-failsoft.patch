@@ -44,7 +44,7 @@ diff --git a/src/mesh/api/WiFiServerAPI.cpp b/src/mesh/api/WiFiServerAPI.cpp
  #ifdef ARCH_ESP32
  #include "concurrency/LockGuard.h"
  
-@@ -17,9 +19,20 @@ void initApiServer(int port)
+@@ -17,9 +19,23 @@ void initApiServer(int port)
  {
      // Start API server on port 4403
      if (!apiPort) {

@@ -3,6 +3,7 @@ import importlib.util
 import json
 import stat
 import struct
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -23,6 +24,20 @@ class HilRunnerTests(unittest.TestCase):
         """Exercise local defaults without inheriting the CI process identity."""
         with mock.patch.dict(hil.os.environ, {"GITHUB_ACTIONS": ""}):
             return hil.full_run(*args, **kwargs)
+
+    def test_every_overlay_patch_is_syntactically_valid(self):
+        patches = sorted((ROOT / "overlay/patches").glob("*.patch"))
+        self.assertTrue(patches)
+        for patch in patches:
+            with self.subTest(patch=patch.name):
+                subprocess.run(
+                    ["git", "apply", "--numstat", str(patch)],
+                    cwd=ROOT,
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.PIPE,
+                    check=True,
+                    text=True,
+                )
 
     @staticmethod
     def production_fixture() -> dict[str, object]:

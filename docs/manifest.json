@@ -1,6 +1,6 @@
 {
   "name": "Meshtastic ADV",
-  "version": "1.0.17 (advui · engine 2.7.26)",
+  "version": "1.0.18 (advui · engine 2.7.26)",
   "new_install_prompt_erase": true,
   "builds": [
     {

@@ -1,0 +1,78 @@
+diff --git a/src/mesh/http/WebServer.cpp b/src/mesh/http/WebServer.cpp
+--- a/src/mesh/http/WebServer.cpp
++++ b/src/mesh/http/WebServer.cpp
+@@ -43,6 +43,7 @@ using namespace httpsserver;
+ #include <HTTPSServer.hpp>
+ #include <HTTPServer.hpp>
+ #include <SSLCert.hpp>
++#include <new>
+ 
+ // The HTTPS Server comes in a separate namespace. For easier use, include it here.
+ using namespace httpsserver;
+@@ -82,7 +83,15 @@ static void handleWebResponse()
+                     }
+                 }
+             }
+-            insecureServer->loop();
++            try {
++                insecureServer->loop(); // advui-inject-webserver-oom-failsoft
++            } catch (const std::bad_alloc &) {
++                // Request parsing and JSON handlers use throwing STL allocations.
++                // Retire only HTTP; the mesh and PhoneAPI must stay alive.
++                LOG_ERROR("Insufficient heap while serving HTTP; disabling web server until reboot");
++                insecureServer->stop();
++                isWebServerReady = false;
++            }
+         }
+     }
+ }
+@@ -249,21 +258,34 @@ void initWebServer()
+ 
+     // We can now use the new certificate to setup our server as usual.
+     secureServer = nullptr; // advui-inject-nohttps: HTTPS off, keep HTTP:80 -> frees tens of KB heap
+-    insecureServer = new HTTPServer();
+-
+-    registerHandlers(insecureServer, secureServer);
+-
+-    if (secureServer) {
+-        LOG_INFO("Start Secure Web Server");
+-        secureServer->start();
+-    }
+-    LOG_INFO("Start Insecure Web Server");
+-    insecureServer->start();
+-    if (insecureServer->isRunning()) {
+-        LOG_INFO("Web Servers Ready! :-) ");
+-        isWebServerReady = true;
+-    } else {
+-        LOG_ERROR("Web Servers Failed! ;-( ");
++    try {
++        insecureServer = new (std::nothrow) HTTPServer(80, MAX_HTTPS_CONNECTIONS);
++        if (!insecureServer) {
++            LOG_ERROR("Insufficient heap to start HTTP server");
++            return;
++        }
++
++        registerHandlers(insecureServer, secureServer);
++
++        if (secureServer) {
++            LOG_INFO("Start Secure Web Server");
++            secureServer->start();
++        }
++        LOG_INFO("Start Insecure Web Server");
++        insecureServer->start();
++        if (insecureServer->isRunning()) {
++            LOG_INFO("Web Servers Ready! :-) ");
++            isWebServerReady = true;
++        } else {
++            LOG_ERROR("Web Servers Failed! ;-( ");
++        }
++    } catch (const std::bad_alloc &) {
++        // Keep the partially initialized server reachable because the bundled
++        // resolver does not own/delete registered ResourceNode instances.
++        LOG_ERROR("Insufficient heap while starting HTTP server; web UI disabled");
++        if (insecureServer && insecureServer->isRunning())
++            insecureServer->stop();
++        isWebServerReady = false;
+     }
+ }
+ #endif

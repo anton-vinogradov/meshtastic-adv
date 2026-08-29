@@ -73,6 +73,7 @@ class ReleaseWorkflowTests(unittest.TestCase):
         self.assertIn("HIL_RECOVERY_ROOT: ${{ vars.HIL_RECOVERY_ROOT }}", header)
         self.assertIn("run-${{ github.run_id }}-attempt-${{ github.run_attempt }}", header)
         self.assertIn("/config-before.yaml", header)
+        self.assertIn("/filesystem-before.bin", header)
         self.assertIn("/hil-flash-started", header)
         prepare = block.split("- name: Prepare persistent configuration recovery vault", 1)[1]
         prepare = prepare.split("- uses: actions/download-artifact", 1)[0]
@@ -82,9 +83,12 @@ class ReleaseWorkflowTests(unittest.TestCase):
         run = block.split("- name: Release behavioral HIL", 1)[1]
         run = run.split("- name: Recover production firmware", 1)[0]
         self.assertIn('--config-backup "$HIL_CONFIG_BACKUP"', run)
+        self.assertIn('--factory-image "${{ steps.release_app.outputs.factory }}"', run)
         recovery = block.split("- name: Recover production firmware", 1)[1]
         recovery = recovery.split("- name: Build deterministic release-demo media", 1)[0]
         self.assertIn('--config-backup "$HIL_CONFIG_BACKUP"', recovery)
+        self.assertIn('--filesystem-backup "$HIL_FILESYSTEM_BACKUP"', recovery)
+        self.assertIn('--factory-image "${{ steps.release_app.outputs.factory }}"', recovery)
         self.assertIn('--flash-marker "$HIL_FLASH_MARKER"', recovery)
         self.assertIn('if [ ! -f "$HIL_FLASH_MARKER" ]', recovery)
         self.assertIn("recovery is not required", recovery)
@@ -94,8 +98,12 @@ class ReleaseWorkflowTests(unittest.TestCase):
         self.assertIn("steps.recovery.outcome == 'success'", cleanup)
         self.assertIn("run-${GITHUB_RUN_ID}-attempt-${GITHUB_RUN_ATTEMPT}", cleanup)
         self.assertIn('test "$HIL_CONFIG_BACKUP" = "$expected"', cleanup)
+        self.assertIn('test "$HIL_FILESYSTEM_BACKUP" = "$filesystem"', cleanup)
         self.assertIn('test "$HIL_FLASH_MARKER" = "$marker"', cleanup)
-        self.assertIn('rm -f -- "$HIL_CONFIG_BACKUP" "$HIL_FLASH_MARKER"', cleanup)
+        self.assertIn(
+            'rm -f -- "$HIL_CONFIG_BACKUP" "$HIL_FILESYSTEM_BACKUP" "$HIL_FLASH_MARKER"',
+            cleanup,
+        )
         self.assertIn('rmdir -- "$(dirname "$HIL_CONFIG_BACKUP")"', cleanup)
         self.assertNotIn("hil-artifacts/release-hil/usb/private/config-before.yaml", block)
 

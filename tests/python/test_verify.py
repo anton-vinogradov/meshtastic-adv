@@ -24,6 +24,7 @@ def args(**overrides):
         "usb": False,
         "production_wifi": False,
         "release_image": None,
+        "factory_image": None,
         "config_backup": None,
         "backup_root": None,
         "capture_rf_backups": False,
@@ -72,11 +73,14 @@ class VerifyRunnerTests(unittest.TestCase):
 
     def test_exact_release_app_is_forwarded_to_usb_hil(self):
         image = Path("/tmp/exact-release.bin")
+        factory = Path("/tmp/exact-release.factory.bin")
         plan = verify.build_plan(
-            args(usb=True, skip_build=True, release_image=image), Path("/tmp/evidence")
+            args(usb=True, skip_build=True, release_image=image, factory_image=factory),
+            Path("/tmp/evidence")
         )
         command = next(stage.command for stage in plan if stage.name == "hardware/usb-cardputer")
         self.assertEqual(command[command.index("--release-image") + 1], str(image))
+        self.assertEqual(command[command.index("--factory-image") + 1], str(factory))
 
     def test_external_config_backup_is_usb_only_and_forwarded(self):
         backup = Path("/persistent/recovery/config.yaml")
@@ -92,11 +96,13 @@ class VerifyRunnerTests(unittest.TestCase):
 
     def test_production_wifi_is_exact_release_usb_only_and_forwarded(self):
         image = Path("/tmp/exact-release.bin")
+        factory = Path("/tmp/exact-release.factory.bin")
         plan = verify.build_plan(
             args(
                 usb=True,
                 skip_build=True,
                 release_image=image,
+                factory_image=factory,
                 production_wifi=True,
             ),
             Path("/tmp/evidence"),

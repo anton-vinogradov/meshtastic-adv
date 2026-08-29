@@ -46,6 +46,10 @@ def parser() -> argparse.ArgumentParser:
         help="exact production app artifact restored after USB HIL (requires --usb)",
     )
     result.add_argument(
+        "--factory-image", type=Path,
+        help="matching factory artifact used to checkpoint/restore LittleFS (requires --usb)",
+    )
+    result.add_argument(
         "--config-backup", type=Path,
         help="exclusive private backup destination for USB HIL (requires --usb)",
     )
@@ -69,6 +73,11 @@ def validate_args(args: argparse.Namespace, source: argparse.ArgumentParser) -> 
         source.error("--hardware-only requires --skip-build")
     if args.release_image is not None and not args.usb:
         source.error("--release-image requires --usb")
+    factory_image = getattr(args, "factory_image", None)
+    if factory_image is not None and not args.usb:
+        source.error("--factory-image requires --usb")
+    if (args.release_image is None) != (factory_image is None):
+        source.error("--release-image and --factory-image must be supplied together")
     if args.config_backup is not None and not args.usb:
         source.error("--config-backup requires --usb")
     if args.production_wifi and not args.usb:
@@ -150,6 +159,9 @@ def build_plan(args: argparse.Namespace, artifacts: Path) -> list[Stage]:
         ]
         if args.release_image is not None:
             usb_command.extend(("--release-image", str(args.release_image)))
+        factory_image = getattr(args, "factory_image", None)
+        if factory_image is not None:
+            usb_command.extend(("--factory-image", str(factory_image)))
         if args.config_backup is not None:
             usb_command.extend(("--config-backup", str(args.config_backup)))
         if args.production_wifi:

@@ -42,6 +42,10 @@ PRODUCTION_WIFI_CLOSE_SETTLE_SECONDS = 3.0
 PRODUCTION_WIFI_FINAL_QUIET_SECONDS = 15.0
 PRODUCTION_WIFI_CONFIG_TIMEOUT_SECONDS = 30
 MAX_APP_IMAGE_BYTES = 3_000_000
+ESP32S3_FLASH_BYTES = 8 * 1024 * 1024
+PARTITION_TABLE_OFFSET = 0x8000
+PARTITION_ENTRY_BYTES = 32
+PARTITION_MAGIC = 0x50AA
 REGION_CODES = {"UNSET": 0, "US": 1}
 USB_IDENTITY_RE = re.compile(r"(?i)\b(?:[0-9a-f]{2}:){5}[0-9a-f]{2}\b")
 SERIAL_PORT_RE = re.compile(r"(?i)(?:/dev/(?:cu|tty)\.[^\s]+|\bCOM\d+\b)")
@@ -69,6 +73,17 @@ class ProductionWifiSnapshot:
 
     reboot_count: int
     node_count: int
+
+
+@dataclass(frozen=True)
+class FlashLayout:
+    """Release artifact-derived regions touched by safe HIL recovery."""
+
+    app_offset: int
+    app_size: int
+    filesystem_offset: int
+    filesystem_size: int
+    partition_table_sha256: str
 
 
 def redact_lab_details(value: str) -> str:
@@ -674,7 +689,6 @@ def production_wifi_soak(
     opener: Callable[[str, int, int], object] | None = None,
     monotonic: Callable[[], float] = time.monotonic,
     sleep: Callable[[float], None] = time.sleep,
-    expected_before_hil: ProductionWifiSnapshot | None = None,
 ) -> dict[str, object]:
     """Prove repeated full production config dumps do not reboot or lose NodeDB state."""
     config = require_production_wifi_config(fixture)
@@ -683,11 +697,11 @@ def production_wifi_soak(
         opener=opener,
         monotonic=monotonic,
         sleep=sleep,
-        enforce_configured_minimum=expected_before_hil is None,
+        enforce_configured_minimum=True,
     )
-    required_nodes = expected_before_hil.node_count if expected_before_hil is not None else int(config["min_nodes"])
+    required_nodes = int(config["min_nodes"])
     if baseline.node_count < required_nodes:
-        raise HilError("production PhoneAPI NodeDB shrank across HIL")
+        raise HilError("production PhoneAPI NodeDB is below the fixture minimum")
 
     started = monotonic()
     soak_dumps = 0
@@ -702,7 +716,7 @@ def production_wifi_soak(
         current = production_wifi_dump(
             config,
             opener=opener,
-            enforce_configured_minimum=expected_before_hil is None,
+            enforce_configured_minimum=True,
         )
         soak_dumps += 1
         minimum_node_count = min(minimum_node_count, current.node_count)
@@ -715,7 +729,7 @@ def production_wifi_soak(
     final = production_wifi_dump(
         config,
         opener=opener,
-        enforce_configured_minimum=expected_before_hil is None,
+        enforce_configured_minimum=True,
     )
     minimum_node_count = min(minimum_node_count, final.node_count)
     if final.node_count < required_nodes:
@@ -733,7 +747,7 @@ def production_wifi_soak(
         "minimum_node_count": minimum_node_count,
         "required_node_count": required_nodes,
         "configured_minimum_node_count": int(config["min_nodes"]),
-        "pre_hil_node_count": expected_before_hil.node_count if expected_before_hil is not None else baseline.node_count,
+        "baseline_node_count": baseline.node_count,
         "stable_reboot_counter": True,
         "mesh_writes": 0,
         "admin_writes": 0,
@@ -849,6 +863,93 @@ def firmware_image(env_name: str) -> Path:
     return images[0]
 
 
+def firmware_factory_image(env_name: str) -> Path:
+    build_dir = FIRMWARE / ".pio/build" / env_name
+    images = sorted(build_dir.glob(f"firmware-{env_name}-*.factory.bin"))
+    if len(images) != 1:
+        names = ", ".join(path.name for path in images) or "none"
+        raise HilError(f"expected exactly one factory image for {env_name}, found: {names}")
+    return images[0]
+
+
+def parse_flash_layout(path: Path) -> FlashLayout:
+    """Read the app/filesystem layout from the exact release partition table."""
+    resolved = path.resolve()
+    try:
+        payload = resolved.read_bytes()
+    except OSError as exc:
+        raise HilError(f"cannot read release factory image {path}: {exc}") from exc
+    table = payload[PARTITION_TABLE_OFFSET:PARTITION_TABLE_OFFSET + 0x1000]
+    if len(table) != 0x1000:
+        raise HilError("release factory image does not contain a complete partition table")
+
+    partitions: dict[str, tuple[int, int, int, int]] = {}
+    table_end = 0
+    for index in range(0, len(table), PARTITION_ENTRY_BYTES):
+        entry = table[index:index + PARTITION_ENTRY_BYTES]
+        magic = struct.unpack_from("<H", entry)[0]
+        if magic != PARTITION_MAGIC:
+            table_end = index
+            break
+        _, partition_type, subtype, offset, size, raw_label, _ = struct.unpack("<HBBII16sI", entry)
+        try:
+            label = raw_label.split(b"\0", 1)[0].decode("ascii", errors="strict")
+        except UnicodeDecodeError as exc:
+            raise HilError("release partition table contains a non-ASCII label") from exc
+        if not label or label in partitions:
+            raise HilError("release partition table contains an invalid or duplicate label")
+        if offset < PARTITION_TABLE_OFFSET + 0x1000 or size <= 0 or offset + size > ESP32S3_FLASH_BYTES:
+            raise HilError(f"release partition {label} is outside the 8 MB flash")
+        partitions[label] = (partition_type, subtype, offset, size)
+    if table_end == 0:
+        raise HilError("release partition table is empty or unterminated")
+
+    try:
+        app_type, _, app_offset, app_size = partitions["app0"]
+        fs_type, fs_subtype, fs_offset, fs_size = partitions["spiffs"]
+    except KeyError as exc:
+        raise HilError("release partition table is missing app0 or spiffs") from exc
+    app_subtype = partitions["app0"][1]
+    if app_type != 0x00 or app_subtype != 0x10 or fs_type != 0x01 or fs_subtype != 0x82:
+        raise HilError("release partition table has unexpected app0/spiffs types")
+    ordered = sorted((offset, offset + size, label) for label, (_, _, offset, size) in partitions.items())
+    for previous, current in zip(ordered, ordered[1:]):
+        if previous[1] > current[0]:
+            raise HilError(
+                f"release partitions {previous[2]} and {current[2]} overlap"
+            )
+    if app_offset + app_size > fs_offset or fs_offset + fs_size > ESP32S3_FLASH_BYTES:
+        raise HilError("release app0 and filesystem layout is invalid")
+    return FlashLayout(
+        app_offset=app_offset,
+        app_size=app_size,
+        filesystem_offset=fs_offset,
+        filesystem_size=fs_size,
+        partition_table_sha256=hashlib.sha256(table[:table_end]).hexdigest(),
+    )
+
+
+def validate_factory_image(path: Path, app_image: Path | None = None) -> tuple[Path, FlashLayout]:
+    resolved = path.resolve()
+    try:
+        size = resolved.stat().st_size
+        magic = resolved.read_bytes()[:1]
+    except OSError as exc:
+        raise HilError(f"cannot read release factory image {path}: {exc}") from exc
+    if magic != b"\xe9" or not PARTITION_TABLE_OFFSET + 0x1000 <= size <= ESP32S3_FLASH_BYTES:
+        raise HilError("release factory image has an invalid size or ESP magic")
+    layout = parse_flash_layout(resolved)
+    if app_image is not None:
+        app = validate_app_image(app_image)
+        if app.stat().st_size > layout.app_size:
+            raise HilError("release app image does not fit the app0 partition")
+        factory = resolved.read_bytes()
+        app_payload = app.read_bytes()
+        if factory[layout.app_offset:layout.app_offset + len(app_payload)] != app_payload:
+            raise HilError("release factory/app bytes do not match")
+    return resolved, layout
+
+
 def validate_app_image(path: Path) -> Path:
     """Validate an app-partition image before allowing an identity-bound flash."""
     resolved = path.resolve()
@@ -878,6 +979,23 @@ def stage_release_image(image_override: Path | None, temporary_root: Path) -> tu
     if source_digest != digest:
         raise HilError("staged production recovery image did not match its source")
     return staged, digest
+
+
+def stage_factory_image(
+    image_override: Path | None, app_image: Path, temporary_root: Path
+) -> tuple[Path, FlashLayout, str]:
+    """Pin the exact partition table used to locate and recover LittleFS."""
+    source = image_override if image_override is not None else firmware_factory_image(RELEASE_ENV)
+    source, _ = validate_factory_image(source, app_image)
+    source_digest = hashlib.sha256(source.read_bytes()).hexdigest()
+    staged = temporary_root / "release-factory.bin"
+    shutil.copyfile(source, staged)
+    os.chmod(staged, 0o600)
+    staged, layout = validate_factory_image(staged, app_image)
+    digest = hashlib.sha256(staged.read_bytes()).hexdigest()
+    if digest != source_digest:
+        raise HilError("staged production factory image did not match its source")
+    return staged, layout, digest
 
 
 def chip_mac(port: str) -> str:
@@ -982,6 +1100,101 @@ def flash(
     live = kick_device(expected_mac)
     print("application USB ready: identity verified", flush=True)
     return {**device, **live, "image": str(image), "chip_mac": actual_mac}
+
+
+def validate_filesystem_backup(path: Path, layout: FlashLayout) -> Path:
+    """Accept only the owner-only, exact-size raw LittleFS recovery image."""
+    if path.is_symlink() or not path.is_file():
+        raise HilError("restorable filesystem backup is missing or unsafe")
+    resolved = path.resolve()
+    if stat.S_IMODE(resolved.stat().st_mode) & 0o077:
+        raise HilError("restorable filesystem backup has unsafe permissions")
+    if resolved.stat().st_size != layout.filesystem_size:
+        raise HilError("restorable filesystem backup has an invalid size")
+    return resolved
+
+
+def filesystem_backup_for(configuration_backup: Path) -> Path:
+    return configuration_backup.parent / "filesystem-before.bin"
+
+
+def capture_filesystem_backup(
+    fixture: dict[str, object], destination: Path, layout: FlashLayout
+) -> tuple[Path, str]:
+    """Read the complete production LittleFS before HIL changes any flash bytes."""
+    if destination.exists() or destination.is_symlink():
+        raise HilError("filesystem backup destination already exists")
+    if not destination.parent.is_dir() or destination.parent.is_symlink():
+        raise HilError("filesystem backup parent must be an existing real directory")
+    parent_stat = destination.parent.stat()
+    if parent_stat.st_uid != os.getuid() or stat.S_IMODE(parent_stat.st_mode) & 0o077:
+        raise HilError("filesystem backup parent is not owner-only")
+
+    device = resolve_role(fixture, "dut")
+    expected_mac = str(device["usb_serial"])
+    if chip_mac(str(device["port"])) != expected_mac:
+        raise HilError("chip identity did not match the fixture before filesystem backup")
+    live = wait_for_usb_serial(expected_mac)
+    partial = destination.with_name(destination.name + ".partial")
+    if partial.exists() or partial.is_symlink():
+        raise HilError("filesystem backup partial destination already exists")
+    try:
+        run_checked(
+            find_esptool() + [
+                "--chip", "esp32s3", "--port", str(live["port"]), "--baud", "921600",
+                "read-flash", hex(layout.filesystem_offset), hex(layout.filesystem_size), str(partial),
+            ],
+            redact_output=True,
+        )
+        os.chmod(partial, 0o600)
+        with partial.open("rb") as stream:
+            os.fsync(stream.fileno())
+        validate_filesystem_backup(partial, layout)
+        os.replace(partial, destination)
+        backup = validate_filesystem_backup(destination, layout)
+        digest = hashlib.sha256(backup.read_bytes()).hexdigest()
+        wait_for_usb_serial(expected_mac, timeout=30)
+        return backup, digest
+    except Exception:
+        partial.unlink(missing_ok=True)
+        raise
+
+
+def restore_production_state(
+    fixture: dict[str, object], release_image: Path, factory_image: Path,
+    filesystem_backup: Path,
+) -> dict[str, object]:
+    """Atomically write and verify the exact production app and saved LittleFS."""
+    app = validate_app_image(release_image)
+    _, layout = validate_factory_image(factory_image, app)
+    filesystem = validate_filesystem_backup(filesystem_backup, layout)
+    device = resolve_role(fixture, "dut")
+    expected_mac = str(device["usb_serial"])
+    if chip_mac(str(device["port"])) != expected_mac:
+        raise HilError("chip identity did not match the fixture before production restore")
+    live = wait_for_usb_serial(expected_mac)
+    common = [
+        "--chip", "esp32s3", "--port", str(live["port"]), "--after", "no-reset"
+    ]
+    run_checked(
+        find_esptool() + common + [
+            "--baud", "921600", "write-flash", "--flash-mode", "dio", "--flash-freq", "80m",
+            "--flash-size", "8MB", hex(layout.app_offset), str(app),
+            hex(layout.filesystem_offset), str(filesystem),
+        ],
+        redact_output=True,
+    )
+    verified = wait_for_usb_serial(expected_mac)
+    verify_common = ["--chip", "esp32s3", "--port", str(verified["port"]), "verify-flash"]
+    run_checked(
+        find_esptool() + verify_common + [
+            hex(layout.app_offset), str(app), hex(layout.filesystem_offset), str(filesystem),
+        ],
+        redact_output=True,
+    )
+    live = kick_device(expected_mac)
+    print("production app and filesystem restored: identity verified", flush=True)
+    return {**device, **live, "chip_mac": expected_mac}
 
 
 def capture_config_fingerprint(
@@ -1139,24 +1352,41 @@ def flash_marker_for(configuration_backup: Path) -> Path:
     return configuration_backup.parent / "hil-flash-started"
 
 
-def flash_marker_payload(configuration_backup: Path, release_image: Path) -> bytes:
+def flash_marker_payload(
+    configuration_backup: Path, release_image: Path, factory_image: Path,
+    filesystem_backup: Path,
+) -> bytes:
     backup = validate_config_backup(configuration_backup)
     image = validate_app_image(release_image)
+    factory, layout = validate_factory_image(factory_image, image)
+    filesystem = validate_filesystem_backup(filesystem_backup, layout)
+    expected_filesystem = filesystem_backup_for(backup).resolve(strict=False)
+    if filesystem != expected_filesystem:
+        raise HilError("filesystem backup is outside the configuration recovery vault")
     payload = {
-        "schema": 2,
+        "schema": 3,
         "backup": backup.name,
         "sha256": hashlib.sha256(backup.read_bytes()).hexdigest(),
         "release_app_sha256": hashlib.sha256(image.read_bytes()).hexdigest(),
         "release_app_size": image.stat().st_size,
+        "release_factory_sha256": hashlib.sha256(factory.read_bytes()).hexdigest(),
+        "partition_table_sha256": layout.partition_table_sha256,
+        "filesystem_backup": filesystem.name,
+        "filesystem_sha256": hashlib.sha256(filesystem.read_bytes()).hexdigest(),
+        "filesystem_offset": layout.filesystem_offset,
+        "filesystem_size": layout.filesystem_size,
     }
     return (json.dumps(payload, sort_keys=True, separators=(",", ":")) + "\n").encode()
 
 
-def write_flash_marker(configuration_backup: Path, release_image: Path) -> Path:
+def write_flash_marker(
+    configuration_backup: Path, release_image: Path, factory_image: Path,
+    filesystem_backup: Path,
+) -> Path:
     backup = validate_config_backup(configuration_backup)
     image = validate_app_image(release_image)
     marker = flash_marker_for(backup)
-    payload = flash_marker_payload(backup, image)
+    payload = flash_marker_payload(backup, image, factory_image, filesystem_backup)
     flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
     if hasattr(os, "O_NOFOLLOW"):
         flags |= os.O_NOFOLLOW
@@ -1172,7 +1402,8 @@ def write_flash_marker(configuration_backup: Path, release_image: Path) -> Path:
 
 
 def validate_flash_marker(
-    marker: Path, configuration_backup: Path, release_image: Path
+    marker: Path, configuration_backup: Path, release_image: Path, factory_image: Path,
+    filesystem_backup: Path,
 ) -> Path:
     backup = validate_config_backup(configuration_backup)
     image = validate_app_image(release_image)
@@ -1188,7 +1419,9 @@ def validate_flash_marker(
         raise HilError("valid HIL flash marker is missing")
     if stat.S_IMODE(resolved.stat().st_mode) & 0o077:
         raise HilError("HIL flash marker has unsafe permissions")
-    if resolved.read_bytes() != flash_marker_payload(backup, image):
+    if resolved.read_bytes() != flash_marker_payload(
+        backup, image, factory_image, filesystem_backup
+    ):
         raise HilError("HIL flash marker is invalid")
     return resolved
 
@@ -2515,15 +2748,21 @@ def visual(fixture: dict[str, object], artifacts: Path, timeout: float) -> Repor
 
 def full_run(
     fixture: dict[str, object], artifacts: Path, timeout: float, skip_build: bool = False,
-    release_image: Path | None = None, config_backup: Path | None = None,
-    production_wifi: bool = False,
+    release_image: Path | None = None, factory_image: Path | None = None,
+    config_backup: Path | None = None, production_wifi: bool = False,
 ) -> int:
     """Run the complete safe suite and always put production firmware back."""
     if production_wifi:
         require_production_wifi_config(fixture)
         if release_image is None:
             raise HilError("production WiFi soak requires an exact --release-image")
+    if release_image is not None and factory_image is None:
+        raise HilError("an exact --release-image requires its matching --factory-image")
     exact_release = validate_app_image(release_image) if release_image is not None else None
+    exact_factory = (
+        validate_factory_image(factory_image, exact_release)[0]
+        if factory_image is not None and exact_release is not None else None
+    )
     if not skip_build:
         build(release=False)
         if exact_release is None:
@@ -2542,17 +2781,26 @@ def full_run(
     production_wifi_failure_type: str | None = None
     production_wifi_skipped = False
     configuration_backup = prepare_config_backup_destination(artifacts, config_backup)
+    filesystem_backup = filesystem_backup_for(configuration_backup)
+    filesystem_captured = False
+    filesystem_restored = False
     with configuration_temporary_directory("meshtastic-adv-hil-config-") as temporary:
         configuration_before: bytes | None = None
         staged_release: Path | None = None
+        staged_factory: Path | None = None
+        flash_layout: FlashLayout | None = None
         release_sha256: str | None = None
+        factory_sha256: str | None = None
         try:
             # A build or another local task may clean firmware/.pio while the
             # several-minute physical suite is running. Recovery must not
             # depend on that mutable directory after the HIL app is flashed.
             staged_release, release_sha256 = stage_release_image(exact_release, Path(temporary))
+            staged_factory, flash_layout, factory_sha256 = stage_factory_image(
+                exact_factory, staged_release, Path(temporary)
+            )
             if production_wifi:
-                print("capturing production WiFi NodeDB baseline", flush=True)
+                print("capturing informational production WiFi NodeDB baseline", flush=True)
                 production_wifi_before = production_wifi_ready_dump(
                     fixture,
                     enforce_configured_minimum=False,
@@ -2567,7 +2815,15 @@ def full_run(
 
             if staged_release is None:
                 raise HilError("production recovery image was not staged")
-            write_flash_marker(configuration_backup, staged_release)
+            if staged_factory is None or flash_layout is None:
+                raise HilError("production partition layout was not staged")
+            capture_filesystem_backup(
+                fixture, filesystem_backup, flash_layout
+            )
+            filesystem_captured = True
+            write_flash_marker(
+                configuration_backup, staged_release, staged_factory, filesystem_backup
+            )
             flash_attempted = True
             flash(fixture, release=False)
             before = smoke(fixture, artifacts / "smoke-before")
@@ -2592,8 +2848,13 @@ def full_run(
                     print("restoring production firmware", flush=True)
                     if staged_release is None:
                         raise HilError("production recovery image was not staged")
-                    flash(fixture, release=True, image_override=staged_release)
+                    if staged_factory is None or not filesystem_captured:
+                        raise HilError("production filesystem recovery image was not staged")
+                    restore_production_state(
+                        fixture, staged_release, staged_factory, filesystem_backup
+                    )
                     restored = True
+                    filesystem_restored = True
                 except Exception as exc:
                     restore_failure_type = type(exc).__name__
                     restore_error = exc
@@ -2604,7 +2865,6 @@ def full_run(
                             print("soaking restored production WiFi PhoneAPI", flush=True)
                             production_wifi_evidence = production_wifi_soak(
                                 fixture,
-                                expected_before_hil=production_wifi_before,
                             )
                         except Exception as exc:
                             production_wifi_failure_type = type(exc).__name__
@@ -2641,6 +2901,8 @@ def full_run(
                 "failure_type": failure_type,
                 "hil_flash_attempted": flash_attempted,
                 "production_restored": restored,
+                "filesystem_captured": filesystem_captured,
+                "filesystem_restored": filesystem_restored,
                 "restore_failure_type": restore_failure_type,
                 "configuration_preserved": configuration_preserved,
                 "configuration_restored": configuration_restored,
@@ -2659,6 +2921,11 @@ def full_run(
                 summary["production_wifi"] = production_wifi_evidence
             if release_sha256 is not None:
                 summary["release_image_sha256"] = release_sha256
+            if factory_sha256 is not None:
+                summary["release_factory_sha256"] = factory_sha256
+            if flash_layout is not None:
+                summary["partition_table_sha256"] = flash_layout.partition_table_sha256
+                summary["filesystem_size"] = flash_layout.filesystem_size
             summary_path.write_text(json.dumps(summary, indent=2) + "\n")
             os.chmod(summary_path, 0o600)
 
@@ -2710,8 +2977,16 @@ def make_parser() -> argparse.ArgumentParser:
                 help="exact validated production app image (for cancellation recovery)",
             )
             cmd.add_argument(
+                "--factory-image", type=Path,
+                help="exact factory artifact supplying the validated partition layout",
+            )
+            cmd.add_argument(
                 "--config-backup", type=Path,
                 help="private full export to compare and restore only if drift is proven",
+            )
+            cmd.add_argument(
+                "--filesystem-backup", type=Path,
+                help="private raw LittleFS snapshot captured before HIL",
             )
             cmd.add_argument(
                 "--flash-marker", type=Path,
@@ -2740,6 +3015,10 @@ def make_parser() -> argparse.ArgumentParser:
     run_cmd.add_argument(
         "--release-image", type=Path,
         help="exact production app image to restore after HIL (the release artifact's app bytes)",
+    )
+    run_cmd.add_argument(
+        "--factory-image", type=Path,
+        help="matching factory artifact used to derive the production flash layout",
     )
     run_cmd.add_argument(
         "--config-backup", type=Path,
@@ -2805,14 +3084,26 @@ def main() -> int:
         fixture = load_fixture(args.fixture)
         if args.command in ("flash", "restore"):
             image = validate_app_image(args.image) if args.command == "restore" and args.image else None
-            if args.command == "restore" and bool(args.config_backup) != bool(args.flash_marker):
-                raise HilError("configuration backup and HIL flash marker must be supplied together")
+            recovery_arguments = (
+                args.config_backup, args.filesystem_backup, args.factory_image, args.flash_marker
+            ) if args.command == "restore" else ()
+            if args.command == "restore" and any(recovery_arguments) and not all(recovery_arguments):
+                raise HilError("all interrupted-HIL recovery inputs must be supplied together")
             if args.command == "restore" and args.config_backup:
                 if image is None:
                     raise HilError("--image is required for interrupted-HIL recovery")
                 validate_config_backup(args.config_backup)
-                validate_flash_marker(args.flash_marker, args.config_backup, image)
-            flash(fixture, args.release, image_override=image)
+                _, layout = validate_factory_image(args.factory_image, image)
+                validate_filesystem_backup(args.filesystem_backup, layout)
+                validate_flash_marker(
+                    args.flash_marker, args.config_backup, image,
+                    args.factory_image, args.filesystem_backup,
+                )
+                restore_production_state(
+                    fixture, image, args.factory_image, args.filesystem_backup
+                )
+            else:
+                flash(fixture, args.release, image_override=image)
             if args.command == "restore" and args.config_backup:
                 with configuration_temporary_directory("meshtastic-adv-hil-recovery-") as temporary:
                     recovered = recover_config_if_needed(
@@ -2839,7 +3130,8 @@ def main() -> int:
             artifacts = args.artifacts or default_artifacts("full")
             failures = full_run(
                 fixture, artifacts, args.timeout, args.skip_build,
-                release_image=args.release_image, config_backup=args.config_backup,
+                release_image=args.release_image, factory_image=args.factory_image,
+                config_backup=args.config_backup,
                 production_wifi=args.production_wifi,
             )
             print(f"artifacts: {artifacts}")

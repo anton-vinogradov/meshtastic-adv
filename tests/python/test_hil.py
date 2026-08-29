@@ -2,6 +2,7 @@ import hashlib
 import importlib.util
 import json
 import stat
+import struct
 import sys
 import tempfile
 import unittest
@@ -62,6 +63,49 @@ class HilRunnerTests(unittest.TestCase):
             sendText=mock.Mock(),
             localNode=SimpleNamespace(writeConfig=mock.Mock(), writeChannel=mock.Mock()),
         )
+
+    @staticmethod
+    def flash_layout() -> hil.FlashLayout:
+        return hil.FlashLayout(
+            app_offset=0x10000,
+            app_size=0x330000,
+            filesystem_offset=0x670000,
+            filesystem_size=0x180000,
+            partition_table_sha256="1" * 64,
+        )
+
+    @staticmethod
+    def recovery_files(root: Path, *, fill: int = 0) -> tuple[Path, Path, Path, Path]:
+        backup = root / "config-before.yaml"
+        backup.write_bytes(
+            b"channel_url: secret\nconfig:\nmodule_config:\nowner: fixture\n"
+            b"  privateKey: 1234567890abcdef\n"
+        )
+        backup.chmod(0o600)
+        app = root / "release.bin"
+        app_payload = b"\xe9" + bytes([fill]) * (64 * 1024 - 1)
+        app.write_bytes(app_payload)
+        factory = root / "release.factory.bin"
+        payload = bytearray(0x10000 + len(app_payload))
+        payload[0] = 0xE9
+        entries = (
+            (1, 2, 0x9000, 0x5000, b"nvs"),
+            (1, 0, 0xE000, 0x2000, b"otadata"),
+            (0, 0x10, 0x10000, 0x330000, b"app0"),
+            (1, 0x82, 0x670000, 0x180000, b"spiffs"),
+        )
+        for index, (partition_type, subtype, offset, size, label) in enumerate(entries):
+            start = hil.PARTITION_TABLE_OFFSET + index * hil.PARTITION_ENTRY_BYTES
+            payload[start:start + hil.PARTITION_ENTRY_BYTES] = struct.pack(
+                "<HBBII16sI", hil.PARTITION_MAGIC, partition_type, subtype,
+                offset, size, label.ljust(16, b"\0"), 0,
+            )
+        payload[0x10000:0x10000 + len(app_payload)] = app_payload
+        factory.write_bytes(payload)
+        filesystem = root / "filesystem-before.bin"
+        filesystem.write_bytes(bytes([fill]) * 0x180000)
+        filesystem.chmod(0o600)
+        return backup, app, factory, filesystem
 
     def test_init_writes_identity_fixture_owner_only(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -178,11 +222,24 @@ class HilRunnerTests(unittest.TestCase):
         self.assertGreaterEqual(patch.count("new (std::nothrow)"), 2)
         self.assertGreaterEqual(patch.count("catch (const std::bad_alloc &)"), 2)
         self.assertIn("client.stop();", patch)
+        self.assertIn("delete next;", patch)
+        self.assertLess(patch.index("next->init();"), patch.index("apiPort = next;"))
         self.assertIn("apiPort = nullptr;", patch)
         self.assertNotIn("openAPI.reset(new T(client))", "\n".join(
             line[1:] for line in patch.splitlines()
             if line.startswith("+") and not line.startswith("+++")
         ))
+
+    def test_http_allocations_disable_only_the_web_ui_on_oom(self):
+        sync = (ROOT / "scripts/sync-overlay.sh").read_text()
+        patch = (ROOT / "overlay/patches/webserver-oom-failsoft.patch").read_text()
+        self.assertIn("webserver-oom-failsoft.patch", sync)
+        self.assertIn("advui-inject-webserver-oom-failsoft", patch)
+        self.assertIn("catch (const std::bad_alloc &)", patch)
+        self.assertIn("insecureServer->stop();", patch)
+        self.assertIn("isWebServerReady = false;", patch)
+        self.assertIn("HTTPServer(80, MAX_HTTPS_CONNECTIONS)", patch)
+        self.assertNotIn("ESP.restart()", patch)
 
     def test_stream_patch_recovers_known_generated_residue_only(self):
         sync = (ROOT / "scripts/sync-overlay.sh").read_text()
@@ -1049,31 +1106,27 @@ class HilRunnerTests(unittest.TestCase):
         self.assertEqual(evidence["mesh_writes"], 0)
         self.assertGreaterEqual(dump.call_count - 2, hil.PRODUCTION_WIFI_MIN_SOAK_DUMPS)
 
-    def test_production_wifi_soak_preserves_the_pre_hil_nodedb_even_below_fixture_capacity(self):
+    def test_production_wifi_soak_uses_persisted_fixture_minimum_not_volatile_pre_hil_count(self):
         now = [0.0]
-        before = hil.ProductionWifiSnapshot(reboot_count=5, node_count=8)
-        restored = hil.ProductionWifiSnapshot(reboot_count=7, node_count=8)
+        restored = hil.ProductionWifiSnapshot(reboot_count=7, node_count=32)
         with mock.patch.object(hil, "production_wifi_dump", return_value=restored):
             evidence = hil.production_wifi_soak(
                 self.production_fixture(),
                 monotonic=lambda: now[0],
                 sleep=lambda seconds: now.__setitem__(0, now[0] + seconds),
-                expected_before_hil=before,
             )
-        self.assertEqual(evidence["pre_hil_node_count"], 8)
-        self.assertEqual(evidence["required_node_count"], 8)
+        self.assertEqual(evidence["baseline_node_count"], 32)
+        self.assertEqual(evidence["required_node_count"], 32)
         self.assertEqual(evidence["configured_minimum_node_count"], 32)
 
-    def test_production_wifi_soak_rejects_nodedb_shrink_across_hil(self):
-        before = hil.ProductionWifiSnapshot(reboot_count=5, node_count=40)
+    def test_production_wifi_soak_rejects_below_persisted_fixture_minimum(self):
         restored = hil.ProductionWifiSnapshot(reboot_count=7, node_count=8)
         with mock.patch.object(hil, "production_wifi_dump", return_value=restored):
-            with self.assertRaisesRegex(hil.HilError, "NodeDB shrank across HIL"):
+            with self.assertRaisesRegex(hil.HilError, "below the fixture minimum"):
                 hil.production_wifi_soak(
                     self.production_fixture(),
                     monotonic=lambda: 0.0,
                     sleep=lambda _seconds: None,
-                    expected_before_hil=before,
                 )
 
     def test_production_wifi_soak_never_retries_a_post_baseline_failure(self):
@@ -1114,15 +1167,17 @@ class HilRunnerTests(unittest.TestCase):
             artifacts = Path(directory) / "artifacts"
             with (
                 mock.patch.object(hil, "stage_release_image", return_value=(Path("/staged.bin"), "a" * 64)),
+                mock.patch.object(hil, "stage_factory_image", return_value=(Path("/factory.bin"), self.flash_layout(), "b" * 64)),
                 mock.patch.object(hil, "capture_config_fingerprint", return_value=b"same"),
+                mock.patch.object(hil, "capture_filesystem_backup", return_value=(Path("/filesystem.bin"), "c" * 64)),
                 mock.patch.object(hil, "write_flash_marker"),
-                mock.patch.object(
-                    hil, "flash", side_effect=[hil.HilError("upload failed"), {"role": "dut"}]
-                ) as flash,
+                mock.patch.object(hil, "flash", side_effect=hil.HilError("upload failed")) as flash,
+                mock.patch.object(hil, "restore_production_state", return_value={"role": "dut"}) as restore,
             ):
                 with self.assertRaises(hil.HilError):
                     self.local_full_run({"schema": 1}, artifacts, timeout=1, skip_build=True)
-            self.assertEqual([call.kwargs["release"] for call in flash.call_args_list], [False, True])
+            self.assertEqual([call.kwargs["release"] for call in flash.call_args_list], [False])
+            restore.assert_called_once()
             summary = json.loads((artifacts / "summary.json").read_text())
             self.assertTrue(summary["hil_flash_attempted"])
             self.assertTrue(summary["production_restored"])
@@ -1136,13 +1191,12 @@ class HilRunnerTests(unittest.TestCase):
             artifacts = Path(directory) / "artifacts"
             with (
                 mock.patch.object(hil, "stage_release_image", return_value=(Path("/staged.bin"), "b" * 64)),
+                mock.patch.object(hil, "stage_factory_image", return_value=(Path("/factory.bin"), self.flash_layout(), "c" * 64)),
                 mock.patch.object(hil, "capture_config_fingerprint", return_value=b"before"),
+                mock.patch.object(hil, "capture_filesystem_backup", return_value=(Path("/filesystem.bin"), "d" * 64)),
                 mock.patch.object(hil, "write_flash_marker"),
-                mock.patch.object(
-                    hil,
-                    "flash",
-                    side_effect=[hil.HilError("upload failed"), hil.HilError("restore failed")],
-                ),
+                mock.patch.object(hil, "flash", side_effect=hil.HilError("upload failed")),
+                mock.patch.object(hil, "restore_production_state", side_effect=hil.HilError("restore failed")),
             ):
                 with self.assertRaisesRegex(hil.HilError, "restore failed"):
                     self.local_full_run({"schema": 1}, artifacts, timeout=1, skip_build=True)
@@ -1159,11 +1213,14 @@ class HilRunnerTests(unittest.TestCase):
             artifacts = Path(directory) / "artifacts"
             with (
                 mock.patch.object(hil, "stage_release_image", return_value=(Path("/staged.bin"), "c" * 64)),
+                mock.patch.object(hil, "stage_factory_image", return_value=(Path("/factory.bin"), self.flash_layout(), "d" * 64)),
                 mock.patch.object(
                     hil, "capture_config_fingerprint", side_effect=[b"before", b"after", b"before"]
                 ),
+                mock.patch.object(hil, "capture_filesystem_backup", return_value=(Path("/filesystem.bin"), "e" * 64)),
                 mock.patch.object(hil, "write_flash_marker"),
                 mock.patch.object(hil, "flash", return_value={"role": "dut"}),
+                mock.patch.object(hil, "restore_production_state", return_value={"role": "dut"}),
                 mock.patch.object(hil, "restore_config_backup") as restore_config,
                 mock.patch.object(hil, "smoke", return_value=report),
                 mock.patch.object(hil, "message_flow", return_value=report),
@@ -1187,6 +1244,7 @@ class HilRunnerTests(unittest.TestCase):
             artifacts = Path(directory) / "artifacts"
             with (
                 mock.patch.object(hil, "stage_release_image", return_value=(Path("/staged.bin"), "d" * 64)),
+                mock.patch.object(hil, "stage_factory_image", return_value=(Path("/factory.bin"), self.flash_layout(), "e" * 64)),
                 mock.patch.object(
                     hil, "capture_config_fingerprint", side_effect=hil.HilError("backup failed")
                 ),
@@ -1210,15 +1268,23 @@ class HilRunnerTests(unittest.TestCase):
             events.append("backup")
             return b"same"
 
-        def mark(path, image):
+        def filesystem(*_args, **_kwargs):
+            events.append("filesystem")
+            return Path("/filesystem.bin"), "f" * 64
+
+        def mark(path, image, factory, filesystem_backup):
             events.append("marker")
             self.assertEqual(image, Path("/staged.bin"))
+            self.assertEqual(factory, Path("/factory.bin"))
+            self.assertEqual(filesystem_backup.name, "filesystem-before.bin")
             return path.parent / "hil-flash-started"
 
         def flash(*_args, **kwargs):
-            events.append("production" if kwargs.get("release") else "hil")
-            if not kwargs.get("release"):
-                raise hil.HilError("upload failed")
+            events.append("hil")
+            raise hil.HilError("upload failed")
+
+        def restore(*_args, **_kwargs):
+            events.append("production")
             return {"role": "dut"}
 
         with tempfile.TemporaryDirectory() as directory:
@@ -1227,14 +1293,20 @@ class HilRunnerTests(unittest.TestCase):
                 mock.patch.object(
                     hil, "stage_release_image", return_value=(Path("/staged.bin"), "e" * 64)
                 ),
+                mock.patch.object(
+                    hil, "stage_factory_image",
+                    return_value=(Path("/factory.bin"), self.flash_layout(), "f" * 64),
+                ),
                 mock.patch.object(hil, "capture_config_fingerprint", side_effect=capture),
+                mock.patch.object(hil, "capture_filesystem_backup", side_effect=filesystem),
                 mock.patch.object(hil, "write_flash_marker", side_effect=mark),
                 mock.patch.object(hil, "flash", side_effect=flash),
+                mock.patch.object(hil, "restore_production_state", side_effect=restore),
             ):
                 with self.assertRaisesRegex(hil.HilError, "upload failed"):
                     self.local_full_run({"schema": 1}, artifacts, timeout=1, skip_build=True)
 
-        self.assertEqual(events[:4], ["backup", "marker", "hil", "production"])
+        self.assertEqual(events[:5], ["backup", "filesystem", "marker", "hil", "production"])
 
     def test_full_run_soaks_exact_production_before_final_config_fingerprint(self):
         events = []
@@ -1245,12 +1317,16 @@ class HilRunnerTests(unittest.TestCase):
             return b"same"
 
         def flash(_fixture, release=False, image_override=None):
-            events.append("production-flash" if release else "hil-flash")
+            events.append("hil-flash")
+            return {"role": "dut"}
+
+        def restore(*_args):
+            events.append("production-restore")
             return {"role": "dut"}
 
         def soak(_fixture, **kwargs):
             events.append("production-soak")
-            self.assertEqual(kwargs["expected_before_hil"].node_count, 40)
+            self.assertNotIn("expected_before_hil", kwargs)
             return {
                 "validated": True,
                 "config_dump_cycles": 10,
@@ -1262,12 +1338,16 @@ class HilRunnerTests(unittest.TestCase):
             artifacts = Path(directory) / "artifacts"
             with (
                 mock.patch.object(hil, "validate_app_image", return_value=Path("/exact.bin")),
+                mock.patch.object(hil, "validate_factory_image", return_value=(Path("/exact.factory.bin"), self.flash_layout())),
                 mock.patch.object(
                     hil, "stage_release_image", return_value=(Path("/staged.bin"), "f" * 64)
                 ),
+                mock.patch.object(hil, "stage_factory_image", return_value=(Path("/factory.bin"), self.flash_layout(), "1" * 64)),
                 mock.patch.object(hil, "capture_config_fingerprint", side_effect=capture),
+                mock.patch.object(hil, "capture_filesystem_backup", return_value=(Path("/filesystem.bin"), "2" * 64)),
                 mock.patch.object(hil, "write_flash_marker"),
                 mock.patch.object(hil, "flash", side_effect=flash),
+                mock.patch.object(hil, "restore_production_state", side_effect=restore),
                 mock.patch.object(hil, "smoke", return_value=report),
                 mock.patch.object(hil, "message_flow", return_value=report),
                 mock.patch.object(hil, "visual", return_value=report),
@@ -1280,13 +1360,14 @@ class HilRunnerTests(unittest.TestCase):
                 self.assertEqual(
                     self.local_full_run(
                         self.production_fixture(), artifacts, timeout=1, skip_build=True,
-                        release_image=Path("/exact.bin"), production_wifi=True,
+                        release_image=Path("/exact.bin"), factory_image=Path("/exact.factory.bin"),
+                        production_wifi=True,
                     ),
                     0,
                 )
 
             summary = json.loads((artifacts / "summary.json").read_text())
-        self.assertLess(events.index("production-flash"), events.index("production-soak"))
+        self.assertLess(events.index("production-restore"), events.index("production-soak"))
         self.assertLess(events.index("production-soak"), events.index("config-after"))
         self.assertTrue(summary["production_wifi_validated"])
         self.assertTrue(summary["configuration_preserved"])
@@ -1303,7 +1384,11 @@ class HilRunnerTests(unittest.TestCase):
             return b"same"
 
         def flash(_fixture, release=False, image_override=None):
-            events.append("production-flash" if release else "hil-flash")
+            events.append("hil-flash")
+            return {"role": "dut"}
+
+        def restore(*_args):
+            events.append("production-restore")
             return {"role": "dut"}
 
         def fail_soak(_fixture, **_kwargs):
@@ -1314,12 +1399,16 @@ class HilRunnerTests(unittest.TestCase):
             artifacts = Path(directory) / "artifacts"
             with (
                 mock.patch.object(hil, "validate_app_image", return_value=Path("/exact.bin")),
+                mock.patch.object(hil, "validate_factory_image", return_value=(Path("/exact.factory.bin"), self.flash_layout())),
                 mock.patch.object(
                     hil, "stage_release_image", return_value=(Path("/staged.bin"), "0" * 64)
                 ),
+                mock.patch.object(hil, "stage_factory_image", return_value=(Path("/factory.bin"), self.flash_layout(), "1" * 64)),
                 mock.patch.object(hil, "capture_config_fingerprint", side_effect=capture),
+                mock.patch.object(hil, "capture_filesystem_backup", return_value=(Path("/filesystem.bin"), "2" * 64)),
                 mock.patch.object(hil, "write_flash_marker"),
                 mock.patch.object(hil, "flash", side_effect=flash),
+                mock.patch.object(hil, "restore_production_state", side_effect=restore),
                 mock.patch.object(hil, "smoke", return_value=report),
                 mock.patch.object(hil, "message_flow", return_value=report),
                 mock.patch.object(hil, "visual", return_value=report),
@@ -1332,7 +1421,8 @@ class HilRunnerTests(unittest.TestCase):
                 with self.assertRaises(hil.UnexpectedReboot):
                     self.local_full_run(
                         self.production_fixture(), artifacts, timeout=1, skip_build=True,
-                        release_image=Path("/exact.bin"), production_wifi=True,
+                        release_image=Path("/exact.bin"), factory_image=Path("/exact.factory.bin"),
+                        production_wifi=True,
                     )
 
             summary = json.loads((artifacts / "summary.json").read_text())
@@ -1367,6 +1457,75 @@ class HilRunnerTests(unittest.TestCase):
             with self.assertRaisesRegex(hil.HilError, "invalid ESP magic"):
                 hil.validate_app_image(bad)
 
+    def test_factory_layout_is_derived_and_bound_to_the_release_app(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            _, app, factory, _ = self.recovery_files(root)
+            resolved, layout = hil.validate_factory_image(factory, app)
+            self.assertEqual(resolved, factory.resolve())
+            self.assertEqual(layout.app_offset, 0x10000)
+            self.assertEqual(layout.app_size, 0x330000)
+            self.assertEqual(layout.filesystem_offset, 0x670000)
+            self.assertEqual(layout.filesystem_size, 0x180000)
+            self.assertRegex(layout.partition_table_sha256, r"^[0-9a-f]{64}$")
+
+            wrong = root / "wrong.bin"
+            wrong.write_bytes(b"\xe9" + b"\1" * (64 * 1024 - 1))
+            with self.assertRaisesRegex(hil.HilError, "factory/app bytes do not match"):
+                hil.validate_factory_image(factory, wrong)
+
+    def test_filesystem_capture_is_identity_bound_exact_size_and_owner_only(self):
+        with tempfile.TemporaryDirectory() as directory:
+            destination = Path(directory) / "filesystem-before.bin"
+            layout = self.flash_layout()
+
+            def run(command, **_kwargs):
+                self.assertIn("read-flash", command)
+                self.assertIn(hex(layout.filesystem_offset), command)
+                self.assertIn(hex(layout.filesystem_size), command)
+                Path(command[-1]).write_bytes(b"\xa5" * layout.filesystem_size)
+
+            with (
+                mock.patch.object(
+                    hil, "resolve_role",
+                    return_value={"usb_serial": "AA:BB:CC:DD:EE:FF", "port": "/dev/dut"},
+                ),
+                mock.patch.object(hil, "chip_mac", return_value="AA:BB:CC:DD:EE:FF"),
+                mock.patch.object(hil, "wait_for_usb_serial", return_value={"port": "/dev/dut"}),
+                mock.patch.object(hil, "find_esptool", return_value=["esptool"]),
+                mock.patch.object(hil, "run_checked", side_effect=run),
+            ):
+                backup, digest = hil.capture_filesystem_backup({}, destination, layout)
+
+            self.assertEqual(backup, destination.resolve())
+            self.assertEqual(stat.S_IMODE(backup.stat().st_mode), 0o600)
+            self.assertEqual(digest, hashlib.sha256(backup.read_bytes()).hexdigest())
+
+    def test_production_restore_writes_and_verifies_app_plus_filesystem_before_boot(self):
+        with tempfile.TemporaryDirectory() as directory:
+            _, app, factory, filesystem = self.recovery_files(Path(directory))
+            commands = []
+            with (
+                mock.patch.object(
+                    hil, "resolve_role",
+                    return_value={"usb_serial": "AA:BB:CC:DD:EE:FF", "port": "/dev/dut"},
+                ),
+                mock.patch.object(hil, "chip_mac", return_value="AA:BB:CC:DD:EE:FF"),
+                mock.patch.object(hil, "wait_for_usb_serial", return_value={"port": "/dev/dut"}),
+                mock.patch.object(hil, "find_esptool", return_value=["esptool"]),
+                mock.patch.object(hil, "run_checked", side_effect=lambda command, **_kwargs: commands.append(command)),
+                mock.patch.object(hil, "kick_device", return_value={"port": "/dev/dut"}),
+            ):
+                hil.restore_production_state({}, app, factory, filesystem)
+
+            self.assertEqual(len(commands), 2)
+            self.assertIn("write-flash", commands[0])
+            self.assertIn("no-reset", commands[0])
+            self.assertIn(hex(self.flash_layout().filesystem_offset), commands[0])
+            self.assertIn(str(filesystem.resolve()), commands[0])
+            self.assertIn("verify-flash", commands[1])
+            self.assertIn(str(filesystem.resolve()), commands[1])
+
     def test_restore_cli_uses_only_the_explicit_validated_release_image(self):
         with tempfile.TemporaryDirectory() as directory:
             image = Path(directory) / "release.bin"
@@ -1385,21 +1544,15 @@ class HilRunnerTests(unittest.TestCase):
     def test_restore_recovery_requires_backup_and_matching_durable_marker(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
-            image = root / "release.bin"
-            image.write_bytes(b"\xe9" + b"\0" * (64 * 1024 - 1))
-            backup = root / "config-before.yaml"
-            backup.write_bytes(
-                b"channel_url: secret\nconfig:\nmodule_config:\nowner: fixture\n"
-                b"  privateKey: 1234567890abcdef\n"
-            )
-            backup.chmod(0o600)
+            backup, image, factory, filesystem = self.recovery_files(root)
             marker = root / "hil-flash-started"
             marker.write_bytes(b"invalid\n")
             marker.chmod(0o600)
             fixture = {"schema": 1}
             argv = [
                 "hil.py", "restore", "--fixture", "fixture.json", "--image", str(image),
-                "--config-backup", str(backup), "--flash-marker", str(marker),
+                "--factory-image", str(factory), "--config-backup", str(backup),
+                "--filesystem-backup", str(filesystem), "--flash-marker", str(marker),
             ]
             with (
                 mock.patch.object(hil, "load_fixture", return_value=fixture),
@@ -1412,43 +1565,55 @@ class HilRunnerTests(unittest.TestCase):
     def test_flash_marker_is_owner_only_exclusive_and_bound_to_backup_and_image(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
-            backup = root / "config-before.yaml"
+            backup, image_a, factory_a, filesystem = self.recovery_files(root)
             other_backup = root / "other.yaml"
-            image_a = root / "release-a.bin"
             image_b = root / "release-b.bin"
-            payload = (
-                b"channel_url: secret\nconfig:\nmodule_config:\nowner: fixture\n"
-                b"  privateKey: 1234567890abcdef\n"
-            )
-            backup.write_bytes(payload)
-            backup.chmod(0o600)
+            payload = backup.read_bytes()
             other_backup.write_bytes(payload.replace(b"fixture", b"other"))
             other_backup.chmod(0o600)
-            image_a.write_bytes(b"\xe9" + b"\0" * (64 * 1024 - 1))
             image_b.write_bytes(b"\xe9" + b"\1" * (64 * 1024 - 1))
-            marker = hil.write_flash_marker(backup, image_a)
+            factory_b = root / "release-b.factory.bin"
+            factory_b_payload = bytearray(factory_a.read_bytes())
+            factory_b_payload[0x10000:0x20000] = image_b.read_bytes()
+            factory_b.write_bytes(factory_b_payload)
+            marker = hil.write_flash_marker(backup, image_a, factory_a, filesystem)
             self.assertEqual(marker, (root / "hil-flash-started").resolve())
             self.assertEqual(stat.S_IMODE(marker.stat().st_mode), 0o600)
             marker_payload = json.loads(marker.read_text())
-            self.assertEqual(marker_payload["schema"], 2)
+            self.assertEqual(marker_payload["schema"], 3)
             self.assertEqual(marker_payload["release_app_size"], image_a.stat().st_size)
             self.assertEqual(
                 marker_payload["release_app_sha256"],
                 hashlib.sha256(image_a.read_bytes()).hexdigest(),
             )
             self.assertEqual(
-                hil.validate_flash_marker(marker, backup, image_a), marker.resolve()
+                hil.validate_flash_marker(
+                    marker, backup, image_a, factory_a, filesystem
+                ), marker.resolve()
             )
             with self.assertRaisesRegex(hil.HilError, "not exclusive"):
-                hil.write_flash_marker(backup, image_a)
+                hil.write_flash_marker(backup, image_a, factory_a, filesystem)
             with self.assertRaises(hil.HilError):
-                hil.validate_flash_marker(marker, other_backup, image_a)
+                hil.validate_flash_marker(
+                    marker, other_backup, image_a, factory_a, filesystem
+                )
             with self.assertRaisesRegex(hil.HilError, "marker is invalid"):
-                hil.validate_flash_marker(marker, backup, image_b)
+                hil.validate_flash_marker(
+                    marker, backup, image_b, factory_b, filesystem
+                )
+            copied_filesystem = root / "copied-filesystem.bin"
+            copied_filesystem.write_bytes(filesystem.read_bytes())
+            copied_filesystem.chmod(0o600)
+            with self.assertRaisesRegex(hil.HilError, "outside the configuration recovery vault"):
+                hil.validate_flash_marker(
+                    marker, backup, image_a, factory_a, copied_filesystem
+                )
             backup.write_bytes(payload.replace(b"fixture", b"changed"))
             backup.chmod(0o600)
             with self.assertRaises(hil.HilError):
-                hil.validate_flash_marker(marker, backup, image_a)
+                hil.validate_flash_marker(
+                    marker, backup, image_a, factory_a, filesystem
+                )
 
     def test_flash_marker_accepts_canonical_equivalent_path_with_symlink_ancestor(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -1458,34 +1623,27 @@ class HilRunnerTests(unittest.TestCase):
             vault.mkdir(parents=True, mode=0o700)
             alias = root / "alias"
             alias.symlink_to(real, target_is_directory=True)
-            backup = alias / "vault" / "config-before.yaml"
-            backup.write_bytes(
-                b"channel_url: secret\nconfig:\nmodule_config:\nowner: fixture\n"
-                b"  privateKey: 1234567890abcdef\n"
-            )
-            backup.chmod(0o600)
-            image = vault / "release.bin"
-            image.write_bytes(b"\xe9" + b"\0" * (64 * 1024 - 1))
-            marker = hil.write_flash_marker(backup, image)
+            real_backup, image, factory, filesystem = self.recovery_files(vault)
+            backup = alias / "vault" / real_backup.name
+            marker = hil.write_flash_marker(backup, image, factory, filesystem)
             lexical_marker = alias / "vault" / "hil-flash-started"
             self.assertEqual(
-                hil.validate_flash_marker(lexical_marker, backup, image), marker.resolve()
+                hil.validate_flash_marker(
+                    lexical_marker, backup, image, factory, filesystem
+                ), marker.resolve()
             )
 
     def test_restore_recovery_rejects_valid_but_unbound_release_image_before_flash(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
-            backup = root / "config-before.yaml"
-            backup.write_bytes(
-                b"channel_url: secret\nconfig:\nmodule_config:\nowner: fixture\n"
-                b"  privateKey: 1234567890abcdef\n"
-            )
-            backup.chmod(0o600)
-            image_a = root / "release-a.bin"
+            backup, image_a, factory_a, filesystem = self.recovery_files(root)
             image_b = root / "release-b.bin"
-            image_a.write_bytes(b"\xe9" + b"\0" * (64 * 1024 - 1))
             image_b.write_bytes(b"\xe9" + b"\1" * (64 * 1024 - 1))
-            marker = hil.write_flash_marker(backup, image_a)
+            factory_b = root / "release-b.factory.bin"
+            factory_b_payload = bytearray(factory_a.read_bytes())
+            factory_b_payload[0x10000:0x20000] = image_b.read_bytes()
+            factory_b.write_bytes(factory_b_payload)
+            marker = hil.write_flash_marker(backup, image_a, factory_a, filesystem)
             with (
                 mock.patch.object(hil, "load_fixture", return_value={"schema": 1}),
                 mock.patch.object(hil, "flash") as flash,
@@ -1495,6 +1653,8 @@ class HilRunnerTests(unittest.TestCase):
                     [
                         "hil.py", "restore", "--fixture", "fixture.json",
                         "--image", str(image_b), "--config-backup", str(backup),
+                        "--factory-image", str(factory_b),
+                        "--filesystem-backup", str(filesystem),
                         "--flash-marker", str(marker),
                     ],
                 ),
@@ -1505,15 +1665,8 @@ class HilRunnerTests(unittest.TestCase):
     def test_flash_marker_rejects_legacy_schema(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
-            backup = root / "config-before.yaml"
-            payload = (
-                b"channel_url: secret\nconfig:\nmodule_config:\nowner: fixture\n"
-                b"  privateKey: 1234567890abcdef\n"
-            )
-            backup.write_bytes(payload)
-            backup.chmod(0o600)
-            image = root / "release.bin"
-            image.write_bytes(b"\xe9" + b"\0" * (64 * 1024 - 1))
+            backup, image, factory, filesystem = self.recovery_files(root)
+            payload = backup.read_bytes()
             marker = root / "hil-flash-started"
             marker.write_text(
                 json.dumps(
@@ -1529,7 +1682,7 @@ class HilRunnerTests(unittest.TestCase):
             )
             marker.chmod(0o600)
             with self.assertRaisesRegex(hil.HilError, "marker is invalid"):
-                hil.validate_flash_marker(marker, backup, image)
+                hil.validate_flash_marker(marker, backup, image, factory, filesystem)
 
     def test_restore_recovery_rejects_one_sided_backup_marker_pair(self):
         fixture = {"schema": 1}
@@ -1560,15 +1713,8 @@ class HilRunnerTests(unittest.TestCase):
     def test_paired_recovery_requires_exact_image_before_flash(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
-            backup = root / "config-before.yaml"
-            backup.write_bytes(
-                b"channel_url: secret\nconfig:\nmodule_config:\nowner: fixture\n"
-                b"  privateKey: 1234567890abcdef\n"
-            )
-            backup.chmod(0o600)
-            image = root / "release.bin"
-            image.write_bytes(b"\xe9" + b"\0" * (64 * 1024 - 1))
-            marker = hil.write_flash_marker(backup, image)
+            backup, image, factory, filesystem = self.recovery_files(root)
+            marker = hil.write_flash_marker(backup, image, factory, filesystem)
             with (
                 mock.patch.object(hil, "load_fixture", return_value={"schema": 1}),
                 mock.patch.object(hil, "flash") as flash,
@@ -1577,7 +1723,8 @@ class HilRunnerTests(unittest.TestCase):
                     "argv",
                     [
                         "hil.py", "restore", "--fixture", "fixture.json",
-                        "--config-backup", str(backup), "--flash-marker", str(marker),
+                        "--factory-image", str(factory), "--config-backup", str(backup),
+                        "--filesystem-backup", str(filesystem), "--flash-marker", str(marker),
                     ],
                 ),
             ):

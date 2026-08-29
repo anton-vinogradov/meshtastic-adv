@@ -51,17 +51,20 @@ diff --git a/src/mesh/api/WiFiServerAPI.cpp b/src/mesh/api/WiFiServerAPI.cpp
 -        apiPort = new WiFiServerPort(port);
 -        LOG_INFO("API server listen on TCP port %d", port);
 -        apiPort->init();
++        WiFiServerPort *next = nullptr;
 +        try {
-+            apiPort = new (std::nothrow) WiFiServerPort(port); // advui-inject-wifi-listener-oom-failsoft
-+            if (apiPort) {
++            next = new (std::nothrow) WiFiServerPort(port); // advui-inject-wifi-listener-oom-failsoft
++            if (next) {
++                next->init();
++                apiPort = next;
 +                LOG_INFO("API server listen on TCP port %d", port);
-+                apiPort->init();
 +            } else {
 +                LOG_ERROR("Insufficient heap to start WiFi API server");
 +            }
 +        } catch (const std::bad_alloc &) {
-+            // Constructor failure automatically releases its allocation. Keep
-+            // the global null so a later WiFi reinitialization can retry.
++            // A constructor throw releases its own storage; an init() throw
++            // happens after construction, so release that completed object.
++            delete next;
 +            apiPort = nullptr;
 +            LOG_ERROR("Insufficient heap while starting WiFi API server");
 +        }

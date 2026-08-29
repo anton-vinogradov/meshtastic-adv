@@ -291,6 +291,17 @@ if [ -f "$CH" ] && ! grep -q 'advui-inject-nohttps' "$CH"; then
   echo "injected advui no-HTTPS guard into ContentHandler.cpp"
 fi
 
+# The bundled HTTP server and JSON handlers use throwing STL allocations for
+# each accepted request. Under fragmented-heap pressure, retire only the local
+# web UI instead of allowing bad_alloc to reboot the mesh node. Limit the
+# already-HTTP-only server to the same two concurrent clients as the removed
+# HTTPS listener.
+if [ -f "$WS" ] && ! grep -q 'advui-inject-webserver-oom-failsoft' "$WS"; then
+  git -C "$FW" apply "$ROOT/overlay/patches/webserver-oom-failsoft.patch"
+  echo "injected fail-soft HTTP allocation handling"
+fi
+test "$(grep -c 'advui-inject-webserver-oom-failsoft' "$WS" || true)" -eq 1
+
 # NodeDB.cpp: saveNodeDatabaseToDisk() stages the four satellite maps into
 # on-disk vectors with reserve() calls that each want a contiguous multi-KB
 # block. On this no-PSRAM board under a busy mesh the heap can be ground low

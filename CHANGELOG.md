@@ -5,14 +5,36 @@ release notes remain available on the [GitHub Releases page](https://github.com/
 
 ## [Unreleased]
 
-No user-visible changes are pending after 1.0.9.
+No user-visible changes are pending after 1.0.10.
+
+## [1.0.10] - 2026-08-29
+
+### Fixed
+
+- Rolls forward the unpublished 1.0.9 candidate. Web UI server startup and
+  request processing now fail softly on fragmented-heap `std::bad_alloc`
+  instead of rebooting the whole device; the HTTP listener also uses the
+  existing two-client resource bound. WiFi PhoneAPI listener initialization
+  releases a fully constructed temporary object if its `init()` allocation
+  fails.
+- Release HIL now checkpoints the complete production LittleFS partition in an
+  owner-only recovery vault and restores and verifies it together with the exact
+  production app before boot. The durable recovery marker binds the app,
+  factory partition layout, configuration export and filesystem snapshot. This
+  preserves message history, learned nodes and every other persistent file even
+  after an interrupted job.
+- The post-restore NodeDB soak no longer compares the persisted cache with a
+  larger volatile RF-learned pre-HIL count. It still enforces the fixture floor,
+  repeated complete PhoneAPI dumps and a stable reboot counter; the raw
+  verified byte-for-byte filesystem restoration now provides the persistence
+  guarantee.
 
 ## [1.0.9] - 2026-08-29
 
 ### Fixed
 
-- Rolls forward the unpublished 1.0.8 candidate after its release gate caught a
-  real loss of the learned node cache: HIL now uses a private NodeDB filename as
+- Rolls forward the unpublished 1.0.8 candidate after its release gate reported
+  a possible loss of the learned node cache: HIL now uses a private NodeDB filename as
   well as disabling saves, so its reduced in-memory database cannot even open
   production `nodes.proto`. The physical suite also proves that the USB DUT and
   production WiFi endpoint expose the same mesh node identity.

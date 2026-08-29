@@ -140,6 +140,7 @@ jobs:
     env:
       HIL_RECOVERY_ROOT: ${{ vars.HIL_RECOVERY_ROOT }}
       HIL_CONFIG_BACKUP: ${{ vars.HIL_RECOVERY_ROOT }}/run-${{ github.run_id }}-attempt-${{ github.run_attempt }}/config-before.yaml
+      HIL_FILESYSTEM_BACKUP: ${{ vars.HIL_RECOVERY_ROOT }}/run-${{ github.run_id }}-attempt-${{ github.run_attempt }}/filesystem-before.bin
       HIL_FLASH_MARKER: ${{ vars.HIL_RECOVERY_ROOT }}/run-${{ github.run_id }}-attempt-${{ github.run_attempt }}/hil-flash-started
     steps:
       - name: Checkout release source and pinned firmware
@@ -199,6 +200,7 @@ jobs:
           test -n "$factory" && test -n "$app"
           FACTORY="$factory" APP="$app" python -c 'import os,pathlib,sys; f=pathlib.Path(os.environ["FACTORY"]).read_bytes(); a=pathlib.Path(os.environ["APP"]).read_bytes(); mismatch=not a or f[0x10000:0x10000+len(a)] != a; sys.exit("factory/app byte mismatch") if mismatch else None'
           echo "path=$app" >> "$GITHUB_OUTPUT"
+          echo "factory=$factory" >> "$GITHUB_OUTPUT"
 
       - name: Materialize the identity-bound lab fixture
         id: fixture
@@ -221,6 +223,7 @@ jobs:
             --usb \
             --production-wifi \
             --release-image "${{ steps.release_app.outputs.path }}" \
+            --factory-image "${{ steps.release_app.outputs.factory }}" \
             --config-backup "$HIL_CONFIG_BACKUP" \
             --fixture "$HIL_FIXTURE" \
             --artifacts hil-artifacts/release-hil
@@ -241,7 +244,9 @@ jobs:
           python scripts/hil.py restore \
             --fixture "$HIL_FIXTURE" \
             --image "${{ steps.release_app.outputs.path }}" \
+            --factory-image "${{ steps.release_app.outputs.factory }}" \
             --config-backup "$HIL_CONFIG_BACKUP" \
+            --filesystem-backup "$HIL_FILESYSTEM_BACKUP" \
             --flash-marker "$HIL_FLASH_MARKER"
 
       - name: Build deterministic release-demo media
@@ -283,10 +288,12 @@ jobs:
         if: always() && (steps.hil.outcome == 'success' || steps.recovery.outcome == 'success')
         run: |
           expected="$HIL_RECOVERY_ROOT/run-${GITHUB_RUN_ID}-attempt-${GITHUB_RUN_ATTEMPT}/config-before.yaml"
+          filesystem="$HIL_RECOVERY_ROOT/run-${GITHUB_RUN_ID}-attempt-${GITHUB_RUN_ATTEMPT}/filesystem-before.bin"
           marker="$HIL_RECOVERY_ROOT/run-${GITHUB_RUN_ID}-attempt-${GITHUB_RUN_ATTEMPT}/hil-flash-started"
           test "$HIL_CONFIG_BACKUP" = "$expected"
+          test "$HIL_FILESYSTEM_BACKUP" = "$filesystem"
           test "$HIL_FLASH_MARKER" = "$marker"
-          rm -f -- "$HIL_CONFIG_BACKUP" "$HIL_FLASH_MARKER"
+          rm -f -- "$HIL_CONFIG_BACKUP" "$HIL_FILESYSTEM_BACKUP" "$HIL_FLASH_MARKER"
           rmdir -- "$(dirname "$HIL_CONFIG_BACKUP")"
 
       - name: Remove the identity-bound temporary fixture

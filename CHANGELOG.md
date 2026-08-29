@@ -5,7 +5,19 @@ release notes remain available on the [GitHub Releases page](https://github.com/
 
 ## [Unreleased]
 
-No user-visible changes are pending after 1.0.7.
+No user-visible changes are pending after 1.0.8.
+
+## [1.0.8] - 2026-08-29
+
+### Fixed
+
+- Rolls forward all runtime and release-safety improvements from the unpublished
+  1.0.6 and 1.0.7 candidates: bounded large-NodeDB streams, preservation of the
+  production node cache across HIL, lower UI stack demand, and fail-soft BLE and
+  audio paths under memory pressure.
+- The release-image output block now satisfies the pinned `actionlint`/ShellCheck
+  gate, allowing the already verified firmware and private HIL artifacts to
+  advance to physical testing and publication.
 
 ## [1.0.7] - 2026-08-29
 
@@ -225,7 +237,8 @@ The 1.0 release line delivered the following product and release-engineering sco
   cannot reuse stale output, and prereleases cannot enter stable distribution
   channels.
 
-[Unreleased]: https://github.com/anton-vinogradov/meshtastic-adv/compare/v1.0.7...HEAD
+[Unreleased]: https://github.com/anton-vinogradov/meshtastic-adv/compare/v1.0.8...HEAD
+[1.0.8]: https://github.com/anton-vinogradov/meshtastic-adv/compare/v1.0.7...v1.0.8
 [1.0.7]: https://github.com/anton-vinogradov/meshtastic-adv/compare/v1.0.6...v1.0.7
 [1.0.6]: https://github.com/anton-vinogradov/meshtastic-adv/compare/v1.0.5...v1.0.6
 [1.0.5]: https://github.com/anton-vinogradov/meshtastic-adv/compare/v1.0.4...v1.0.5

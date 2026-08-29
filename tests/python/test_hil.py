@@ -235,6 +235,11 @@ class HilRunnerTests(unittest.TestCase):
         self.assertIn("free(g_buffers)", ble_init)
         self.assertIn("g_rxQueue = nullptr", ble_init)
         self.assertLess(ble_init.index("if (g_bleInitFailed)"), ble_init.index("if (!initQueues())"))
+        reset = ble.split("void resetCompanionState()", 1)[1].split("// my_info is the boundary", 1)[0]
+        self.assertNotIn("initQueues()", reset)
+        self.assertIn("g_buffers != nullptr", reset)
+        hil_clear = ble.split("void bleHilClearState()", 1)[1].split("void bleHilReleaseState()", 1)[0]
+        self.assertIn("initQueues()", hil_clear)
         self.assertNotIn("std::stable_sort", ui)
         self.assertIn("kSeenHotCap = 150", ui)
         self.assertNotIn("hotId[266]", ui)

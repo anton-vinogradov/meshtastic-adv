@@ -318,7 +318,10 @@ uint8_t g_connType = 0;
 
 void resetCompanionState()
 {
-    const bool haveBuffers = initQueues();
+    // Reset is also used after a failed/disabled BLE stack. It must never
+    // resurrect the ~9 KB companion arena merely to clear already-empty state;
+    // callers that are about to use the transport establish the queues first.
+    const bool haveBuffers = g_buffers != nullptr;
     {
         StateGuard guard;
         g_compNodeCount.store(0, std::memory_order_relaxed);
@@ -776,6 +779,10 @@ bool bleHilInjectFromRadio(const uint8_t *bytes, uint16_t len)
 
 void bleHilClearState()
 {
+    // Unlike a production disconnect, the synthetic ingress fixture needs the
+    // queues immediately after a clear. Keep that allocation explicit so the
+    // ordinary reset primitive remains allocation-free after BLE-init OOM.
+    (void)initQueues();
     resetCompanionState();
     g_hilIngressFirstHeap = 0;
     g_hilIngressLastHeap = 0;

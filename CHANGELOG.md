@@ -5,7 +5,16 @@ release notes remain available on the [GitHub Releases page](https://github.com/
 
 ## [Unreleased]
 
-No user-visible changes are pending after 1.0.17.
+No user-visible changes are pending after 1.0.18.
+
+## [1.0.18] - 2026-08-29
+
+### Fixed
+
+- Clearing a failed companion link no longer reallocates the roughly 8.5 KiB
+  companion arena after NimBLE initialization has already failed and disabled
+  retries for the current boot. The low-memory failure path now stays released
+  even if the user forgets the unavailable peer.
 
 ## [1.0.17] - 2026-08-29
 
@@ -360,7 +369,8 @@ The 1.0 release line delivered the following product and release-engineering sco
   cannot reuse stale output, and prereleases cannot enter stable distribution
   channels.
 
-[Unreleased]: https://github.com/anton-vinogradov/meshtastic-adv/compare/v1.0.17...HEAD
+[Unreleased]: https://github.com/anton-vinogradov/meshtastic-adv/compare/v1.0.18...HEAD
+[1.0.18]: https://github.com/anton-vinogradov/meshtastic-adv/compare/v1.0.17...v1.0.18
 [1.0.17]: https://github.com/anton-vinogradov/meshtastic-adv/compare/v1.0.16...v1.0.17
 [1.0.16]: https://github.com/anton-vinogradov/meshtastic-adv/compare/v1.0.15...v1.0.16
 [1.0.15]: https://github.com/anton-vinogradov/meshtastic-adv/compare/v1.0.14...v1.0.15

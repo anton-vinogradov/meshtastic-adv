@@ -54,6 +54,9 @@ namespace
 {
 int g_scanCount = 0;
 bool g_scanning = false;
+#ifndef ADVUI_HIL
+bool g_bleInitFailed = false;
+#endif
 char g_linkErr[kBleLinkErrorSize] = {0};
 std::atomic<bool> g_compLoraValid{false};
 std::atomic<bool> g_compDeviceValid{false};
@@ -847,15 +850,31 @@ bool bleCompanionInit()
     g_bleUnsupported = true;
     return false;
 #else
+    if (g_bleInitFailed)
+        return false; // a partial NimBLE init is not safe to repeat this boot
     if (!initQueues()) {
         fail("no mem for companion");
         return false;
     }
     if (g_bleInited)
         return true;
-    BLEDevice::init("advui"); // no-op if the stock peripheral initialised the stack already
-    g_bleInited = true;
-    return true;
+    try {
+        BLEDevice::init("advui"); // no-op if the stock peripheral initialised the stack already
+        g_bleInited = true;
+        return true;
+    } catch (const std::bad_alloc &) {
+        // NimBLE creates its host/controller state with throwing STL
+        // allocations before the protected connect worker exists.
+        g_bleInitFailed = true;
+        // No worker can exist yet. The queues are static objects inside this
+        // single arena, so invalidate their handles and return its ~9 KB too.
+        g_rxQueue = nullptr;
+        g_txQueue = nullptr;
+        free(g_buffers);
+        g_buffers = nullptr;
+        fail("no mem for BLE init");
+        return false;
+    }
 #endif
 }
 

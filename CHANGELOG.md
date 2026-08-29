@@ -5,7 +5,23 @@ release notes remain available on the [GitHub Releases page](https://github.com/
 
 ## [Unreleased]
 
-No user-visible changes are pending after 1.0.15.
+No user-visible changes are pending after 1.0.16.
+
+## [1.0.16] - 2026-08-29
+
+### Fixed
+
+- Every runtime file open owned by the ADV UI now converts Arduino FS's
+  throwing `shared_ptr` allocation failure into an ordinary unavailable-file
+  result. History scrolling/compaction, unread tracking, message/config loads,
+  crash guards and saved-clock reads can no longer reboot the node solely
+  because the heap is fragmented.
+- The early radio-mode probe also catches file-handle OOM and selects the
+  smaller 32-node allocation for that boot instead of adding pressure during
+  NodeDB construction.
+- Companion-mode NimBLE initialization now fails softly before its protected
+  connect worker exists, releases the unused companion arena, and does not retry
+  a partially initialized stack in a loop during the same boot.
 
 ## [1.0.15] - 2026-08-29
 
@@ -332,7 +348,8 @@ The 1.0 release line delivered the following product and release-engineering sco
   cannot reuse stale output, and prereleases cannot enter stable distribution
   channels.
 
-[Unreleased]: https://github.com/anton-vinogradov/meshtastic-adv/compare/v1.0.15...HEAD
+[Unreleased]: https://github.com/anton-vinogradov/meshtastic-adv/compare/v1.0.16...HEAD
+[1.0.16]: https://github.com/anton-vinogradov/meshtastic-adv/compare/v1.0.15...v1.0.16
 [1.0.15]: https://github.com/anton-vinogradov/meshtastic-adv/compare/v1.0.14...v1.0.15
 [1.0.14]: https://github.com/anton-vinogradov/meshtastic-adv/compare/v1.0.13...v1.0.14
 [1.0.13]: https://github.com/anton-vinogradov/meshtastic-adv/compare/v1.0.12...v1.0.13

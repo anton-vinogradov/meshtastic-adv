@@ -57,6 +57,19 @@ namespace advui
 namespace
 {
 
+File openAdvFile(const char *path, const char *mode)
+{
+    try {
+        return FSCom.open(path, mode);
+    } catch (const std::bad_alloc &) {
+        // Arduino FS constructs every File handle through std::make_shared.
+        // Reads and non-atomic append paths must fail like an unavailable file,
+        // not reboot the messenger when the runtime heap is fragmented.
+        LOG_WARN("advui: file open deferred after heap allocation failure: %s", path ? path : "(null)");
+        return File();
+    }
+}
+
 // LovyanGFX wrapper for the embedded Cyrillic font — used for message text.
 const lgfx::U8g2font cyrFont(u8g2_font_9x15_t_cyrillic);
 
@@ -573,7 +586,7 @@ const char *kBleAttemptPath = "/advui_bleatt";
 
 bool bleAttemptMark()
 {
-    auto f = FSCom.open(kBleAttemptPath, FILE_O_WRITE);
+    auto f = openAdvFile(kBleAttemptPath, FILE_O_WRITE);
     if (!f) {
         LOG_ERROR("advui: cannot arm BLE connect crash guard");
         return false;
@@ -591,7 +604,7 @@ void bleAttemptClear()
 
 bool bleAttemptPending()
 {
-    auto f = FSCom.open(kBleAttemptPath, FILE_O_READ);
+    auto f = openAdvFile(kBleAttemptPath, FILE_O_READ);
     if (f) {
         f.close();
         return true;
@@ -737,7 +750,7 @@ uint16_t linkColor()
 
 void loadRadioCfg()
 {
-    auto f = FSCom.open(kRadioPath, FILE_O_READ);
+    auto f = openAdvFile(kRadioPath, FILE_O_READ);
     if (!f)
         return;
     uint32_t magic = 0;
@@ -1010,7 +1023,7 @@ static bool loadMsgsCounted(File &f, bool v3Messages, bool v4Reactions)
 
 void loadMsgs()
 {
-    auto f = FSCom.open(kMsgPath, FILE_O_READ);
+    auto f = openAdvFile(kMsgPath, FILE_O_READ);
     if (!f)
         return;
     uint32_t magic = 0;
@@ -1097,7 +1110,7 @@ bool histRewriteCurrent(int skip, int keep)
 {
     if (skip < 0 || keep < 0)
         return false;
-    auto in = FSCom.open(kHistPath, FILE_O_READ);
+    auto in = openAdvFile(kHistPath, FILE_O_READ);
     if (!in)
         return false;
     uint32_t magic = 0;
@@ -1127,7 +1140,7 @@ int histTotal()
     if (g_histTotal >= 0)
         return g_histTotal;
     g_histTotal = 0;
-    auto f = FSCom.open(kHistPath, FILE_O_READ);
+    auto f = openAdvFile(kHistPath, FILE_O_READ);
     if (f) {
         uint32_t magic = 0;
         bool got = f.read((uint8_t *)&magic, 4) == 4;
@@ -1154,7 +1167,7 @@ int histTotal()
 // One-shot: rewrite an AVH1 archive (MsgV3-sized records) into the current layout.
 bool histMigrateV1()
 {
-    auto in = FSCom.open(kHistPath, FILE_O_READ);
+    auto in = openAdvFile(kHistPath, FILE_O_READ);
     if (!in)
         return false;
     uint32_t magic = 0;
@@ -1211,7 +1224,7 @@ void histAppend(const Msg &m, uint32_t replyId)
 {
     bool fresh = histTotal() == 0;
     if (!fresh) {
-        auto check = FSCom.open(kHistPath, FILE_O_READ);
+        auto check = openAdvFile(kHistPath, FILE_O_READ);
         const size_t expected = 4 + (size_t)g_histTotal * kHistRec;
         if (!check || check.size() != expected) {
             if (check)
@@ -1223,7 +1236,7 @@ void histAppend(const Msg &m, uint32_t replyId)
     } else {
         // A failed AVH1 migration deliberately leaves the legacy file intact.
         // Do not mistake that preserved archive for a fresh AVH2 file and erase it.
-        auto check = FSCom.open(kHistPath, FILE_O_READ);
+        auto check = openAdvFile(kHistPath, FILE_O_READ);
         if (check) {
             uint32_t magic = 0;
             const bool current = check.read((uint8_t *)&magic, 4) == 4 && magic == kHistMagic && check.size() == 4;
@@ -1234,7 +1247,7 @@ void histAppend(const Msg &m, uint32_t replyId)
             }
         }
     }
-    auto f = FSCom.open(kHistPath, fresh ? FILE_O_WRITE : "a");
+    auto f = openAdvFile(kHistPath, fresh ? FILE_O_WRITE : "a");
     if (!f)
         return;
     bool ok = !fresh || f.write((const uint8_t *)&kHistMagic, 4) == 4;
@@ -1264,7 +1277,7 @@ int histCountFor(bool isChan, uint8_t ch, uint32_t node)
     int total = histTotal(), n = 0;
     if (!total)
         return 0;
-    auto f = FSCom.open(kHistPath, FILE_O_READ);
+    auto f = openAdvFile(kHistPath, FILE_O_READ);
     if (!f)
         return 0;
     if (!f.seek(4)) {
@@ -1295,7 +1308,7 @@ int histLoadSlice(bool isChan, uint8_t ch, uint32_t node, int skipNewest, int ma
         start = 0;
     if (end <= 0)
         return 0;
-    auto f = FSCom.open(kHistPath, FILE_O_READ);
+    auto f = openAdvFile(kHistPath, FILE_O_READ);
     if (!f)
         return 0;
     if (!f.seek(4)) {
@@ -1328,7 +1341,7 @@ bool histPurge(bool isChan, uint8_t ch, uint32_t node, bool *dropReacts)
     int total = histTotal();
     if (!total)
         return true;
-    auto in = FSCom.open(kHistPath, FILE_O_READ);
+    auto in = openAdvFile(kHistPath, FILE_O_READ);
     if (!in)
         return false;
     SafeFile out(kHistPath, true);
@@ -1384,7 +1397,7 @@ uint32_t reactionTargetFrom(const meshtastic_MeshPacket &p, uint32_t me)
         consider(g_msgs[i]);
 
     const int total = histTotal();
-    auto history = total > 0 ? FSCom.open(kHistPath, FILE_O_READ) : File();
+    auto history = total > 0 ? openAdvFile(kHistPath, FILE_O_READ) : File();
     if (history && history.seek(4)) {
         HistRec rec;
         for (int i = 0; i < total; i++) {
@@ -1495,9 +1508,9 @@ void seenReconcile()
         }
     }
     bool fresh = false;
-    auto f = FSCom.open(kSeenPath, "r+");
+    auto f = openAdvFile(kSeenPath, "r+");
     if (!f) {
-        f = FSCom.open(kSeenPath, FILE_O_WRITE);
+        f = openAdvFile(kSeenPath, FILE_O_WRITE);
         if (!f)
             return;
         if (f.write((const uint8_t *)&kSeenMagic, 4) != 4) {
@@ -1513,7 +1526,7 @@ void seenReconcile()
             !checkedFixedRecordFile(f.size(), 4, sizeof(SeenRec), &records) || records > kSeenCap) {
             f.close();
             FSCom.remove(kSeenPath); // derived cache: rebuild it from the hot DB below
-            f = FSCom.open(kSeenPath, FILE_O_WRITE);
+            f = openAdvFile(kSeenPath, FILE_O_WRITE);
             if (!f || f.write((const uint8_t *)&kSeenMagic, 4) != 4) {
                 if (f)
                     f.close();
@@ -1875,7 +1888,7 @@ void persistUiCfg()
 
 void loadUiCfg()
 {
-    auto f = FSCom.open(kUiCfgPath, FILE_O_READ);
+    auto f = openAdvFile(kUiCfgPath, FILE_O_READ);
     if (!f)
         return;
     uint8_t v = 0;
@@ -2361,7 +2374,7 @@ void epochNote()
         return;
     static uint32_t savedDay = 0;
     if (!savedDay) { // first call this boot: don't rewrite a same-day record
-        auto f = FSCom.open(kEpochPath, FILE_O_READ);
+        auto f = openAdvFile(kEpochPath, FILE_O_READ);
         if (f) {
             uint32_t v = 0;
             const bool ok = f.size() == sizeof(v) && f.read((uint8_t *)&v, sizeof(v)) == sizeof(v) &&
@@ -2378,11 +2391,11 @@ void epochNote()
     // full SafeFile temp/readback/rename transaction buys no recoverability.
     // Avoiding the temporary file and rename keeps this tiny advisory write out
     // of LittleFS's heavier atomic path while messages spill into their archive.
-    auto f = FSCom.open(kEpochPath, FILE_O_WRITE);
+    auto f = openAdvFile(kEpochPath, FILE_O_WRITE);
     const bool wrote = f && f.write((uint8_t *)&now, sizeof(now)) == sizeof(now);
     if (f)
         f.close();
-    auto check = wrote ? FSCom.open(kEpochPath, FILE_O_READ) : File();
+    auto check = wrote ? openAdvFile(kEpochPath, FILE_O_READ) : File();
     uint32_t saved = 0;
     const bool verified = check && check.size() == sizeof(saved) &&
                           check.read((uint8_t *)&saved, sizeof(saved)) == sizeof(saved) && saved == now;
@@ -2396,7 +2409,7 @@ void epochNote()
 
 uint32_t savedDateEpoch()
 {
-    auto f = FSCom.open(kEpochPath, FILE_O_READ);
+    auto f = openAdvFile(kEpochPath, FILE_O_READ);
     if (!f)
         return 0;
     uint32_t v = 0;
@@ -3465,7 +3478,7 @@ void AdvUI::deleteConversation(const Conv &c)
     for (int i = 0; i < g_msgCount; i++)
         preserveReactionsForMessage(g_msgs[i].id, g_msgs[i].from, dropReacts);
     bool archiveChecked = historyPurged && g_histTotal == 0;
-    auto hist = historyPurged && g_histTotal > 0 ? FSCom.open(kHistPath, FILE_O_READ) : File();
+    auto hist = historyPurged && g_histTotal > 0 ? openAdvFile(kHistPath, FILE_O_READ) : File();
     if (hist && historyPurged) {
         uint32_t magic = 0;
         HistRec rec;
@@ -5718,7 +5731,7 @@ void AdvUI::hilSeenSaturation()
 
     bool found = false;
     size_t records = 0;
-    auto check = FSCom.open(kSeenPath, FILE_O_READ);
+    auto check = openAdvFile(kSeenPath, FILE_O_READ);
     uint32_t magic = 0;
     ok = ok && check && check.read((uint8_t *)&magic, sizeof(magic)) == sizeof(magic) && magic == kSeenMagic &&
          checkedFixedRecordFile(check.size(), sizeof(magic), sizeof(SeenRec), &records) && records == kSeenCap;

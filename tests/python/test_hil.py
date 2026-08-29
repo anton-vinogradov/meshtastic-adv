@@ -229,6 +229,12 @@ class HilRunnerTests(unittest.TestCase):
         self.assertIn("g_client->deleteServices()", ble)
         self.assertIn("parseBleAddress(g_connAddr, peerOctets)", ble)
         self.assertNotIn("std::string(g_connAddr)", ble)
+        ble_init = ble.split("bool bleCompanionInit()", 1)[1].split("void bleScanStart()", 1)[0]
+        self.assertIn("catch (const std::bad_alloc &)", ble_init)
+        self.assertIn("g_bleInitFailed = true", ble_init)
+        self.assertIn("free(g_buffers)", ble_init)
+        self.assertIn("g_rxQueue = nullptr", ble_init)
+        self.assertLess(ble_init.index("if (g_bleInitFailed)"), ble_init.index("if (!initQueues())"))
         self.assertNotIn("std::stable_sort", ui)
         self.assertIn("kSeenHotCap = 150", ui)
         self.assertNotIn("hotId[266]", ui)
@@ -263,6 +269,18 @@ class HilRunnerTests(unittest.TestCase):
         ))
         self.assertIn("return okay && writeSucceeded", save_result)
         self.assertIn("bool writeSucceeded = false", save_result)
+
+    def test_all_advui_file_handles_fail_soft_on_fragmented_heap(self):
+        ui = (ROOT / "overlay/src/advui/AdvUI.cpp").read_text()
+        node_cap = (ROOT / "overlay/src/advui/AdvNodeCap.cpp").read_text()
+
+        helper = ui.split("File openAdvFile", 1)[1].split("// LovyanGFX wrapper", 1)[0]
+        self.assertIn("catch (const std::bad_alloc &)", helper)
+        self.assertIn("return FSCom.open(path, mode)", helper)
+        self.assertEqual(ui.count("FSCom.open("), 1)
+        self.assertGreaterEqual(ui.count("openAdvFile("), 24)
+        self.assertIn("catch (const std::bad_alloc &)", node_cap)
+        self.assertIn("cached = 32", node_cap.split("catch (const std::bad_alloc &)", 1)[1])
 
     def test_future_satellite_save_oom_cleanup_cannot_allocate(self):
         patch = (ROOT / "overlay/patches/nodedb-oom-save.patch").read_text()
@@ -510,7 +528,8 @@ class HilRunnerTests(unittest.TestCase):
         source = (ROOT / "overlay/src/advui/AdvUI.cpp").read_text()
         epoch = source.split("void epochNote()", 1)[1].split("uint32_t savedDateEpoch()", 1)[0]
         self.assertNotIn("SafeFile f(", epoch)
-        self.assertIn("FSCom.open(kEpochPath, FILE_O_WRITE)", epoch)
+        self.assertIn("openAdvFile(kEpochPath, FILE_O_WRITE)", epoch)
+        self.assertNotIn("FSCom.open(", epoch)
         self.assertIn("saved == now", epoch)
         scheduler = source.split("static uint32_t lastEpochNoteMs", 1)[1].split("clockSeen", 1)[0]
         self.assertIn("if (!g_msgsDirty &&", scheduler)

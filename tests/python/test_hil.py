@@ -1369,7 +1369,7 @@ class HilRunnerTests(unittest.TestCase):
                 mock.patch.object(
                     hil, "production_wifi_ready_dump",
                     return_value=hil.ProductionWifiSnapshot(reboot_count=5, node_count=40),
-                ),
+                ) as ready_dump,
                 mock.patch.object(hil, "production_wifi_soak", side_effect=soak),
             ):
                 self.assertEqual(
@@ -1382,6 +1382,9 @@ class HilRunnerTests(unittest.TestCase):
                 )
 
             summary = json.loads((artifacts / "summary.json").read_text())
+        ready_dump.assert_called_once_with(
+            self.production_fixture(), enforce_configured_minimum=True
+        )
         self.assertLess(events.index("production-restore"), events.index("production-soak"))
         self.assertLess(events.index("production-soak"), events.index("config-after"))
         self.assertTrue(summary["production_wifi_validated"])
@@ -1389,6 +1392,41 @@ class HilRunnerTests(unittest.TestCase):
         self.assertEqual(summary["production_wifi_before"]["node_count"], 40)
         self.assertNotIn("192.0.2.20", json.dumps(summary))
         self.assertNotIn("!aabbccdd", json.dumps(summary))
+
+    def test_full_run_rejects_impossible_persistence_floor_before_backup_or_flash(self):
+        fixture = self.production_fixture()
+        with tempfile.TemporaryDirectory() as directory:
+            artifacts = Path(directory) / "artifacts"
+            with (
+                mock.patch.object(hil, "validate_app_image", return_value=Path("/exact.bin")),
+                mock.patch.object(
+                    hil, "validate_factory_image",
+                    return_value=(Path("/exact.factory.bin"), self.flash_layout()),
+                ),
+                mock.patch.object(
+                    hil, "stage_release_image", return_value=(Path("/staged.bin"), "f" * 64)
+                ),
+                mock.patch.object(
+                    hil, "stage_factory_image",
+                    return_value=(Path("/factory.bin"), self.flash_layout(), "1" * 64),
+                ),
+                mock.patch.object(
+                    hil, "production_wifi_ready_dump",
+                    side_effect=hil.HilError("production PhoneAPI NodeDB is below the fixture minimum"),
+                ),
+                mock.patch.object(hil, "capture_config_fingerprint") as config_backup,
+                mock.patch.object(hil, "flash") as flash,
+            ):
+                with self.assertRaisesRegex(hil.HilError, "below the fixture minimum"):
+                    self.local_full_run(
+                        fixture, artifacts, timeout=1, skip_build=True,
+                        release_image=Path("/exact.bin"),
+                        factory_image=Path("/exact.factory.bin"),
+                        production_wifi=True,
+                    )
+
+        config_backup.assert_not_called()
+        flash.assert_not_called()
 
     def test_full_run_checks_config_and_recovery_path_after_production_soak_failure(self):
         events = []

@@ -5,7 +5,17 @@ release notes remain available on the [GitHub Releases page](https://github.com/
 
 ## [Unreleased]
 
-No user-visible changes are pending after 1.0.12.
+No user-visible changes are pending after 1.0.13.
+
+## [1.0.13] - 2026-08-29
+
+### Release engineering
+
+- Clarifies that the release-HIL NodeDB threshold is a conservative
+  post-reboot persistence floor, not the larger volatile population learned
+  from RF traffic since boot. The same floor is now validated before flash as
+  well as after exact production restoration, so an impossible private fixture
+  fails without touching the Cardputer.
 
 ## [1.0.12] - 2026-08-29
 
@@ -285,7 +295,8 @@ The 1.0 release line delivered the following product and release-engineering sco
   cannot reuse stale output, and prereleases cannot enter stable distribution
   channels.
 
-[Unreleased]: https://github.com/anton-vinogradov/meshtastic-adv/compare/v1.0.12...HEAD
+[Unreleased]: https://github.com/anton-vinogradov/meshtastic-adv/compare/v1.0.13...HEAD
+[1.0.13]: https://github.com/anton-vinogradov/meshtastic-adv/compare/v1.0.12...v1.0.13
 [1.0.12]: https://github.com/anton-vinogradov/meshtastic-adv/compare/v1.0.9...v1.0.12
 [1.0.11]: https://github.com/anton-vinogradov/meshtastic-adv/compare/v1.0.10...v1.0.11
 [1.0.9]: https://github.com/anton-vinogradov/meshtastic-adv/compare/v1.0.8...v1.0.9

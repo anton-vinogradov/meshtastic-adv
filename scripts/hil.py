@@ -2800,10 +2800,10 @@ def full_run(
                 exact_factory, staged_release, Path(temporary)
             )
             if production_wifi:
-                print("capturing informational production WiFi NodeDB baseline", flush=True)
+                print("validating production WiFi NodeDB persistence floor", flush=True)
                 production_wifi_before = production_wifi_ready_dump(
                     fixture,
-                    enforce_configured_minimum=False,
+                    enforce_configured_minimum=True,
                 )
             try:
                 configuration_before = capture_config_fingerprint(

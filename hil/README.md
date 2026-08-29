@@ -84,9 +84,12 @@ the private fixture (never commit the real values):
 }
 ```
 
-`min_nodes` must be in `32..250`; choose the normal production population, not
-the smallest accepted value. The endpoint is used only after the exact
-production app has been restored.
+`min_nodes` must be in `32..250`. It is a conservative persistence floor: choose
+a count the node still exposes immediately after an ordinary reboot, not the
+larger live count accumulated from RF traffic since boot. HIL validates this
+floor before touching flash and again throughout the restored-production soak,
+so a stale or impossible fixture fails before the destructive boundary. The
+endpoint is read only and is also used before the HIL app is flashed.
 
 ## Run
 
@@ -381,8 +384,9 @@ Configure the protected GitHub environment `release-hil` with:
   `protected_devices`, and pinning its intentional `expected_region: "US"` and
   `expected_tx_power: 26`. Its `devices.dut.production_wifi` object must contain
   the Cardputer's private `host`, port `4403`, expected `!xxxxxxxx` node ID and
-  a realistic `min_nodes`. No WiFi peer, channel key or RF credential is
-  required by the release job.
+  a conservative post-reboot persistence floor in `min_nodes`. Do not derive
+  that floor from the larger RF-inflated live count. No WiFi peer, channel key
+  or RF credential is required by the release job.
 - variable `HIL_RECOVERY_ROOT`: an existing owner-only absolute directory on the
   persistent self-hosted runner, outside both the checkout and `RUNNER_TEMP`.
   Provision it once with mode `0700`; the workflow creates exclusive

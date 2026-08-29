@@ -18,6 +18,7 @@ def args(**overrides):
     values = {
         "quick": False,
         "firmware_only": False,
+        "hardware_only": False,
         "skip_build": False,
         "rf": False,
         "usb": False,
@@ -55,6 +56,19 @@ class VerifyRunnerTests(unittest.TestCase):
         self.assertEqual([stage.name for stage in hardware], ["hardware/usb-cardputer", "hardware/rf-private"])
         self.assertFalse(any(stage.name.startswith("firmware/build-") for stage in plan))
         self.assertIn("--skip-build", hardware[0].command)
+
+    def test_hardware_only_plan_runs_no_duplicate_host_or_build_stages(self):
+        selected = args(hardware_only=True, usb=True, skip_build=True)
+        verify.validate_args(selected, verify.parser())
+        plan = verify.build_plan(selected, Path("/tmp/evidence"))
+        self.assertEqual([stage.name for stage in plan], ["hardware/usb-cardputer"])
+
+        for invalid in (
+            args(hardware_only=True, skip_build=True),
+            args(hardware_only=True, usb=True, skip_build=False),
+        ):
+            with self.assertRaises(SystemExit):
+                verify.validate_args(invalid, verify.parser())
 
     def test_exact_release_app_is_forwarded_to_usb_hil(self):
         image = Path("/tmp/exact-release.bin")

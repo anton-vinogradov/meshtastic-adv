@@ -1,4 +1,5 @@
 #include "AdvNodeCount.h"
+#include "AdvOrder.h"
 #include "AdvStorage.h"
 #include "AdvUtf8.h"
 
@@ -104,6 +105,20 @@ int main()
     assert(!validBleAddress("02-11-22-33-44-55"));
     assert(!validBleAddress("02:11:22:33:44:5g"));
     assert(!validBleAddress("02:11:22:33:44:55:66"));
+    uint8_t bleAddress[6] = {};
+    assert(parseBleAddress("02:11:aB:33:44:fF", bleAddress));
+    const uint8_t expectedBleAddress[] = {0x02, 0x11, 0xab, 0x33, 0x44, 0xff};
+    assert(memcmp(bleAddress, expectedBleAddress, sizeof(bleAddress)) == 0);
+    memset(bleAddress, 0xa5, sizeof(bleAddress));
+    assert(!parseBleAddress("02:11:22:33:44:5g", bleAddress));
+    const uint8_t untouchedBleAddress[] = {0xa5, 0xa5, 0xa5, 0xa5, 0xa5, 0xa5};
+    assert(memcmp(bleAddress, untouchedBleAddress, sizeof(bleAddress)) == 0);
+
+    uint8_t channels[] = {0, 1, 2, 3, 4, 5};
+    stableMoveMatchingFirst(channels, sizeof(channels), [](uint8_t channel) { return channel == 1 || channel == 4; });
+    const uint8_t expectedChannels[] = {1, 4, 0, 2, 3, 5};
+    assert(memcmp(channels, expectedChannels, sizeof(channels)) == 0);
+    stableMoveMatchingFirst<uint8_t>(nullptr, 0, [](uint8_t) { return true; });
 
     float frequency = -1.0f;
     assert(parseFrequencyOverride("", &frequency) && frequency == 0.0f);

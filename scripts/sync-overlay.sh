@@ -90,10 +90,22 @@ fi
 #     port whenever USB is plugged and would eat those bytes. Dead code in
 #     release builds (the flag is never set there).
 SC="$FW/src/SerialConsole.cpp"
+SC_H="$FW/src/SerialConsole.h"
 if [ -f "$SC" ] && ! grep -q 'the screenshot build reads serial itself' "$SC"; then
   perl -0pi -e 's{(int32_t SerialConsole::runOnce\(\)\n\{\n)}{$1#ifdef ADVUI_SCREENSHOT\n    return 250; // advui-inject: the screenshot build reads serial itself\n#endif\n}' "$SC"
   echo "injected advui screenshot hook into SerialConsole.cpp"
 fi
+
+# AudioThread.h: optional RTTTL/SAM alerts must fail soft when the fragmented
+# no-PSRAM heap cannot allocate a source/generator. The pinned implementation
+# uses throwing new and leaves partial playback state alive after begin() fails.
+AUDIO_THREAD="$FW/src/AudioThread.h"
+if [ -f "$AUDIO_THREAD" ] && ! grep -q 'new (std::nothrow) AudioGeneratorRTTTL' "$AUDIO_THREAD"; then
+  git -C "$FW" apply "$ROOT/overlay/patches/audio-rtttl-failsoft.patch"
+  echo "injected fail-soft audio allocations into AudioThread.h"
+fi
+grep -q 'new (std::nothrow) AudioGeneratorRTTTL' "$AUDIO_THREAD"
+grep -q 'new (std::nothrow) AudioOutputI2S' "$AUDIO_THREAD"
 
 # RadioLibInterface.cpp: USB HIL is an isolated test transport, never a radio
 # transmitter. USERPREFS_LORA_TX_DISABLED makes the ordinary boot config
@@ -177,13 +189,42 @@ fi
 test "$(grep -c 'advui-inject-bounded-stream-writes' "$STREAM_API_H" || true)" -eq 1
 
 FRAME_WRITER="$FW/src/mesh/StreamFrameWriter.cpp"
-if [ ! -f "$FRAME_WRITER" ]; then
-  git -C "$FW" apply "$ROOT/overlay/patches/streamapi-retained-nonblocking-writes.patch"
+FRAME_WRITER_H="$FW/src/mesh/StreamFrameWriter.h"
+USB_SESSION_STREAM="$FW/src/mesh/UsbSessionStream.h"
+stream_retained_tracked_ready() {
+  grep -q 'StreamFrameWriter frameWriter' "$SC_H" &&
+    grep -q 'virtual bool finishPendingFrame' "$STREAM_API_H" &&
+    grep -q 'StreamFrameWriter frameWriter' "$FW/src/mesh/api/WiFiServerAPI.h" &&
+    grep -q 'MSG_DONTWAIT' "$FW/src/mesh/api/WiFiServerAPI.cpp" &&
+    grep -q 'resetStreamInput' "$SC"
+}
+stream_retained_generated_ready() {
+  test -f "$FRAME_WRITER" && test -f "$FRAME_WRITER_H" && test -f "$USB_SESSION_STREAM" &&
+    grep -q 'HWCDC::isConnected()' "$USB_SESSION_STREAM"
+}
+stream_retained_ready() {
+  stream_retained_tracked_ready && stream_retained_generated_ready
+}
+if ! stream_retained_ready; then
+  # actions/checkout resets tracked submodule files but older self-hosted work
+  # directories can retain these three generated files. Remove only that known
+  # incomplete patch residue, then apply the exact reviewed patch normally.
+  if ! stream_retained_tracked_ready; then
+    rm -f -- "$FRAME_WRITER" "$FRAME_WRITER_H" "$USB_SESSION_STREAM"
+    git -C "$FW" apply "$ROOT/overlay/patches/streamapi-retained-nonblocking-writes.patch"
+  else
+    # The inverse mixed state is also recoverable: tracked hunks are complete,
+    # but a cleanup removed one or more generated headers/sources.
+    rm -f -- "$FRAME_WRITER" "$FRAME_WRITER_H" "$USB_SESSION_STREAM"
+    git -C "$FW" apply \
+      --include=src/mesh/StreamFrameWriter.cpp \
+      --include=src/mesh/StreamFrameWriter.h \
+      --include=src/mesh/UsbSessionStream.h \
+      "$ROOT/overlay/patches/streamapi-retained-nonblocking-writes.patch"
+  fi
   echo "injected retained non-blocking StreamAPI transport writes"
 fi
-test -f "$FRAME_WRITER"
-grep -q 'MSG_DONTWAIT' "$FW/src/mesh/api/WiFiServerAPI.cpp"
-grep -q 'HWCDC::isConnected()' "$FW/src/mesh/UsbSessionStream.h"
+stream_retained_ready
 grep -q 'delegate.availableForWrite()' "$FW/src/mesh/UsbSessionStream.h"
 grep -q 'resetStreamInput' "$SC"
 
@@ -247,6 +288,11 @@ fi
 # defers the save (returns true, not false — false would send saveToDisk() down
 # its retry/fsFormat path). Applied as a patch: it spans two hunks.
 ND="$FW/src/mesh/NodeDB.cpp"
+if [ -f "$ND" ] && ! grep -q 'advui-inject-hil-preserve-nodedb' "$ND"; then
+  git -C "$FW" apply "$ROOT/overlay/patches/nodedb-hil-preserve-cache.patch"
+  echo "injected immutable HIL NodeDB persistence guard"
+fi
+test "$(grep -c 'advui-inject-hil-preserve-nodedb' "$ND" || true)" -eq 1
 if [ -f "$ND" ] && ! grep -q 'advui-inject-oomsave' "$ND"; then
   # The 2.8 NodeDB projects four satellite maps into temporary protobuf
   # vectors before saving. The 2.7 release line stores a single monolithic

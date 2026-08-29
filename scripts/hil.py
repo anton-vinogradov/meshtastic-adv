@@ -556,6 +556,8 @@ def open_production_wifi_interface(host: str, port: int, timeout: int) -> object
 def production_wifi_dump(
     config: dict[str, object],
     opener: Callable[[str, int, int], object] | None = None,
+    *,
+    enforce_configured_minimum: bool = True,
 ) -> ProductionWifiSnapshot:
     """Receive and validate one full production config dump without persisting it."""
     config = validate_production_wifi_config(config)
@@ -605,7 +607,7 @@ def production_wifi_dump(
 
             received_nodes = len(nodes)
             minimum_nodes = int(config["min_nodes"])
-            if reported_nodes < minimum_nodes or received_nodes < minimum_nodes:
+            if enforce_configured_minimum and (reported_nodes < minimum_nodes or received_nodes < minimum_nodes):
                 raise HilError("production PhoneAPI NodeDB is below the fixture minimum")
 
             if reboot_count < 0:
@@ -624,20 +626,24 @@ def production_wifi_dump(
                     ) from None
 
 
-def production_wifi_soak(
+def production_wifi_ready_dump(
     fixture: dict[str, object],
     *,
     opener: Callable[[str, int, int], object] | None = None,
     monotonic: Callable[[], float] = time.monotonic,
     sleep: Callable[[float], None] = time.sleep,
-) -> dict[str, object]:
-    """Prove repeated full production config dumps do not reboot the DUT."""
+    enforce_configured_minimum: bool = True,
+) -> ProductionWifiSnapshot:
+    """Wait for one complete production config stream after an app reset."""
     config = require_production_wifi_config(fixture)
     ready_deadline = monotonic() + PRODUCTION_WIFI_READY_SECONDS
     while True:
         try:
-            baseline = production_wifi_dump(config, opener=opener)
-            break
+            return production_wifi_dump(
+                config,
+                opener=opener,
+                enforce_configured_minimum=enforce_configured_minimum,
+            )
         except ProductionWifiConnectionError as exc:
             remaining = ready_deadline - monotonic()
             if remaining <= 0:
@@ -645,6 +651,28 @@ def production_wifi_soak(
                     f"production PhoneAPI did not become ready ({type(exc).__name__})"
                 ) from None
             sleep(min(PRODUCTION_WIFI_CLOSE_SETTLE_SECONDS, remaining))
+
+
+def production_wifi_soak(
+    fixture: dict[str, object],
+    *,
+    opener: Callable[[str, int, int], object] | None = None,
+    monotonic: Callable[[], float] = time.monotonic,
+    sleep: Callable[[float], None] = time.sleep,
+    expected_before_hil: ProductionWifiSnapshot | None = None,
+) -> dict[str, object]:
+    """Prove repeated full production config dumps do not reboot or lose NodeDB state."""
+    config = require_production_wifi_config(fixture)
+    baseline = production_wifi_ready_dump(
+        fixture,
+        opener=opener,
+        monotonic=monotonic,
+        sleep=sleep,
+        enforce_configured_minimum=expected_before_hil is None,
+    )
+    required_nodes = expected_before_hil.node_count if expected_before_hil is not None else int(config["min_nodes"])
+    if baseline.node_count < required_nodes:
+        raise HilError("production PhoneAPI NodeDB shrank across HIL")
 
     started = monotonic()
     soak_dumps = 0
@@ -656,15 +684,27 @@ def production_wifi_soak(
         if soak_dumps >= PRODUCTION_WIFI_MAX_SOAK_DUMPS:
             raise HilError("production WiFi soak did not reach its minimum duration")
         sleep(PRODUCTION_WIFI_CLOSE_SETTLE_SECONDS)
-        current = production_wifi_dump(config, opener=opener)
+        current = production_wifi_dump(
+            config,
+            opener=opener,
+            enforce_configured_minimum=expected_before_hil is None,
+        )
         soak_dumps += 1
         minimum_node_count = min(minimum_node_count, current.node_count)
+        if current.node_count < required_nodes:
+            raise HilError("production PhoneAPI NodeDB shrank during soak")
         if current.reboot_count != baseline.reboot_count:
             raise UnexpectedReboot("production firmware rebooted during the WiFi config-dump soak")
 
     sleep(PRODUCTION_WIFI_FINAL_QUIET_SECONDS)
-    final = production_wifi_dump(config, opener=opener)
+    final = production_wifi_dump(
+        config,
+        opener=opener,
+        enforce_configured_minimum=expected_before_hil is None,
+    )
     minimum_node_count = min(minimum_node_count, final.node_count)
+    if final.node_count < required_nodes:
+        raise HilError("production PhoneAPI NodeDB shrank after soak")
     if final.reboot_count != baseline.reboot_count:
         raise UnexpectedReboot("production firmware rebooted after the WiFi config-dump soak")
 
@@ -676,6 +716,9 @@ def production_wifi_soak(
         "config_dump_cycles": 1 + soak_dumps + 1,
         "soak_seconds": round(monotonic() - started, 3),
         "minimum_node_count": minimum_node_count,
+        "required_node_count": required_nodes,
+        "configured_minimum_node_count": int(config["min_nodes"]),
+        "pre_hil_node_count": expected_before_hil.node_count if expected_before_hil is not None else baseline.node_count,
         "stable_reboot_counter": True,
         "mesh_writes": 0,
         "admin_writes": 0,
@@ -2479,6 +2522,7 @@ def full_run(
     configuration_restored = False
     configuration_check_failure_type: str | None = None
     production_wifi_evidence: dict[str, object] | None = None
+    production_wifi_before: ProductionWifiSnapshot | None = None
     production_wifi_failure_type: str | None = None
     production_wifi_skipped = False
     configuration_backup = prepare_config_backup_destination(artifacts, config_backup)
@@ -2491,6 +2535,12 @@ def full_run(
             # several-minute physical suite is running. Recovery must not
             # depend on that mutable directory after the HIL app is flashed.
             staged_release, release_sha256 = stage_release_image(exact_release, Path(temporary))
+            if production_wifi:
+                print("capturing production WiFi NodeDB baseline", flush=True)
+                production_wifi_before = production_wifi_ready_dump(
+                    fixture,
+                    enforce_configured_minimum=False,
+                )
             try:
                 configuration_before = capture_config_fingerprint(
                     fixture, Path(temporary), "before", preserve=configuration_backup
@@ -2536,7 +2586,10 @@ def full_run(
                     if failure_type is None and failures == 0:
                         try:
                             print("soaking restored production WiFi PhoneAPI", flush=True)
-                            production_wifi_evidence = production_wifi_soak(fixture)
+                            production_wifi_evidence = production_wifi_soak(
+                                fixture,
+                                expected_before_hil=production_wifi_before,
+                            )
                         except Exception as exc:
                             production_wifi_failure_type = type(exc).__name__
                             production_wifi_error = exc
@@ -2581,6 +2634,11 @@ def full_run(
                 "production_wifi_skipped_after_hil_failure": production_wifi_skipped,
                 "production_wifi_failure_type": production_wifi_failure_type,
             }
+            if production_wifi_before is not None:
+                summary["production_wifi_before"] = {
+                    "node_count": production_wifi_before.node_count,
+                    "reboot_count": production_wifi_before.reboot_count,
+                }
             if production_wifi_evidence is not None:
                 summary["production_wifi"] = production_wifi_evidence
             if release_sha256 is not None:

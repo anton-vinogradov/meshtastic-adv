@@ -5,7 +5,32 @@ release notes remain available on the [GitHub Releases page](https://github.com/
 
 ## [Unreleased]
 
-No user-visible changes are pending after 1.0.6.
+No user-visible changes are pending after 1.0.7.
+
+## [1.0.7] - 2026-08-29
+
+### Changed
+
+- Channel ordering is now stable and allocation-free, and the 24-hour seen-node
+  reconciliation workspace is capped to the board's real 150-node limit. This
+  removes roughly 1 KiB from the UI task's peak stack demand.
+- Release HIL reuses the exact private HIL image already built and size-checked
+  by CI instead of compiling it again on the physical runner. The production
+  WiFi gate records the live NodeDB count before flashing and requires the
+  restored firmware to retain at least that exact baseline throughout its soak.
+
+### Fixed
+
+- HIL firmware can no longer persist its intentionally reduced 32-node in-memory
+  database over the user's production `nodes.proto` cache. Configuration,
+  identity, channels and the intentional US/26 dBm profile remain unchanged.
+- Optional BLE companion connections and audio alerts fail softly under memory
+  pressure instead of terminating the firmware. BLE address conversion no
+  longer allocates a temporary string, and completed/failed NimBLE sessions
+  release their discovered GATT graph before another worker starts.
+- Self-hosted release checkouts recover safely from either partially applied
+  state of the retained-stream patch. Interrupted-run recovery now runs only
+  after HIL actually crossed its verified flash boundary.
 
 ## [1.0.6] - 2026-08-29
 
@@ -200,7 +225,8 @@ The 1.0 release line delivered the following product and release-engineering sco
   cannot reuse stale output, and prereleases cannot enter stable distribution
   channels.
 
-[Unreleased]: https://github.com/anton-vinogradov/meshtastic-adv/compare/v1.0.6...HEAD
+[Unreleased]: https://github.com/anton-vinogradov/meshtastic-adv/compare/v1.0.7...HEAD
+[1.0.7]: https://github.com/anton-vinogradov/meshtastic-adv/compare/v1.0.6...v1.0.7
 [1.0.6]: https://github.com/anton-vinogradov/meshtastic-adv/compare/v1.0.5...v1.0.6
 [1.0.5]: https://github.com/anton-vinogradov/meshtastic-adv/compare/v1.0.4...v1.0.5
 [1.0.4]: https://github.com/anton-vinogradov/meshtastic-adv/compare/v1.0.3...v1.0.4

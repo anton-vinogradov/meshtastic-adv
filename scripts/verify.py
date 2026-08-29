@@ -30,6 +30,10 @@ def parser() -> argparse.ArgumentParser:
     mode = result.add_mutually_exclusive_group()
     mode.add_argument("--quick", action="store_true", help="run syntax, unit and sanitizer checks only")
     mode.add_argument("--firmware-only", action="store_true", help="run firmware builds and size checks only")
+    mode.add_argument(
+        "--hardware-only", action="store_true",
+        help="run only opted-in hardware stages against already verified build artifacts",
+    )
     result.add_argument("--skip-build", action="store_true", help="validate already-built firmware artifacts")
     result.add_argument("--rf", action="store_true", help="opt in to the state-preserving two-node RF suite")
     result.add_argument("--usb", action="store_true", help="opt in to the Cardputer USB HIL suite")
@@ -59,6 +63,10 @@ def parser() -> argparse.ArgumentParser:
 def validate_args(args: argparse.Namespace, source: argparse.ArgumentParser) -> None:
     if (args.quick or args.firmware_only) and (args.rf or args.usb):
         source.error("hardware stages cannot be combined with --quick or --firmware-only")
+    if args.hardware_only and not (args.rf or args.usb):
+        source.error("--hardware-only requires --usb or --rf")
+    if args.hardware_only and not args.skip_build:
+        source.error("--hardware-only requires --skip-build")
     if args.release_image is not None and not args.usb:
         source.error("--release-image requires --usb")
     if args.config_backup is not None and not args.usb:
@@ -90,7 +98,7 @@ def build_plan(args: argparse.Namespace, artifacts: Path) -> list[Stage]:
     )
     stages: list[Stage] = []
 
-    if not args.firmware_only:
+    if not args.firmware_only and not args.hardware_only:
         stages.extend(
             [
                 Stage("syntax/python", (python, "-m", "py_compile", *python_sources)),
@@ -103,7 +111,7 @@ def build_plan(args: argparse.Namespace, artifacts: Path) -> list[Stage]:
             ]
         )
 
-    if not args.quick:
+    if not args.quick and not args.hardware_only:
         if not args.skip_build:
             # Stage the recovery image last before hardware is allowed to run.
             stages.extend(

@@ -33,6 +33,7 @@ constexpr bool dirtyWriteDue(uint32_t now, uint32_t lastChange, uint32_t quietDe
 // Canonical six-octet Bluetooth address (xx:xx:xx:xx:xx:xx). Persisted radio
 // state is untrusted input after a torn/corrupt filesystem write.
 bool validBleAddress(const char *address);
+bool parseBleAddress(const char *address, uint8_t octets[6]);
 
 // Strict parsers for the on-device numeric editors. They reject prefixes with
 // ignored trailing characters; an empty/zero frequency intentionally means

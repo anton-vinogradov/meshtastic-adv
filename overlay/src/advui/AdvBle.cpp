@@ -22,7 +22,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
-#include <string>
+#include <new>
 #include <freertos/FreeRTOS.h>
 #include <freertos/queue.h>
 #if ADVUI_NIMBLE_14
@@ -515,7 +515,12 @@ void connectBlocking()
 #if ADVUI_NIMBLE_14
     BLEDevice::setMTU(517);
     g_client->setConnectTimeout(15);
-    const BLEAddress peer(std::string(g_connAddr), g_connType);
+    uint8_t peerOctets[6];
+    if (!parseBleAddress(g_connAddr, peerOctets)) {
+        fail("bad BLE address");
+        return;
+    }
+    const BLEAddress peer(peerOctets, g_connType);
     const bool connected = g_client->connect(peer, true);
 #else
     const bool connected = g_client->connect(BLEAddress(String(g_connAddr), g_connType), g_connType, 15000);
@@ -708,12 +713,28 @@ void pumpLoop()
 
 void connectTask(void *)
 {
-    connectBlocking();
-    if (g_linkState == BLE_CONNECTED)
-        pumpLoop();
+    try {
+        connectBlocking();
+        if (g_linkState == BLE_CONNECTED)
+            pumpLoop();
+    } catch (const std::bad_alloc &) {
+        // NimBLE 1.4 builds its client/GATT graph with throwing new/vector
+        // operations. Heap pressure must fail the optional companion link, not
+        // terminate the firmware and reboot the whole messenger.
+        if (g_client && g_client->isConnected())
+            g_client->disconnect();
+        fail("no mem for BLE link");
+    }
     // The worker owns the discovered services/characteristics. Publish their
     // release before another worker or a new scan is allowed to start.
     g_toRadio = g_fromRadio = g_fromNum = nullptr;
+#if ADVUI_NIMBLE_14
+    // connect(..., true) deletes the old graph only after a successful new
+    // connection. Releasing here prevents failed reconnects from retaining the
+    // previous services while a fresh 9-16 KiB worker stack is allocated.
+    if (g_client)
+        g_client->deleteServices();
+#endif
     resetCompanionState();
     g_connectTaskRunning.store(false, std::memory_order_release);
     vTaskDelete(nullptr);

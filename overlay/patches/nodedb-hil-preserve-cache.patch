@@ -1,0 +1,18 @@
+diff --git a/src/mesh/NodeDB.cpp b/src/mesh/NodeDB.cpp
+--- a/src/mesh/NodeDB.cpp
++++ b/src/mesh/NodeDB.cpp
+@@ -1545,6 +1545,14 @@ bool NodeDB::saveDeviceStateToDisk()
+ 
+ bool NodeDB::saveNodeDatabaseToDisk()
+ {
++#ifdef ADVUI_HIL
++    // The HIL image intentionally allocates a 32-node hot DB while the user's
++    // production cache may hold 150 nodes. Persisting that truncated vector
++    // would silently destroy the learned NodeDB even though app-only flashing
++    // leaves LittleFS untouched. HIL may mutate its in-memory copy, never the
++    // production nodes.proto file.
++    return true; // advui-inject-hil-preserve-nodedb
++#endif
+
+     // do not try to save anything if power level is not safe. In many cases flash will be lock-protected
+     // and all writes will fail anyway. Device should be sleeping at this point anyway.

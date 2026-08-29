@@ -134,6 +134,44 @@ class HilRunnerTests(unittest.TestCase):
         self.assertNotIn("+                nodeInfoQueue.pop_front", patch)
         self.assertNotIn("onNowHasData(0)", added)
 
+    def test_hil_cannot_persist_its_truncated_nodedb(self):
+        sync = (ROOT / "scripts/sync-overlay.sh").read_text()
+        patch = (ROOT / "overlay/patches/nodedb-hil-preserve-cache.patch").read_text()
+        self.assertIn("nodedb-hil-preserve-cache.patch", sync)
+        self.assertIn("advui-inject-hil-preserve-nodedb", patch)
+        body = patch.split("bool NodeDB::saveNodeDatabaseToDisk()", 1)[1]
+        guard = body.split("#endif", 1)[0]
+        self.assertIn("#ifdef ADVUI_HIL", guard)
+        self.assertIn("return true", guard)
+
+    def test_optional_audio_and_ble_paths_fail_soft_without_heap_churn(self):
+        sync = (ROOT / "scripts/sync-overlay.sh").read_text()
+        audio = (ROOT / "overlay/patches/audio-rtttl-failsoft.patch").read_text()
+        ble = (ROOT / "overlay/src/advui/AdvBle.cpp").read_text()
+        ui = (ROOT / "overlay/src/advui/AdvUI.cpp").read_text()
+        self.assertIn("audio-rtttl-failsoft.patch", sync)
+        self.assertGreaterEqual(audio.count("std::nothrow"), 4)
+        self.assertIn("catch (const std::bad_alloc &)", audio)
+        self.assertIn("!i2sRtttl->begin", audio)
+        self.assertIn("catch (const std::bad_alloc &)", ble)
+        self.assertIn("g_client->deleteServices()", ble)
+        self.assertIn("parseBleAddress(g_connAddr, peerOctets)", ble)
+        self.assertNotIn("std::string(g_connAddr)", ble)
+        self.assertNotIn("std::stable_sort", ui)
+        self.assertIn("kSeenHotCap = 150", ui)
+        self.assertNotIn("hotId[266]", ui)
+
+    def test_stream_patch_recovers_known_generated_residue_only(self):
+        sync = (ROOT / "scripts/sync-overlay.sh").read_text()
+        self.assertIn("stream_retained_ready()", sync)
+        self.assertIn('SC_H="$FW/src/SerialConsole.h"', sync)
+        self.assertIn("grep -q 'StreamFrameWriter frameWriter' \"$SC_H\"", sync)
+        self.assertNotIn('"$SC".h', sync)
+        self.assertIn('rm -f -- "$FRAME_WRITER" "$FRAME_WRITER_H" "$USB_SESSION_STREAM"', sync)
+        self.assertIn("--include=src/mesh/StreamFrameWriter.cpp", sync)
+        self.assertIn("--include=src/mesh/UsbSessionStream.h", sync)
+        self.assertNotIn('rm -rf -- "$FRAME_WRITER"', sync)
+
     def test_phoneapi_other_config_memory_is_bounded(self):
         sync = (ROOT / "scripts/sync-overlay.sh").read_text()
         patch = (ROOT / "overlay/patches/phoneapi-bounded-memory.patch").read_text()
@@ -950,6 +988,17 @@ class HilRunnerTests(unittest.TestCase):
                     hil.production_wifi_dump(config, opener=lambda *_args: interface)
                 interface.close.assert_called_once()
 
+    def test_pre_hil_dump_can_measure_a_small_derived_cache_without_weakening_identity(self):
+        config = self.production_fixture()["devices"]["dut"]["production_wifi"]
+        interface = self.phoneapi_interface(reported_nodes=8, received_nodes=8)
+        snapshot = hil.production_wifi_dump(
+            config,
+            opener=lambda *_args: interface,
+            enforce_configured_minimum=False,
+        )
+        self.assertEqual(snapshot.node_count, 8)
+        self.assertEqual(snapshot.reboot_count, 7)
+
     def test_production_wifi_soak_enforces_dump_count_duration_and_final_dump(self):
         now = [0.0]
 
@@ -968,6 +1017,33 @@ class HilRunnerTests(unittest.TestCase):
         self.assertTrue(evidence["stable_reboot_counter"])
         self.assertEqual(evidence["mesh_writes"], 0)
         self.assertGreaterEqual(dump.call_count - 2, hil.PRODUCTION_WIFI_MIN_SOAK_DUMPS)
+
+    def test_production_wifi_soak_preserves_the_pre_hil_nodedb_even_below_fixture_capacity(self):
+        now = [0.0]
+        before = hil.ProductionWifiSnapshot(reboot_count=5, node_count=8)
+        restored = hil.ProductionWifiSnapshot(reboot_count=7, node_count=8)
+        with mock.patch.object(hil, "production_wifi_dump", return_value=restored):
+            evidence = hil.production_wifi_soak(
+                self.production_fixture(),
+                monotonic=lambda: now[0],
+                sleep=lambda seconds: now.__setitem__(0, now[0] + seconds),
+                expected_before_hil=before,
+            )
+        self.assertEqual(evidence["pre_hil_node_count"], 8)
+        self.assertEqual(evidence["required_node_count"], 8)
+        self.assertEqual(evidence["configured_minimum_node_count"], 32)
+
+    def test_production_wifi_soak_rejects_nodedb_shrink_across_hil(self):
+        before = hil.ProductionWifiSnapshot(reboot_count=5, node_count=40)
+        restored = hil.ProductionWifiSnapshot(reboot_count=7, node_count=8)
+        with mock.patch.object(hil, "production_wifi_dump", return_value=restored):
+            with self.assertRaisesRegex(hil.HilError, "NodeDB shrank across HIL"):
+                hil.production_wifi_soak(
+                    self.production_fixture(),
+                    monotonic=lambda: 0.0,
+                    sleep=lambda _seconds: None,
+                    expected_before_hil=before,
+                )
 
     def test_production_wifi_soak_never_retries_a_post_baseline_failure(self):
         now = [0.0]
@@ -1141,8 +1217,9 @@ class HilRunnerTests(unittest.TestCase):
             events.append("production-flash" if release else "hil-flash")
             return {"role": "dut"}
 
-        def soak(_fixture):
+        def soak(_fixture, **kwargs):
             events.append("production-soak")
+            self.assertEqual(kwargs["expected_before_hil"].node_count, 40)
             return {
                 "validated": True,
                 "config_dump_cycles": 10,
@@ -1163,6 +1240,10 @@ class HilRunnerTests(unittest.TestCase):
                 mock.patch.object(hil, "smoke", return_value=report),
                 mock.patch.object(hil, "message_flow", return_value=report),
                 mock.patch.object(hil, "visual", return_value=report),
+                mock.patch.object(
+                    hil, "production_wifi_ready_dump",
+                    return_value=hil.ProductionWifiSnapshot(reboot_count=5, node_count=40),
+                ),
                 mock.patch.object(hil, "production_wifi_soak", side_effect=soak),
             ):
                 self.assertEqual(
@@ -1178,6 +1259,7 @@ class HilRunnerTests(unittest.TestCase):
         self.assertLess(events.index("production-soak"), events.index("config-after"))
         self.assertTrue(summary["production_wifi_validated"])
         self.assertTrue(summary["configuration_preserved"])
+        self.assertEqual(summary["production_wifi_before"]["node_count"], 40)
         self.assertNotIn("192.0.2.20", json.dumps(summary))
         self.assertNotIn("!aabbccdd", json.dumps(summary))
 
@@ -1193,7 +1275,7 @@ class HilRunnerTests(unittest.TestCase):
             events.append("production-flash" if release else "hil-flash")
             return {"role": "dut"}
 
-        def fail_soak(_fixture):
+        def fail_soak(_fixture, **_kwargs):
             events.append("production-soak")
             raise hil.UnexpectedReboot("production rebooted")
 
@@ -1210,6 +1292,10 @@ class HilRunnerTests(unittest.TestCase):
                 mock.patch.object(hil, "smoke", return_value=report),
                 mock.patch.object(hil, "message_flow", return_value=report),
                 mock.patch.object(hil, "visual", return_value=report),
+                mock.patch.object(
+                    hil, "production_wifi_ready_dump",
+                    return_value=hil.ProductionWifiSnapshot(reboot_count=5, node_count=40),
+                ),
                 mock.patch.object(hil, "production_wifi_soak", side_effect=fail_soak),
             ):
                 with self.assertRaises(hil.UnexpectedReboot):

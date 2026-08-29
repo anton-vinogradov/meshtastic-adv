@@ -45,6 +45,10 @@ class ReleaseWorkflowTests(unittest.TestCase):
         self.assertIn("umask 077", block)
         self.assertIn("--release-image", block)
         self.assertIn("--production-wifi", block)
+        self.assertIn("--hardware-only", block)
+        self.assertIn("--skip-build", block)
+        self.assertIn("name: firmware-hil-private", block)
+        self.assertIn("path: firmware/.pio/build/m5stack-cardputer-adv-advui-hil", block)
         self.assertNotIn("runner.temp", block.split("steps:", 1)[0])
         self.assertEqual(block.count("${{ runner.temp }}"), 5)
         self.assertIn("timeout-minutes: 150", block)
@@ -61,10 +65,7 @@ class ReleaseWorkflowTests(unittest.TestCase):
             block,
         )
         self.assertIn("python -m pip install --require-hashes -r hil/requirements.txt", block)
-        self.assertIn(
-            "python -m pip install --require-hashes --no-deps -r requirements/platformio.txt",
-            block,
-        )
+        self.assertNotIn("requirements/platformio.txt", block)
 
     def test_physical_hil_recovery_vault_survives_checkout_and_is_exactly_cleaned(self):
         block = job("release-hil")
@@ -85,6 +86,8 @@ class ReleaseWorkflowTests(unittest.TestCase):
         recovery = recovery.split("- name: Build deterministic release-demo media", 1)[0]
         self.assertIn('--config-backup "$HIL_CONFIG_BACKUP"', recovery)
         self.assertIn('--flash-marker "$HIL_FLASH_MARKER"', recovery)
+        self.assertIn('if [ ! -f "$HIL_FLASH_MARKER" ]', recovery)
+        self.assertIn("recovery is not required", recovery)
         cleanup = block.split(
             "- name: Remove private configuration backup after verified recovery", 1
         )[1].split("- name: Remove the identity-bound temporary fixture", 1)[0]
@@ -134,6 +137,8 @@ class ReleaseWorkflowTests(unittest.TestCase):
         self.assertIn('f[0x10000:0x10000+len(a)] != a', physical)
         self.assertNotIn('assert f[0x10000:', physical)
         self.assertIn('echo "path=$app" >> "$GITHUB_OUTPUT"', physical)
+        self.assertIn("name: firmware-hil-private", firmware)
+        self.assertIn("steps.img.outputs.hil_app", firmware)
 
     def test_secret_fixture_cleanup_runs_even_after_failure(self):
         block = job("release-hil")
@@ -409,7 +414,7 @@ class ReleaseWorkflowTests(unittest.TestCase):
                     self.assertRegex(reference, r"@[0-9a-f]{40}$")
             self.assertNotRegex(workflow, r"pip install ['\"]?[^\n]*[<>=]")
         self.assertEqual(WORKFLOW.count("pip install --require-hashes -r"), 3)
-        self.assertEqual(WORKFLOW.count("pip install --require-hashes --no-deps"), 5)
+        self.assertEqual(WORKFLOW.count("pip install --require-hashes --no-deps"), 4)
 
     def test_m5burner_repair_is_exact_run_bound_and_cannot_mutate_github_release(self):
         self.assertIn("workflow_dispatch:", REPAIR_WORKFLOW)

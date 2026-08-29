@@ -3,6 +3,7 @@
 #include "AdvVersion.h"
 #include "AdvFont.h"
 #include "AdvMeshCompat.h"
+#include "AdvOrder.h"
 #include "AdvStorage.h"
 #include "AdvUtf8.h"
 #include "SPILock.h" // the external panel shares SPI2 with the SD card
@@ -1418,6 +1419,7 @@ struct SeenRec {
 };
 constexpr int kSeenCap = 2048; // at most ~16 KB of LittleFS
 constexpr int kSeenReplaceCap = 32;
+constexpr int kSeenHotCap = 150; // this no-PSRAM variant never admits more hot nodes
 int g_seen24 = -1;             // nodes heard in the last 24 h (-1 = not computed yet)
 
 // Hearings observed by US: the engine quality-gates last_heard to 0 after every
@@ -1459,12 +1461,13 @@ void seenReconcile()
     if (!nodeDB || !validStoredEpoch(now))
         return; // clockless: a 24 h window is meaningless right now
     int hotN = (int)nodeDB->getNumMeshNodes();
-    if (hotN > 250)
-        hotN = 250;
-    uint32_t hotId[266]; // 250 hot slots + up to 16 pending self-observations
-    uint32_t hotLast[266];
-    bool inFile[266];
-    bool observed[266] = {}; // packet senders are admitted before passive DB entries at saturation
+    if (hotN > kSeenHotCap)
+        hotN = kSeenHotCap;
+    constexpr int kSeenWorkingCap = kSeenHotCap + kSeenPendCap;
+    uint32_t hotId[kSeenWorkingCap];
+    uint32_t hotLast[kSeenWorkingCap];
+    bool inFile[kSeenWorkingCap];
+    bool observed[kSeenWorkingCap] = {}; // packet senders are admitted before passive DB entries at saturation
     for (int i = 0; i < hotN; i++) {
         meshtastic_NodeInfoLite *n = nodeDB->getMeshNodeByIndex(i);
         hotId[i] = n ? n->num : 0;
@@ -3299,7 +3302,7 @@ int AdvUI::buildChannels(const char *query)
         }
         chanList[count++] = (uint8_t)i;
     }
-    std::stable_sort(chanList, chanList + count, [](uint8_t a, uint8_t b) { return chanFav(a) && !chanFav(b); });
+    stableMoveMatchingFirst(chanList, (size_t)count, [](uint8_t channel) { return chanFav(channel); });
     return count;
 }
 

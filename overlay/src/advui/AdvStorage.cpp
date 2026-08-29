@@ -54,22 +54,43 @@ uint32_t armDeadline(uint32_t now, uint32_t delay)
     return deadline ? deadline : 1U;
 }
 
-bool validBleAddress(const char *address)
+namespace
+{
+int hexNibble(char value)
+{
+    if (value >= '0' && value <= '9')
+        return value - '0';
+    if (value >= 'a' && value <= 'f')
+        return value - 'a' + 10;
+    if (value >= 'A' && value <= 'F')
+        return value - 'A' + 10;
+    return -1;
+}
+} // namespace
+
+bool parseBleAddress(const char *address, uint8_t octets[6])
 {
     if (!address)
         return false;
-    for (size_t i = 0; i < 17; i++) {
-        if (i % 3 == 2) {
-            if (address[i] != ':')
-                return false;
-        } else {
-            const char c = address[i];
-            const bool hex = (c >= '0' && c <= '9') || (c >= 'a' && c <= 'f') || (c >= 'A' && c <= 'F');
-            if (!hex)
-                return false;
-        }
+    if (strlen(address) != 17)
+        return false;
+    uint8_t parsed[6];
+    for (size_t i = 0; i < sizeof(parsed); i++) {
+        const size_t offset = i * 3;
+        const int high = hexNibble(address[offset]);
+        const int low = hexNibble(address[offset + 1]);
+        if (high < 0 || low < 0 || (i < sizeof(parsed) - 1 && address[offset + 2] != ':'))
+            return false;
+        parsed[i] = static_cast<uint8_t>((high << 4) | low);
     }
-    return address[17] == '\0';
+    if (octets)
+        memcpy(octets, parsed, sizeof(parsed));
+    return true;
+}
+
+bool validBleAddress(const char *address)
+{
+    return parseBleAddress(address, nullptr);
 }
 
 bool parseFrequencyOverride(const char *text, float *mhz)

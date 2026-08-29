@@ -8,7 +8,7 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
-from types import SimpleNamespace
+from types import ModuleType, SimpleNamespace
 from unittest import mock
 
 
@@ -227,6 +227,13 @@ class HilRunnerTests(unittest.TestCase):
         self.assertNotIn("hotId[266]", ui)
         self.assertNotIn("WiFi.localIP().toString()", ui)
         self.assertIn("const IPAddress ip = WiFi.localIP();", ui)
+        ext_init = ui.split("void AdvUI::extInit()", 1)[1].split("void AdvUI::extStop()", 1)[0]
+        self.assertIn("catch (const std::bad_alloc &)", ext_init)
+        self.assertIn("if (!next->init())", ext_init)
+        self.assertLess(ext_init.index("new (std::nothrow) AdvExtDisplay"), ext_init.index("g_ext = next"))
+        screen_wake = ui.split("void AdvUI::screenWake()", 1)[1].split("void AdvUI::initHardware()", 1)[0]
+        self.assertIn("if (!display.init())", screen_wake)
+        self.assertIn("screenOn = false", screen_wake)
 
     def test_wifi_phoneapi_allocations_fail_soft_under_fragmented_heap(self):
         sync = (ROOT / "scripts/sync-overlay.sh").read_text()
@@ -1075,6 +1082,59 @@ class HilRunnerTests(unittest.TestCase):
         interface.sendText.assert_not_called()
         interface.localNode.writeConfig.assert_not_called()
         interface.localNode.writeChannel.assert_not_called()
+
+    def test_production_wifi_interface_overrides_upstream_hardcoded_config_wait(self):
+        waits = []
+
+        class FakeTCPInterface:
+            def __init__(self, *, hostname, portNumber, noNodes, timeout):
+                self.hostname = hostname
+                self.portNumber = portNumber
+                self._waitConnected()
+
+            def _waitConnected(self, timeout=30):  # noqa: N802 - upstream spelling
+                waits.append(timeout)
+
+        package = ModuleType("meshtastic")
+        package.__path__ = []
+        tcp_module = ModuleType("meshtastic.tcp_interface")
+        tcp_module.TCPInterface = FakeTCPInterface
+        package.tcp_interface = tcp_module
+        connected = mock.Mock()
+        with (
+            mock.patch.dict(
+                sys.modules,
+                {"meshtastic": package, "meshtastic.tcp_interface": tcp_module},
+            ),
+            mock.patch.object(hil.socket, "create_connection", return_value=connected) as create,
+        ):
+            interface = hil.open_production_wifi_interface(
+                "192.0.2.20", 4403, hil.PRODUCTION_WIFI_CONFIG_TIMEOUT_SECONDS
+            )
+            interface.myConnect()
+
+        self.assertEqual(waits, [hil.PRODUCTION_WIFI_CONFIG_TIMEOUT_SECONDS])
+        create.assert_called_once_with(
+            ("192.0.2.20", 4403), timeout=hil.PRODUCTION_WIFI_CONNECT_TIMEOUT_SECONDS
+        )
+        connected.settimeout.assert_called_once_with(None)
+
+    def test_display_power_cycles_gate_retained_and_minimum_heap(self):
+        samples = [
+            {"before": "41000", "after": "40000", "min_heap": "39000"},
+            {"before": "40500", "after": "39500", "min_heap": "38500"},
+        ]
+        evidence = hil.require_display_power_cycle_heap(samples)
+        self.assertEqual(evidence["cycles"], 2)
+        self.assertEqual(evidence["first_after"], 40000)
+        self.assertEqual(evidence["last_after"], 39500)
+
+        leaking = [samples[0], {**samples[1], "after": "39487"}]
+        with self.assertRaisesRegex(hil.HilError, "retained heap"):
+            hil.require_display_power_cycle_heap(leaking)
+        unsafe = [samples[0], {**samples[1], "min_heap": "11999"}]
+        with self.assertRaisesRegex(hil.HilError, "headroom"):
+            hil.require_display_power_cycle_heap(unsafe)
 
     def test_production_wifi_dump_fails_closed_on_identity_environment_wifi_or_nodedb(self):
         config = self.production_fixture()["devices"]["dut"]["production_wifi"]

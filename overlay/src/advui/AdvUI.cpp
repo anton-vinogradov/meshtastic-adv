@@ -2787,7 +2787,11 @@ void AdvUI::screenWake()
     bleAdvSlow(false);
     digitalWrite(38, HIGH);
     delay(20); // let the rail settle before talking to the panel
-    display.init();
+    if (!display.init()) {
+        screenOn = false;
+        LOG_ERROR("advui: screen wake initialization failed");
+        return; // keep the mesh alive and let the next input retry the panel
+    }
     display.setRotation(1);
     screenOn = true;
     lastActivityMs = millis();
@@ -4556,18 +4560,30 @@ void AdvUI::extInit()
 {
     if (g_ext || !g_extRot || !g_radioCompanion)
         return;
-    g_ext = new (std::nothrow) AdvExtDisplay();
-    if (!g_ext) {
+    AdvExtDisplay *next = nullptr;
+    try {
+        next = new (std::nothrow) AdvExtDisplay();
+        if (next) {
+            concurrency::LockGuard guard(spiLock); // the SD card is on this bus too
+            if (!next->init()) {
+                LOG_WARN("advui: second screen initialization failed");
+                delete next;
+                next = nullptr;
+            } else {
+                next->setRotation(g_extRot); // however the builder mounted it
+                next->fillScreen(0);
+            }
+        }
+    } catch (const std::bad_alloc &) {
+        delete next;
+        next = nullptr;
+    }
+    if (!next) {
         LOG_WARN("advui: no memory for the second screen");
         g_extRot = 0;
         return;
     }
-    {
-        concurrency::LockGuard guard(spiLock); // the SD card is on this bus too
-        g_ext->init();
-        g_ext->setRotation(g_extRot); // however the builder mounted it
-        g_ext->fillScreen(0);
-    }
+    g_ext = next; // publish only a completely initialized optional panel
     canvas.setPivot(120, 67); // centre of our frame, the anchor pushFrame() scales about
     LOG_INFO("advui: second screen up (ILI9341 320x240 on the EXT header)");
 }
@@ -7175,6 +7191,17 @@ int32_t AdvUI::runOnce()
             hilReactionState();
         } else if (sc == 'T') {
             hilMemoryState();
+        } else if (sc == 'W') {
+            const uint32_t before = ESP.getFreeHeap();
+            screenSleep();
+            delay(25); // exercise a real rail-off interval before panel/SPI re-init
+            screenWake();
+            const uint32_t after = ESP.getFreeHeap();
+            uiDirty = true;
+            Serial.printf("@@POWER v=1 ok=%u screen=%u before=%u after=%u min_heap=%u\n",
+                          screenOn ? 1U : 0U, screenOn ? 1U : 0U, (unsigned)before,
+                          (unsigned)after, (unsigned)ESP.getMinFreeHeap());
+            Serial.flush();
         } else if (sc == 'Y') {
             const uint32_t before = ESP.getFreeHeap();
             bleHilReleaseState();

@@ -5,7 +5,25 @@ release notes remain available on the [GitHub Releases page](https://github.com/
 
 ## [Unreleased]
 
-No user-visible changes are pending after 1.0.13.
+No user-visible changes are pending after 1.0.14.
+
+## [1.0.14] - 2026-08-29
+
+### Fixed
+
+- Optional second-screen allocation and initialization now fail softly under
+  heap pressure, and a failed built-in panel wake leaves the mesh running for a
+  later retry instead of pretending the dark display is ready.
+
+### Release engineering
+
+- Release HIL now overrides meshtastic-python 2.7's hard-coded 30-second
+  initial config-stream wait with an explicit bounded 90-second deadline. This
+  allows a large restored NodeDB to finish its first post-boot PhoneAPI stream
+  while retaining the existing fail-closed reconnect and reboot checks.
+- Physical HIL performs twelve real display power-off/panel-SPI reinitialization
+  cycles and rejects cumulative retained heap, unsafe headroom, a dark wake or
+  an unexpected reboot.
 
 ## [1.0.13] - 2026-08-29
 
@@ -295,7 +313,8 @@ The 1.0 release line delivered the following product and release-engineering sco
   cannot reuse stale output, and prereleases cannot enter stable distribution
   channels.
 
-[Unreleased]: https://github.com/anton-vinogradov/meshtastic-adv/compare/v1.0.13...HEAD
+[Unreleased]: https://github.com/anton-vinogradov/meshtastic-adv/compare/v1.0.14...HEAD
+[1.0.14]: https://github.com/anton-vinogradov/meshtastic-adv/compare/v1.0.13...v1.0.14
 [1.0.13]: https://github.com/anton-vinogradov/meshtastic-adv/compare/v1.0.12...v1.0.13
 [1.0.12]: https://github.com/anton-vinogradov/meshtastic-adv/compare/v1.0.9...v1.0.12
 [1.0.11]: https://github.com/anton-vinogradov/meshtastic-adv/compare/v1.0.10...v1.0.11

@@ -37,10 +37,13 @@ EXPECTED_DEMO_FRAMES = [
 PRODUCTION_WIFI_MIN_SOAK_DUMPS = 8
 PRODUCTION_WIFI_MAX_SOAK_DUMPS = 64
 PRODUCTION_WIFI_MIN_SOAK_SECONDS = 120.0
-PRODUCTION_WIFI_READY_SECONDS = 90.0
+PRODUCTION_WIFI_READY_SECONDS = 180.0
 PRODUCTION_WIFI_CLOSE_SETTLE_SECONDS = 3.0
 PRODUCTION_WIFI_FINAL_QUIET_SECONDS = 15.0
-PRODUCTION_WIFI_CONFIG_TIMEOUT_SECONDS = 30
+PRODUCTION_WIFI_CONNECT_TIMEOUT_SECONDS = 5
+PRODUCTION_WIFI_CONFIG_TIMEOUT_SECONDS = 90
+DISPLAY_POWER_CYCLE_COUNT = 12
+DISPLAY_POWER_CYCLE_RETAINED_TOLERANCE = 512
 MAX_APP_IMAGE_BYTES = 3_000_000
 ESP32S3_FLASH_BYTES = 8 * 1024 * 1024
 PARTITION_TABLE_OFFSET = 0x8000
@@ -563,10 +566,20 @@ def open_production_wifi_interface(host: str, port: int, timeout: int) -> object
     class FailClosedTCPInterface(TCPInterface):
         def myConnect(self) -> None:  # noqa: N802 - upstream API spelling
             connected = socket.create_connection(
-                (self.hostname, self.portNumber), timeout=timeout
+                (self.hostname, self.portNumber),
+                timeout=min(timeout, PRODUCTION_WIFI_CONNECT_TIMEOUT_SECONDS),
             )
             connected.settimeout(None)
             self.socket = connected
+
+        def _waitConnected(self, _upstream_default: float = 30.0) -> None:  # noqa: N802
+            # meshtastic-python 2.7 hard-codes a separate 30-second initial
+            # config-stream wait inside StreamInterface.connect(), ignoring the
+            # timeout supplied to TCPInterface. A large restored NodeDB can be
+            # healthy yet need longer immediately after boot. Honour our exact
+            # bounded config deadline; retries are still allowed only before a
+            # baseline is accepted.
+            super()._waitConnected(float(timeout))
 
         def _reconnect(self) -> None:
             # A reconnect could hide a reboot inside one nominal config dump.
@@ -1770,6 +1783,11 @@ class HilSession:
     def memory_state(self) -> dict[str, str]:
         return parse_fields(self.exchange(b"T", "@@MEM"), "@@MEM")
 
+    def display_power_cycle(self) -> dict[str, str]:
+        result = parse_fields(self.exchange(b"W", "@@POWER", timeout=8), "@@POWER")
+        require_fields(result, {"ok": "1", "screen": "1"})
+        return result
+
     def release_companion_state(self) -> dict[str, str]:
         result = parse_fields(self.exchange(b"Y", "@@BRELEASE"), "@@BRELEASE")
         require_fields(result, {"ok": "1"})
@@ -1912,6 +1930,29 @@ def require_heap_headroom(state: dict[str, str], minimum: int = 12_000) -> dict[
     return require_heap_fields(state, ("heap", "min_heap"), minimum)
 
 
+def require_display_power_cycle_heap(
+    samples: list[dict[str, str]],
+    minimum: int = 12_000,
+    retained_tolerance: int = DISPLAY_POWER_CYCLE_RETAINED_TOLERANCE,
+) -> dict[str, int]:
+    """Gate repeated real panel/SPI reinitialization on retained heap."""
+    if len(samples) < 2:
+        raise HilError("display power-cycle gate requires multiple samples")
+    before = [int(sample.get("before", "0")) for sample in samples]
+    after = [int(sample.get("after", "0")) for sample in samples]
+    min_heap = [int(sample.get("min_heap", "0")) for sample in samples]
+    if min((*before, *after, *min_heap)) < minimum:
+        raise HilError(f"unsafe display power-cycle heap headroom (minimum {minimum})")
+    if after[-1] + retained_tolerance < after[0]:
+        raise HilError("display power cycles retained heap")
+    return {
+        "cycles": len(samples),
+        "first_after": after[0],
+        "last_after": after[-1],
+        "minimum_after": min(after),
+    }
+
+
 def require_companion_ingress_heap(
     state: dict[str, str], minimum: int = 12_000, retained_tolerance: int = 512
 ) -> dict[str, int]:
@@ -2040,6 +2081,19 @@ def smoke(fixture: dict[str, object], artifacts: Path) -> Report:
                 return {"digests": digests, "unique": unique}
 
             report.check("display/distinct-renders", distinct_frames_case)
+
+            def display_power_cycle_case():
+                samples = [
+                    session.display_power_cycle()
+                    for _ in range(DISPLAY_POWER_CYCLE_COUNT)
+                ]
+                evidence = require_display_power_cycle_heap(samples)
+                state = session.query()
+                require_fields(state, {"screen": "1"})
+                require_heap_headroom(state)
+                return {**evidence, "state": state}
+
+            report.check("display/repeated-sleep-wake-retains-heap", display_power_cycle_case)
     except Exception as exc:
         message = report.redact(str(exc))
         if isinstance(exc, UnexpectedReboot):

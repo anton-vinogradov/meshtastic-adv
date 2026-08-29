@@ -91,6 +91,13 @@ floor before touching flash and again throughout the restored-production soak,
 so a stale or impossible fixture fails before the destructive boundary. The
 endpoint is read only and is also used before the HIL app is flashed.
 
+The production endpoint may take longer than meshtastic-python's built-in
+30-second connection default to stream a large NodeDB immediately after boot.
+Release HIL overrides that upstream default with a bounded 90-second config
+deadline inside a 180-second readiness window. Once the first complete snapshot
+is accepted, reconnects remain forbidden: a disconnect or reboot during the
+two-minute soak fails the release.
+
 ## Run
 
 ```sh
@@ -330,7 +337,7 @@ synthetic marketing poster.
 |---|---|---|
 | Boot, heap, serial protocol | USB HIL state assertions | programmable USB power switch for cold-boot loops |
 | UI navigation and settings pages | injected keys + state assertions | key actuator/matrix jig to verify every physical key |
-| Display and all major screens | framebuffer digest + 35 real captures | camera for panel/backlight/colour verification |
+| Display and all major screens | framebuffer digest, 35 real captures, and 12 physical sleep/wake cycles with retained-heap gating | camera for panel/backlight/colour verification |
 | Unicode, emoji, replies, reactions, history screens | real serialized FromRadio injection + controlled visual fixtures | extend private RF traffic to every live message type |
 | LoRa send/receive | state-preserving private RF exchange in both directions | programmable attenuator for sensitivity/range thresholds |
 | Routing ACK/NAK | injected production handler path plus explicit ACK for private directed RF in both directions | programmable attenuator for deterministic failure/retry thresholds |

@@ -290,6 +290,17 @@ if [ -f "$PHONE_API" ] && [ -f "$PHONE_API_H" ] && \
 fi
 test "$(grep -c 'advui-inject-bounded-phone-memory' "$PHONE_API_H" || true)" -eq 1
 
+# ContentHandler request allocations are caught by WebServer::loop(). Make the
+# multipart parser and SPI lock unwind with them so fail-soft HTTP cannot retain
+# a parser or permanently strand the shared radio/storage bus lock.
+CONTENT_HANDLER="$FW/src/mesh/http/ContentHandler.cpp"
+if [ -f "$CONTENT_HANDLER" ] && \
+   ! grep -q 'advui-inject-contenthandler-oom-raii' "$CONTENT_HANDLER"; then
+  git -C "$FW" apply "$ROOT/overlay/patches/contenthandler-oom-raii.patch"
+  echo "injected RAII cleanup for HTTP OOM paths"
+fi
+test "$(grep -c 'advui-inject-contenthandler-oom-raii' "$CONTENT_HANDLER" || true)" -eq 2
+
 # WebServer.cpp + ContentHandler.cpp: drop the HTTPS/TLS server, keep HTTP:80.
 # The self-signed RSA-2048 cert plus mbedTLS session state costs tens of KB of
 # heap on this no-PSRAM board — the stock code already logs "skipping HTTPS

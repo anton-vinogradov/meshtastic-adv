@@ -2,6 +2,14 @@ diff --git a/src/mesh/PhoneAPI.cpp b/src/mesh/PhoneAPI.cpp
 index be6ce3916..f8d99034f 100644
 --- a/src/mesh/PhoneAPI.cpp
 +++ b/src/mesh/PhoneAPI.cpp
+@@ -31,6 +31,7 @@
+ #endif
+ #include "Throttle.h"
+ #include <RTC.h>
++#include <new>
+ 
+ // Flag to indicate a heartbeat was received and we should send queue status
+ bool heartbeatReceived = false;
 @@ -81,23 +81,12 @@ void PhoneAPI::handleStartConfig()
          state = STATE_SEND_MY_INFO;
      }
@@ -42,7 +50,7 @@ index be6ce3916..f8d99034f 100644
          fromRadioNum = 0;
          config_nonce = 0;
          config_state = 0;
-@@ -538,11 +528,29 @@ size_t PhoneAPI::getFromRadio(uint8_t *buf)
+@@ -538,11 +528,36 @@ size_t PhoneAPI::getFromRadio(uint8_t *buf)
  
      case STATE_SEND_FILEMANIFEST: {
          LOG_DEBUG("FromRadio=STATE_SEND_FILEMANIFEST");
@@ -50,9 +58,16 @@ index be6ce3916..f8d99034f 100644
 +        // contiguous allocation out of the 150-node config transfer.
 +        if (!filesManifestPrepared && config_nonce != SPECIAL_NONCE_ONLY_NODES) {
 +            bool filesManifestLimited = false;
-+            {
++            try {
 +                concurrency::LockGuard guard(spiLock);
 +                filesManifest = getFiles("/", FILES_MANIFEST_LEVELS, FILES_MANIFEST_MAX_COUNT, &filesManifestLimited);
++            } catch (const std::bad_alloc &) {
++                // Arduino FS creates each File/openNextFile handle through a
++                // throwing shared_ptr allocation. The manifest is optional;
++                // omit it instead of aborting the whole phone API stream.
++                releaseFilesManifest(filesManifest);
++                filesManifestLimited = true;
++                LOG_WARN("File manifest omitted: heap allocation failed");
 +            }
 +            filesManifestPrepared = true;
 +            if (filesManifestLimited) {

@@ -312,13 +312,25 @@ class HilRunnerTests(unittest.TestCase):
     def test_http_allocations_disable_only_the_web_ui_on_oom(self):
         sync = (ROOT / "scripts/sync-overlay.sh").read_text()
         patch = (ROOT / "overlay/patches/webserver-oom-failsoft.patch").read_text()
+        handler = (ROOT / "overlay/patches/contenthandler-oom-raii.patch").read_text()
+        handler_added = "\n".join(
+            line[1:] for line in handler.splitlines()
+            if line.startswith("+") and not line.startswith("+++")
+        )
         self.assertIn("webserver-oom-failsoft.patch", sync)
+        self.assertIn("contenthandler-oom-raii.patch", sync)
         self.assertIn("advui-inject-webserver-oom-failsoft", patch)
         self.assertIn("catch (const std::bad_alloc &)", patch)
         self.assertIn("insecureServer->stop();", patch)
         self.assertIn("isWebServerReady = false;", patch)
         self.assertIn("HTTPServer(80, MAX_HTTPS_CONNECTIONS)", patch)
         self.assertNotIn("ESP.restart()", patch)
+        self.assertIn("std::unique_ptr<HTTPBodyParser> parser", handler)
+        self.assertIn("parser.reset(new HTTPMultipartBodyParser(req))", handler)
+        self.assertNotIn("delete parser", handler_added)
+        self.assertIn("concurrency::LockGuard guard(spiLock)", handler)
+        self.assertNotIn("spiLock->lock()", handler_added)
+        self.assertNotIn("spiLock->unlock()", handler_added)
 
     def test_stream_patch_recovers_known_generated_residue_only(self):
         sync = (ROOT / "scripts/sync-overlay.sh").read_text()
@@ -348,6 +360,14 @@ class HilRunnerTests(unittest.TestCase):
             patch.index("case STATE_SEND_FILEMANIFEST"),
             patch.rindex('filesManifest = getFiles("/"'),
         )
+        manifest_catch = patch.split("catch (const std::bad_alloc &)", 1)[1]
+        self.assertIn("releaseFilesManifest(filesManifest);", manifest_catch)
+        self.assertIn("File manifest omitted: heap allocation failed", manifest_catch)
+        self.assertLess(
+            patch.rindex('filesManifest = getFiles("/"'),
+            patch.index("catch (const std::bad_alloc &)"),
+        )
+        self.assertIn("#include <new>", patch)
         self.assertIn("uint32_t lastPortNumToRadio[RATE_LIMIT_SLOT_COUNT]", patch)
         self.assertIn("default:\n+        return nullptr;", patch)
         self.assertIn("if (lastPortTimestamp)\n+        *lastPortTimestamp = millis();", patch)

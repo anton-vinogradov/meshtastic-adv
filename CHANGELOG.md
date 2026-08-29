@@ -5,7 +5,19 @@ release notes remain available on the [GitHub Releases page](https://github.com/
 
 ## [Unreleased]
 
-No user-visible changes are pending after 1.0.16.
+No user-visible changes are pending after 1.0.17.
+
+## [1.0.17] - 2026-08-29
+
+### Fixed
+
+- A low-memory PhoneAPI configuration dump now omits its optional filesystem
+  manifest and still reaches `config_complete` when Arduino FS cannot allocate
+  a file handle, instead of rebooting the device.
+- HTTP upload parsers now unwind through RAII on every request failure, and the
+  diagnostics endpoint can no longer strand the shared SPI lock if JSON
+  allocation fails. The web UI may fail softly without retaining request memory
+  or blocking radio and storage access.
 
 ## [1.0.16] - 2026-08-29
 
@@ -348,7 +360,8 @@ The 1.0 release line delivered the following product and release-engineering sco
   cannot reuse stale output, and prereleases cannot enter stable distribution
   channels.
 
-[Unreleased]: https://github.com/anton-vinogradov/meshtastic-adv/compare/v1.0.16...HEAD
+[Unreleased]: https://github.com/anton-vinogradov/meshtastic-adv/compare/v1.0.17...HEAD
+[1.0.17]: https://github.com/anton-vinogradov/meshtastic-adv/compare/v1.0.16...v1.0.17
 [1.0.16]: https://github.com/anton-vinogradov/meshtastic-adv/compare/v1.0.15...v1.0.16
 [1.0.15]: https://github.com/anton-vinogradov/meshtastic-adv/compare/v1.0.14...v1.0.15
 [1.0.14]: https://github.com/anton-vinogradov/meshtastic-adv/compare/v1.0.13...v1.0.14

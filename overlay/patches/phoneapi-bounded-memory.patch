@@ -1,0 +1,198 @@
+diff --git a/src/mesh/PhoneAPI.cpp b/src/mesh/PhoneAPI.cpp
+index be6ce3916..f8d99034f 100644
+--- a/src/mesh/PhoneAPI.cpp
++++ b/src/mesh/PhoneAPI.cpp
+@@ -81,23 +81,12 @@ void PhoneAPI::handleStartConfig()
+         state = STATE_SEND_MY_INFO;
+     }
+     pauseBluetoothLogging = true;
+-    // Manifest is never read on the node-info-only path (STATE_SEND_FILEMANIFEST
+-    // short-circuits to sendConfigComplete), so skip the SPI lock + FS walk.
+-    if (config_nonce != SPECIAL_NONCE_ONLY_NODES) {
+-        bool filesManifestLimited = false;
+-        {
+-            concurrency::LockGuard guard(spiLock);
+-            filesManifest = getFiles("/", FILES_MANIFEST_LEVELS, FILES_MANIFEST_MAX_COUNT, &filesManifestLimited);
+-        }
+-        if (filesManifestLimited) {
+-            LOG_WARN("Got %zu files in manifest (limited to %zu entries/depth %u)", filesManifest.size(),
+-                     FILES_MANIFEST_MAX_COUNT, static_cast<unsigned>(FILES_MANIFEST_LEVELS));
+-        } else {
+-            LOG_DEBUG("Got %zu files in manifest", filesManifest.size());
+-        }
+-    } else {
+-        releaseFilesManifest(filesManifest);
+-    }
++    // A manifest can occupy almost 15 KiB. Do not keep it alive throughout
++    // the much larger config/node dump, and release the previous allocation
++    // before a repeated want_config request can build another one.
++    releaseFilesManifest(filesManifest);
++    filesManifestPrepared = false;
++    config_state = 0;
+ 
+     LOG_INFO("Start API client config millis=%u", millis());
+     // Protect against concurrent BLE callbacks: they run in NimBLE's FreeRTOS task and also touch this iterator state.
+@@ -145,7 +134,8 @@ void PhoneAPI::close()
+         }
+         packetForPhone = NULL;
+         releaseFilesManifest(filesManifest);
+-        lastPortNumToRadio.clear();
++        filesManifestPrepared = false;
++        std::fill(std::begin(lastPortNumToRadio), std::end(lastPortNumToRadio), 0);
+         fromRadioNum = 0;
+         config_nonce = 0;
+         config_state = 0;
+@@ -538,11 +528,29 @@ size_t PhoneAPI::getFromRadio(uint8_t *buf)
+ 
+     case STATE_SEND_FILEMANIFEST: {
+         LOG_DEBUG("FromRadio=STATE_SEND_FILEMANIFEST");
++        // Build only when it is about to be emitted. This keeps its large
++        // contiguous allocation out of the 150-node config transfer.
++        if (!filesManifestPrepared && config_nonce != SPECIAL_NONCE_ONLY_NODES) {
++            bool filesManifestLimited = false;
++            {
++                concurrency::LockGuard guard(spiLock);
++                filesManifest = getFiles("/", FILES_MANIFEST_LEVELS, FILES_MANIFEST_MAX_COUNT, &filesManifestLimited);
++            }
++            filesManifestPrepared = true;
++            if (filesManifestLimited) {
++                LOG_WARN("Got %u files in manifest (limited to %u entries/depth %u)",
++                         static_cast<unsigned>(filesManifest.size()), static_cast<unsigned>(FILES_MANIFEST_MAX_COUNT),
++                         static_cast<unsigned>(FILES_MANIFEST_LEVELS));
++            } else {
++                LOG_DEBUG("Got %u files in manifest", static_cast<unsigned>(filesManifest.size()));
++            }
++        }
+         // last element
+         if (config_state == filesManifest.size() ||
+             config_nonce == SPECIAL_NONCE_ONLY_NODES) { // also handles an empty filesManifest
+             config_state = 0;
+             releaseFilesManifest(filesManifest);
++            filesManifestPrepared = false;
+             // Skip to complete packet
+             sendConfigComplete();
+         } else {
+@@ -791,6 +799,26 @@ bool PhoneAPI::wasSeenRecently(uint32_t id)
+     return false;
+ }
+ 
++uint32_t *PhoneAPI::rateLimitTimestamp(meshtastic_PortNum portNum)
++{
++    switch (portNum) {
++    case meshtastic_PortNum_TRACEROUTE_APP:
++        return &lastPortNumToRadio[RATE_LIMIT_TRACEROUTE];
++    case meshtastic_PortNum_POSITION_APP:
++        return &lastPortNumToRadio[RATE_LIMIT_POSITION];
++    case meshtastic_PortNum_WAYPOINT_APP:
++        return &lastPortNumToRadio[RATE_LIMIT_WAYPOINT];
++    case meshtastic_PortNum_ALERT_APP:
++        return &lastPortNumToRadio[RATE_LIMIT_ALERT];
++    case meshtastic_PortNum_TELEMETRY_APP:
++        return &lastPortNumToRadio[RATE_LIMIT_TELEMETRY];
++    case meshtastic_PortNum_TEXT_MESSAGE_APP:
++        return &lastPortNumToRadio[RATE_LIMIT_TEXT];
++    default:
++        return nullptr;
++    }
++}
++
+ /**
+  * Handle a packet that the phone wants us to send.  It is our responsibility to free the packet to the pool
+  */
+@@ -807,8 +835,11 @@ bool PhoneAPI::handleToRadioPacket(meshtastic_MeshPacket &p)
+             return false;
+         }
+ 
+-    if (p.decoded.portnum == meshtastic_PortNum_TRACEROUTE_APP && lastPortNumToRadio[p.decoded.portnum] &&
+-        Throttle::isWithinTimespanMs(lastPortNumToRadio[p.decoded.portnum], THIRTY_SECONDS_MS)) {
++    uint32_t *lastPortTimestamp = rateLimitTimestamp(p.decoded.portnum);
++    const uint32_t lastPortMsec = lastPortTimestamp ? *lastPortTimestamp : 0;
++
++    if (p.decoded.portnum == meshtastic_PortNum_TRACEROUTE_APP && lastPortMsec &&
++        Throttle::isWithinTimespanMs(lastPortMsec, THIRTY_SECONDS_MS)) {
+         LOG_WARN("Rate limit portnum %d", p.decoded.portnum);
+         sendNotification(meshtastic_LogRecord_Level_WARNING, p.id, "TraceRoute can only be sent once every 30 seconds");
+         meshtastic_QueueStatus qs = router->getQueueStatus();
+@@ -821,8 +852,7 @@ bool PhoneAPI::handleToRadioPacket(meshtastic_MeshPacket &p)
+         return false;
+     } else if (IS_ONE_OF(p.decoded.portnum, meshtastic_PortNum_POSITION_APP, meshtastic_PortNum_WAYPOINT_APP,
+                          meshtastic_PortNum_ALERT_APP, meshtastic_PortNum_TELEMETRY_APP) &&
+-               lastPortNumToRadio[p.decoded.portnum] &&
+-               Throttle::isWithinTimespanMs(lastPortNumToRadio[p.decoded.portnum], TEN_SECONDS_MS)) {
++               lastPortMsec && Throttle::isWithinTimespanMs(lastPortMsec, TEN_SECONDS_MS)) {
+         // TODO: [Issue #6700] Make this rate limit throttling scale up / down with the preset
+         LOG_WARN("Rate limit portnum %d", p.decoded.portnum);
+         meshtastic_QueueStatus qs = router->getQueueStatus();
+@@ -830,8 +860,8 @@ bool PhoneAPI::handleToRadioPacket(meshtastic_MeshPacket &p)
+         // FIXME: Figure out why this continues to happen
+         // sendNotification(meshtastic_LogRecord_Level_WARNING, p.id, "Position can only be sent once every 5 seconds");
+         return false;
+-    } else if (p.decoded.portnum == meshtastic_PortNum_TEXT_MESSAGE_APP && lastPortNumToRadio[p.decoded.portnum] &&
+-               Throttle::isWithinTimespanMs(lastPortNumToRadio[p.decoded.portnum], TWO_SECONDS_MS)) {
++    } else if (p.decoded.portnum == meshtastic_PortNum_TEXT_MESSAGE_APP && lastPortMsec &&
++               Throttle::isWithinTimespanMs(lastPortMsec, TWO_SECONDS_MS)) {
+         LOG_WARN("Rate limit portnum %d", p.decoded.portnum);
+         meshtastic_QueueStatus qs = router->getQueueStatus();
+         service->sendQueueStatusToPhone(qs, 0, p.id);
+@@ -846,7 +876,8 @@ bool PhoneAPI::handleToRadioPacket(meshtastic_MeshPacket &p)
+         p.want_ack = true;
+     }
+ 
+-    lastPortNumToRadio[p.decoded.portnum] = millis();
++    if (lastPortTimestamp)
++        *lastPortTimestamp = millis();
+     service->handleToRadio(p);
+     return true;
+ }
+diff --git a/src/mesh/PhoneAPI.h b/src/mesh/PhoneAPI.h
+index 1776013b9..6940c2fba 100644
+--- a/src/mesh/PhoneAPI.h
++++ b/src/mesh/PhoneAPI.h
+@@ -6,7 +6,6 @@
+ #include "meshtastic/portnums.pb.h"
+ #include <iterator>
+ #include <string>
+-#include <unordered_map>
+ #include <vector>
+ 
+ // Make sure that we never let our packets grow too large for one BLE packet
+@@ -53,8 +52,19 @@ class PhoneAPI
+ 
+     uint8_t config_state = 0;
+ 
+-    // Hashmap of timestamps for last time we received a packet on the API per portnum
+-    std::unordered_map<meshtastic_PortNum, uint32_t> lastPortNumToRadio;
++    // advui-inject-bounded-phone-memory: only these six production rate-limit
++    // classes need timestamps. A map here
++    // let arbitrary decoded port numbers grow heap storage without a bound.
++    enum RateLimitSlot : uint8_t {
++        RATE_LIMIT_TRACEROUTE,
++        RATE_LIMIT_POSITION,
++        RATE_LIMIT_WAYPOINT,
++        RATE_LIMIT_ALERT,
++        RATE_LIMIT_TELEMETRY,
++        RATE_LIMIT_TEXT,
++        RATE_LIMIT_SLOT_COUNT,
++    };
++    uint32_t lastPortNumToRadio[RATE_LIMIT_SLOT_COUNT] = {};
+     uint32_t recentToRadioPacketIds[20]; // Last 20 ToRadio MeshPacket IDs we have seen
+ 
+     /**
+@@ -93,6 +103,7 @@ class PhoneAPI
+     uint32_t readIndex = 0;
+ 
+     std::vector<meshtastic_FileInfo> filesManifest = {};
++    bool filesManifestPrepared = false;
+ 
+     void resetReadIndex() { readIndex = 0; }
+ 
+@@ -189,5 +200,8 @@ class PhoneAPI
+ 
+     bool wasSeenRecently(uint32_t packetId);
+ 
++    /// Return the fixed timestamp slot for a rate-limited port, or nullptr.
++    uint32_t *rateLimitTimestamp(meshtastic_PortNum portNum);
++
+     /**
+      * Handle a packet that the phone wants us to send.  We can write to it but can not keep a reference to it
+     * @return true true if a packet was queued for sending

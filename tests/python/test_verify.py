@@ -21,6 +21,7 @@ def args(**overrides):
         "skip_build": False,
         "rf": False,
         "usb": False,
+        "production_wifi": False,
         "release_image": None,
         "config_backup": None,
         "backup_root": None,
@@ -74,6 +75,26 @@ class VerifyRunnerTests(unittest.TestCase):
         source = verify.parser()
         with self.assertRaises(SystemExit):
             verify.validate_args(args(config_backup=backup), source)
+
+    def test_production_wifi_is_exact_release_usb_only_and_forwarded(self):
+        image = Path("/tmp/exact-release.bin")
+        plan = verify.build_plan(
+            args(
+                usb=True,
+                skip_build=True,
+                release_image=image,
+                production_wifi=True,
+            ),
+            Path("/tmp/evidence"),
+        )
+        command = next(stage.command for stage in plan if stage.name == "hardware/usb-cardputer")
+        self.assertIn("--production-wifi", command)
+
+        source = verify.parser()
+        with self.assertRaises(SystemExit):
+            verify.validate_args(args(production_wifi=True), source)
+        with self.assertRaises(SystemExit):
+            verify.validate_args(args(usb=True, production_wifi=True), source)
 
     def test_rf_release_options_are_forwarded(self):
         plan = verify.build_plan(

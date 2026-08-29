@@ -63,9 +63,10 @@ fi
 #  1. include our UI header,
 #  2. create the UI once after setupModules() (engine + nodeDB up); AdvUI is an
 #     OSThread and then schedules itself, so there is no main-loop edit,
-#  3. make the USB-CDC console non-blocking, so boot logging doesn't stall for
+#  3. make the USB-CDC console effectively non-blocking, so boot logging doesn't stall for
 #     seconds when the port is enumerated by a host that isn't draining it
-#     (that stall is why USB-powered boots are much slower than battery).
+#     (Arduino-ESP32 2.0.17 underflows an internal retry counter at exactly 0,
+#     so the minimum safe timeout is 1 ms).
 MC="$FW/src/main.cpp"
 # Meshtastic 2.7 declares this definition as OSThread*, while the module
 # headers declare the same symbol as AmbientLightingThread*. That is an ODR
@@ -80,31 +81,18 @@ fi
 if [ -f "$MC" ] && ! grep -q 'advui/AdvUI.h" // advui-inject' "$MC"; then
   perl -0pi -e 's{#include "main\.h"\n}{#include "main.h"\n#include "advui/AdvUI.h" // advui-inject\n}' "$MC"
   perl -0pi -e 's{(\n[ \t]*setupModules\(\);\n)}{$1    advui::advuiSetup(); // advui-inject\n}' "$MC"
-  perl -0pi -e 's{(\n[ \t]*consoleInit\(\); // Set serial baud rate and init our mesh console\n)}{$1#if defined(ARDUINO_USB_CDC_ON_BOOT) && ARDUINO_USB_CDC_ON_BOOT\n    Serial.setTxTimeoutMs(0); // advui-inject: keep boot logging non-blocking when the USB host is not draining the CDC\n#endif\n}' "$MC"
+  perl -0pi -e 's{(\n[ \t]*consoleInit\(\); // Set serial baud rate and init our mesh console\n)}{$1#if defined(ARDUINO_USB_CDC_ON_BOOT) && ARDUINO_USB_CDC_ON_BOOT\n    Serial.setTxTimeoutMs(1); // advui-inject: minimum safe HWCDC timeout when the host is not draining\n#endif\n}' "$MC"
   echo "injected advui hooks into main.cpp"
 fi
 
-# SerialConsole.cpp, two independent injections:
-#  1. in the ADVUI_SCREENSHOT dev build the remote-debug driver owns serial
+# SerialConsole.cpp: in the ADVUI_SCREENSHOT dev build the remote-debug driver owns serial
 #     input (keys/screenshots); the stock console polls-and-drains the same
 #     port whenever USB is plugged and would eat those bytes. Dead code in
 #     release builds (the flag is never set there).
-#  2. the boot-time zero TX timeout (main.cpp injection above) makes USB-CDC
-#     writes droppable: under pressure HWCDC::write() returns short, and a
-#     PhoneAPI frame cut mid-body corrupts the whole stream for the client
-#     ("Wire format was corrupt" in the python lib). While an API client is
-#     on the line it IS draining the port, so blocking writes are cheap —
-#     switch to them on the first ToRadio protobuf, and fall back to the
-#     non-blocking boot behavior once the client goes away.
 SC="$FW/src/SerialConsole.cpp"
 if [ -f "$SC" ] && ! grep -q 'the screenshot build reads serial itself' "$SC"; then
   perl -0pi -e 's{(int32_t SerialConsole::runOnce\(\)\n\{\n)}{$1#ifdef ADVUI_SCREENSHOT\n    return 250; // advui-inject: the screenshot build reads serial itself\n#endif\n}' "$SC"
   echo "injected advui screenshot hook into SerialConsole.cpp"
-fi
-if [ -f "$SC" ] && ! grep -q 'advui-inject-txto' "$SC"; then
-  perl -0pi -e 's{(usingProtobufs = true;\n        canWrite = true;\n)}{$1#ifdef IS_USB_SERIAL\n        // advui-inject-txto: an API client is draining the CDC, so blocking\n        // writes are cheap and keep PhoneAPI frames whole; with the boot-time\n        // zero timeout a frame cut short by a full TX ring corrupts the stream.\n        Port.setTxTimeoutMs(50);\n#endif\n}' "$SC"
-  perl -0pi -e 's{(\n    int32_t delay = runOncePart\(\);)}{\n#ifdef IS_USB_SERIAL\n    if (!checkIsConnected())\n        Port.setTxTimeoutMs(0); // advui-inject-txto: client gone -> non-blocking boot behavior\n#endif$1}' "$SC"
-  echo "injected advui tx-timeout hooks into SerialConsole.cpp"
 fi
 
 # RadioLibInterface.cpp: USB HIL is an isolated test transport, never a radio
@@ -170,6 +158,63 @@ if [ -f "$ESP32_MAIN" ] && ! grep -q 'advui-inject-hil-no-stock-ble' "$ESP32_MAI
 fi
 test "$(grep -c 'advui-inject-hil-no-stock-ble' "$ESP32_MAIN" || true)" -eq 1
 
+# StreamAPI + ServerAPI: a full 150-node config dump can fill the TCP send
+# window. The pinned implementation keeps dequeuing frames even after a short
+# write and never returns to loop(), eventually tripping the task watchdog.
+# Slice the cooperative drain. A follow-up patch retains partial frames and
+# uses zero-wait lwIP writes on ESP32 so backpressure cannot corrupt a frame or
+# starve loop() long enough to trip the watchdog.
+STREAM_API="$FW/src/mesh/StreamAPI.cpp"
+STREAM_API_H="$FW/src/mesh/StreamAPI.h"
+SERVER_API="$FW/src/mesh/api/ServerAPI.cpp"
+SERVER_API_H="$FW/src/mesh/api/ServerAPI.h"
+if [ -f "$STREAM_API" ] && [ -f "$STREAM_API_H" ] && \
+   [ -f "$SERVER_API" ] && [ -f "$SERVER_API_H" ] && \
+   ! grep -q 'advui-inject-bounded-stream-writes' "$STREAM_API_H"; then
+  git -C "$FW" apply "$ROOT/overlay/patches/streamapi-bounded-writes.patch"
+  echo "injected bounded StreamAPI writes and TCP short-write guard"
+fi
+test "$(grep -c 'advui-inject-bounded-stream-writes' "$STREAM_API_H" || true)" -eq 1
+
+FRAME_WRITER="$FW/src/mesh/StreamFrameWriter.cpp"
+if [ ! -f "$FRAME_WRITER" ]; then
+  git -C "$FW" apply "$ROOT/overlay/patches/streamapi-retained-nonblocking-writes.patch"
+  echo "injected retained non-blocking StreamAPI transport writes"
+fi
+test -f "$FRAME_WRITER"
+grep -q 'MSG_DONTWAIT' "$FW/src/mesh/api/WiFiServerAPI.cpp"
+grep -q 'HWCDC::isConnected()' "$FW/src/mesh/UsbSessionStream.h"
+grep -q 'delegate.availableForWrite()' "$FW/src/mesh/UsbSessionStream.h"
+grep -q 'resetStreamInput' "$SC"
+
+# PhoneAPI.cpp/.h: upstream 2.7 keeps prefetched NodeInfo records in a
+# std::deque. Every time the deque needs another 308-byte block it calls the
+# throwing operator new; on an ESP32 without enough contiguous internal heap,
+# the unwind path ends in abort() and a reboot. ADV's UI plus a real 150-node
+# database reproduced that failure during a WiFi PhoneAPI config dump. Reuse
+# the existing single-record staging slot: no extra resident payload and no
+# allocation while the heap is fragmented. The patch is intentionally pinned to the
+# reviewed 2.7.26 layout and fails closed when an engine update changes it.
+PHONE_API="$FW/src/mesh/PhoneAPI.cpp"
+PHONE_API_H="$FW/src/mesh/PhoneAPI.h"
+if [ -f "$PHONE_API" ] && [ -f "$PHONE_API_H" ] && \
+   ! grep -q 'advui-inject-fixed-node-prefetch' "$PHONE_API_H"; then
+  git -C "$FW" apply "$ROOT/overlay/patches/phoneapi-fixed-node-prefetch.patch"
+  echo "injected allocation-free PhoneAPI node prefetch"
+fi
+test "$(grep -c 'advui-inject-fixed-node-prefetch' "$PHONE_API" || true)" -eq 1
+test "$(grep -c 'advui-inject-fixed-node-prefetch' "$PHONE_API_H" || true)" -eq 1
+
+# Keep config/node dumps away from two unrelated heap hazards: build the file
+# manifest only after the node stream has finished, and replace the unbounded
+# per-port unordered_map with six fixed rate-limit timestamp slots.
+if [ -f "$PHONE_API" ] && [ -f "$PHONE_API_H" ] && \
+   ! grep -q 'advui-inject-bounded-phone-memory' "$PHONE_API_H"; then
+  git -C "$FW" apply "$ROOT/overlay/patches/phoneapi-bounded-memory.patch"
+  echo "injected bounded PhoneAPI manifest and rate-limit storage"
+fi
+test "$(grep -c 'advui-inject-bounded-phone-memory' "$PHONE_API_H" || true)" -eq 1
+
 # WebServer.cpp + ContentHandler.cpp: drop the HTTPS/TLS server, keep HTTP:80.
 # The self-signed RSA-2048 cert plus mbedTLS session state costs tens of KB of
 # heap on this no-PSRAM board — the stock code already logs "skipping HTTPS
@@ -230,6 +275,16 @@ if [ -f "$ND" ] && [ -f "$NDH" ] && ! grep -q 'advui-inject-forward-nodedb' "$ND
     echo "injected forward-version guard into NodeDB.cpp"
   fi
 fi
+
+# NodeDB.cpp: nanopb decodes the saved vector with push_back. Without an exact
+# reservation, a full 150-node database grows to capacity 256 and permanently
+# strands roughly 20 KiB of internal heap. Reserve once while boot still has a
+# large contiguous block; the patch is pinned after the v24 forward guard above.
+if [ -f "$ND" ] && ! grep -q 'advui-inject-nodedb-reserve' "$ND"; then
+  git -C "$FW" apply "$ROOT/overlay/patches/nodedb-reserve-before-decode.patch"
+  echo "reserved exact NodeDB capacity before decode"
+fi
+test "$(grep -c 'advui-inject-nodedb-reserve' "$ND" || true)" -eq 1
 
 # ADV sends need the synchronous queue-admission result. Existing callers may
 # ignore the returned ErrorCode, so widening the API is source-compatible.

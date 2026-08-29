@@ -1,0 +1,50 @@
+diff --git a/src/mesh/NodeDB.cpp b/src/mesh/NodeDB.cpp
+--- a/src/mesh/NodeDB.cpp
++++ b/src/mesh/NodeDB.cpp
+@@ -174,7 +174,11 @@ bool meshtastic_NodeDatabase_callback(pb_istream_t *istream, pb_ostream_t *outst
+         meshtastic_NodeInfoLite node; // this gets good data
+         std::vector<meshtastic_NodeInfoLite> *vec = (std::vector<meshtastic_NodeInfoLite> *)field->pData;
+ 
+-        if (istream->bytes_left && pb_decode(istream, meshtastic_NodeInfoLite_fields, &node))
+-            vec->push_back(node);
++        if (istream->bytes_left) {
++            if (!pb_decode(istream, meshtastic_NodeInfoLite_fields, &node))
++                return false;
++            if (vec->size() < MAX_NUM_NODES)
++                vec->push_back(node);
++        }
+     }
+     return true;
+@@ -557,7 +561,11 @@ void NodeDB::installDefaultNodeDatabase()
+ {
+     LOG_DEBUG("Install default NodeDatabase");
+     nodeDatabase.version = DEVICESTATE_CUR_VER;
+-    nodeDatabase.nodes = std::vector<meshtastic_NodeInfoLite>(MAX_NUM_NODES);
++    // Reuse an exact-capacity buffer prepared before decode. Constructing a
++    // temporary vector here briefly doubles the large NodeDB allocation on a
++    // missing, corrupt or forward-version cache.
++    nodeDatabase.nodes.clear();
++    nodeDatabase.nodes.resize(MAX_NUM_NODES);
+     numMeshNodes = 0;
+     meshNodes = &nodeDatabase.nodes;
+ }
+@@ -1252,12 +1260,17 @@ void NodeDB::loadFromDisk()
+     }
+ 
+ #endif
++    // advui-inject-nodedb-reserve: decoding with repeated push_back otherwise
++    // grows 150 records through capacity 256, retaining about 20 KiB of unused
++    // internal heap for the entire boot on this no-PSRAM target.
++    nodeDatabase.nodes.clear();
++    nodeDatabase.nodes.reserve(MAX_NUM_NODES);
+     auto state = loadProto(nodeDatabaseFileName, getMaxNodesAllocatedSize(), sizeof(meshtastic_NodeDatabase),
+                            &meshtastic_NodeDatabase_msg, &nodeDatabase);
+     // advui-inject-forward-nodedb: v25 flattened NodeInfoLite and is not
+     // backward-decodable by the v24 schema. Drop only this rebuildable cache.
+-    if (nodeDatabase.version != DEVICESTATE_CUR_VER) {
+-        LOG_WARN("NodeDatabase %d is incompatible, discard", nodeDatabase.version);
++    if (state != LoadFileResult::LOAD_SUCCESS || nodeDatabase.version != DEVICESTATE_CUR_VER) {
++        LOG_WARN("NodeDatabase load failed or version %d is incompatible, discard", nodeDatabase.version);
+         installDefaultNodeDatabase();
+     } else {
+         meshNodes = &nodeDatabase.nodes;

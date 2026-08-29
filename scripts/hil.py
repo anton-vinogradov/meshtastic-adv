@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import contextlib
 import hashlib
 import importlib.util
 import json
@@ -33,6 +34,13 @@ EXPECTED_DEMO_FRAMES = [
     "wifi", "mqtt", "unicode", "stress", "bscan", "bpin", "blink",
     *[f"a{i:02d}" for i in range(1, 20)],
 ]
+PRODUCTION_WIFI_MIN_SOAK_DUMPS = 8
+PRODUCTION_WIFI_MAX_SOAK_DUMPS = 64
+PRODUCTION_WIFI_MIN_SOAK_SECONDS = 120.0
+PRODUCTION_WIFI_READY_SECONDS = 90.0
+PRODUCTION_WIFI_CLOSE_SETTLE_SECONDS = 3.0
+PRODUCTION_WIFI_FINAL_QUIET_SECONDS = 15.0
+PRODUCTION_WIFI_CONFIG_TIMEOUT_SECONDS = 30
 MAX_APP_IMAGE_BYTES = 3_000_000
 REGION_CODES = {"UNSET": 0, "US": 1}
 USB_IDENTITY_RE = re.compile(r"(?i)\b(?:[0-9a-f]{2}:){5}[0-9a-f]{2}\b")
@@ -49,6 +57,18 @@ class UnexpectedReboot(HilError):
 
 class DemoCaptureTransportError(HilError):
     pass
+
+
+class ProductionWifiConnectionError(HilError):
+    """A pre-baseline connectivity failure that may be retried during readiness."""
+
+
+@dataclass(frozen=True)
+class ProductionWifiSnapshot:
+    """Private in-memory result of one complete production PhoneAPI config dump."""
+
+    reboot_count: int
+    node_count: int
 
 
 def redact_lab_details(value: str) -> str:
@@ -341,6 +361,10 @@ def load_fixture(path: Path) -> dict[str, object]:
         if isinstance(power, bool) or not isinstance(power, int) or not 0 <= power <= 30:
             raise HilError("devices.dut.expected_tx_power must be an integer in 0..30")
 
+    production_wifi = dut.get("production_wifi")
+    if production_wifi is not None:
+        validate_production_wifi_config(production_wifi)
+
     # Schema 1 called the second USB device a peer. Treat it as protected when
     # loading old local fixtures: current HIL never opens or mutates it.
     if fixture["schema"] == 1:
@@ -381,6 +405,48 @@ def load_fixture(path: Path) -> dict[str, object]:
     return fixture
 
 
+def validate_production_wifi_config(value: object) -> dict[str, object]:
+    """Validate the private release-only endpoint without exposing its values."""
+    required = {"host", "port", "expected_node_id", "min_nodes"}
+    if not isinstance(value, dict) or set(value) != required:
+        raise HilError("devices.dut.production_wifi must contain host, port, expected_node_id and min_nodes")
+
+    host = value["host"]
+    if (
+        not isinstance(host, str)
+        or not host.strip()
+        or len(host.strip()) > 253
+        or any(ord(character) <= 32 for character in host.strip())
+        or any(character in host for character in "/?#@")
+    ):
+        raise HilError("devices.dut.production_wifi.host is invalid")
+
+    port = value["port"]
+    if isinstance(port, bool) or not isinstance(port, int) or not 1 <= port <= 65535:
+        raise HilError("devices.dut.production_wifi.port must be an integer in 1..65535")
+
+    node_id = value["expected_node_id"]
+    if not isinstance(node_id, str) or not re.fullmatch(r"![0-9a-fA-F]{8}", node_id.strip()):
+        raise HilError("devices.dut.production_wifi.expected_node_id must be ! plus eight hex digits")
+
+    min_nodes = value["min_nodes"]
+    if isinstance(min_nodes, bool) or not isinstance(min_nodes, int) or not 32 <= min_nodes <= 250:
+        raise HilError("devices.dut.production_wifi.min_nodes must be an integer in 32..250")
+
+    value["host"] = host.strip()
+    value["expected_node_id"] = node_id.strip().lower()
+    return value
+
+
+def require_production_wifi_config(fixture: dict[str, object]) -> dict[str, object]:
+    devices = fixture.get("devices")
+    dut = devices.get("dut") if isinstance(devices, dict) else None
+    config = dut.get("production_wifi") if isinstance(dut, dict) else None
+    if config is None:
+        raise HilError("release HIL requires devices.dut.production_wifi in its private fixture")
+    return validate_production_wifi_config(config)
+
+
 def resolve_role(fixture: dict[str, object], role: str) -> dict[str, object]:
     expected = fixture["devices"][role]
     visible = ports()
@@ -404,7 +470,7 @@ def wait_for_usb_serial(usb_serial: str, timeout: float = 20) -> dict[str, objec
 
 
 def kick_device(usb_serial: str) -> dict[str, object]:
-    """Open native USB once so the application leaves the post-upload reset state."""
+    """Hold native USB open long enough to leave the post-upload reset state."""
     serial, _ = require_serial()
     device = wait_for_usb_serial(usb_serial)
     handle = serial.Serial()
@@ -415,7 +481,13 @@ def kick_device(usb_serial: str) -> dict[str, object]:
     handle.rts = False
     try:
         handle.open()
-        time.sleep(0.5)
+        # ESP32-S3 native USB can reappear before the application has actually
+        # crossed the ROM/bootloader handoff. Keep the host side present while
+        # draining (and deliberately discarding) early logs so a production
+        # Wi-Fi soak does not depend on someone opening a serial terminal.
+        deadline = time.monotonic() + 3.0
+        while time.monotonic() < deadline:
+            handle.read(512)
         handle.close()
     except Exception:
         try:
@@ -441,6 +513,174 @@ def wifi_inventory(fixture: dict[str, object], timeout: float = 1) -> list[dict[
             error = str(exc)
         found.append({**peer, "port": port, "online": online, "error": error})
     return found
+
+
+@contextlib.contextmanager
+def quiet_phoneapi():
+    """Keep library logs and private config fields out of unattended evidence."""
+    with open(os.devnull, "w", encoding="utf-8") as sink:
+        with contextlib.redirect_stdout(sink), contextlib.redirect_stderr(sink):
+            yield
+
+
+def open_production_wifi_interface(host: str, port: int, timeout: int) -> object:
+    """Open one complete, non-reconnecting, read-only PhoneAPI config stream."""
+    try:
+        from meshtastic.tcp_interface import TCPInterface
+    except ImportError as exc:
+        raise HilError("Meshtastic Python is required (install the hash-locked HIL requirements)") from exc
+
+    class FailClosedTCPInterface(TCPInterface):
+        def myConnect(self) -> None:  # noqa: N802 - upstream API spelling
+            connected = socket.create_connection(
+                (self.hostname, self.portNumber), timeout=timeout
+            )
+            connected.settimeout(None)
+            self.socket = connected
+
+        def _reconnect(self) -> None:
+            # A reconnect could hide a reboot inside one nominal config dump.
+            # Every post-baseline connection is therefore exactly one TCP
+            # session, and any loss is release-blocking.
+            self._wantExit = True
+            raise ConnectionError("production WiFi soak forbids PhoneAPI reconnect")
+
+    return FailClosedTCPInterface(
+        hostname=host,
+        portNumber=port,
+        noNodes=False,
+        timeout=timeout,
+    )
+
+
+def production_wifi_dump(
+    config: dict[str, object],
+    opener: Callable[[str, int, int], object] | None = None,
+) -> ProductionWifiSnapshot:
+    """Receive and validate one full production config dump without persisting it."""
+    config = validate_production_wifi_config(config)
+    open_interface = opener or open_production_wifi_interface
+    interface: object | None = None
+    with quiet_phoneapi():
+        try:
+            interface = open_interface(
+                str(config["host"]),
+                int(config["port"]),
+                PRODUCTION_WIFI_CONFIG_TIMEOUT_SECONDS,
+            )
+        except Exception as exc:
+            raise ProductionWifiConnectionError(
+                f"production PhoneAPI config dump failed ({type(exc).__name__})"
+            ) from None
+
+        try:
+            connected = getattr(interface, "isConnected", None)
+            if connected is None or not callable(getattr(connected, "is_set", None)):
+                raise HilError("production PhoneAPI did not expose config-complete state")
+            if not connected.is_set():
+                raise ProductionWifiConnectionError("production PhoneAPI config dump was incomplete")
+
+            my_info = getattr(interface, "myInfo", None)
+            metadata = getattr(interface, "metadata", None)
+            nodes = getattr(interface, "nodesByNum", None)
+            if my_info is None or metadata is None or not isinstance(nodes, dict):
+                raise ProductionWifiConnectionError("production PhoneAPI config dump was incomplete")
+
+            expected_node = int(str(config["expected_node_id"])[-8:], 16)
+            try:
+                actual_node = int(getattr(my_info, "my_node_num", 0))
+                reported_nodes = int(getattr(my_info, "nodedb_count", 0))
+                reboot_count = int(getattr(my_info, "reboot_count", -1))
+            except (TypeError, ValueError):
+                raise HilError("production PhoneAPI reported invalid numeric metadata") from None
+
+            if actual_node != expected_node:
+                raise HilError("production PhoneAPI endpoint identity does not match the fixture")
+            if str(getattr(my_info, "pio_env", "")) != RELEASE_ENV:
+                raise HilError("production PhoneAPI endpoint reports the wrong firmware environment")
+            # The pinned 2.7 Meshtastic Python protobuf exposes the legacy
+            # camelCase field name used on this release line.
+            if not bool(getattr(metadata, "hasWifi", False)):
+                raise HilError("production PhoneAPI endpoint does not report WiFi capability")
+
+            received_nodes = len(nodes)
+            minimum_nodes = int(config["min_nodes"])
+            if reported_nodes < minimum_nodes or received_nodes < minimum_nodes:
+                raise HilError("production PhoneAPI NodeDB is below the fixture minimum")
+
+            if reboot_count < 0:
+                raise HilError("production PhoneAPI did not report a valid reboot counter")
+            return ProductionWifiSnapshot(
+                reboot_count=reboot_count,
+                node_count=min(reported_nodes, received_nodes),
+            )
+        finally:
+            if interface is not None:
+                try:
+                    interface.close()
+                except Exception as exc:
+                    raise ProductionWifiConnectionError(
+                        f"production PhoneAPI close failed ({type(exc).__name__})"
+                    ) from None
+
+
+def production_wifi_soak(
+    fixture: dict[str, object],
+    *,
+    opener: Callable[[str, int, int], object] | None = None,
+    monotonic: Callable[[], float] = time.monotonic,
+    sleep: Callable[[float], None] = time.sleep,
+) -> dict[str, object]:
+    """Prove repeated full production config dumps do not reboot the DUT."""
+    config = require_production_wifi_config(fixture)
+    ready_deadline = monotonic() + PRODUCTION_WIFI_READY_SECONDS
+    while True:
+        try:
+            baseline = production_wifi_dump(config, opener=opener)
+            break
+        except ProductionWifiConnectionError as exc:
+            remaining = ready_deadline - monotonic()
+            if remaining <= 0:
+                raise HilError(
+                    f"production PhoneAPI did not become ready ({type(exc).__name__})"
+                ) from None
+            sleep(min(PRODUCTION_WIFI_CLOSE_SETTLE_SECONDS, remaining))
+
+    started = monotonic()
+    soak_dumps = 0
+    minimum_node_count = baseline.node_count
+    while (
+        soak_dumps < PRODUCTION_WIFI_MIN_SOAK_DUMPS
+        or monotonic() - started < PRODUCTION_WIFI_MIN_SOAK_SECONDS
+    ):
+        if soak_dumps >= PRODUCTION_WIFI_MAX_SOAK_DUMPS:
+            raise HilError("production WiFi soak did not reach its minimum duration")
+        sleep(PRODUCTION_WIFI_CLOSE_SETTLE_SECONDS)
+        current = production_wifi_dump(config, opener=opener)
+        soak_dumps += 1
+        minimum_node_count = min(minimum_node_count, current.node_count)
+        if current.reboot_count != baseline.reboot_count:
+            raise UnexpectedReboot("production firmware rebooted during the WiFi config-dump soak")
+
+    sleep(PRODUCTION_WIFI_FINAL_QUIET_SECONDS)
+    final = production_wifi_dump(config, opener=opener)
+    minimum_node_count = min(minimum_node_count, final.node_count)
+    if final.reboot_count != baseline.reboot_count:
+        raise UnexpectedReboot("production firmware rebooted after the WiFi config-dump soak")
+
+    return {
+        "validated": True,
+        "identity_verified": True,
+        "environment_verified": True,
+        "wifi_capability_verified": True,
+        "config_dump_cycles": 1 + soak_dumps + 1,
+        "soak_seconds": round(monotonic() - started, 3),
+        "minimum_node_count": minimum_node_count,
+        "stable_reboot_counter": True,
+        "mesh_writes": 0,
+        "admin_writes": 0,
+        "chat_writes": 0,
+    }
 
 
 def find_pio() -> str:
@@ -2217,8 +2457,13 @@ def visual(fixture: dict[str, object], artifacts: Path, timeout: float) -> Repor
 def full_run(
     fixture: dict[str, object], artifacts: Path, timeout: float, skip_build: bool = False,
     release_image: Path | None = None, config_backup: Path | None = None,
+    production_wifi: bool = False,
 ) -> int:
     """Run the complete safe suite and always put production firmware back."""
+    if production_wifi:
+        require_production_wifi_config(fixture)
+        if release_image is None:
+            raise HilError("production WiFi soak requires an exact --release-image")
     exact_release = validate_app_image(release_image) if release_image is not None else None
     if not skip_build:
         build(release=False)
@@ -2233,6 +2478,9 @@ def full_run(
     configuration_preserved: bool | None = None
     configuration_restored = False
     configuration_check_failure_type: str | None = None
+    production_wifi_evidence: dict[str, object] | None = None
+    production_wifi_failure_type: str | None = None
+    production_wifi_skipped = False
     configuration_backup = prepare_config_backup_destination(artifacts, config_backup)
     with configuration_temporary_directory("meshtastic-adv-hil-config-") as temporary:
         configuration_before: bytes | None = None
@@ -2272,6 +2520,7 @@ def full_run(
         finally:
             restore_error: Exception | None = None
             configuration_error: Exception | None = None
+            production_wifi_error: Exception | None = None
             if flash_attempted:
                 try:
                     print("restoring production firmware", flush=True)
@@ -2282,6 +2531,17 @@ def full_run(
                 except Exception as exc:
                     restore_failure_type = type(exc).__name__
                     restore_error = exc
+
+                if restored and production_wifi:
+                    if failure_type is None and failures == 0:
+                        try:
+                            print("soaking restored production WiFi PhoneAPI", flush=True)
+                            production_wifi_evidence = production_wifi_soak(fixture)
+                        except Exception as exc:
+                            production_wifi_failure_type = type(exc).__name__
+                            production_wifi_error = exc
+                    else:
+                        production_wifi_skipped = True
 
                 if restored:
                     try:
@@ -2316,7 +2576,13 @@ def full_run(
                 "configuration_preserved": configuration_preserved,
                 "configuration_restored": configuration_restored,
                 "configuration_check_failure_type": configuration_check_failure_type,
+                "production_wifi_requested": production_wifi,
+                "production_wifi_validated": production_wifi_evidence is not None,
+                "production_wifi_skipped_after_hil_failure": production_wifi_skipped,
+                "production_wifi_failure_type": production_wifi_failure_type,
             }
+            if production_wifi_evidence is not None:
+                summary["production_wifi"] = production_wifi_evidence
             if release_sha256 is not None:
                 summary["release_image_sha256"] = release_sha256
             summary_path.write_text(json.dumps(summary, indent=2) + "\n")
@@ -2328,6 +2594,8 @@ def full_run(
                 raise restore_error
             if configuration_error is not None:
                 raise configuration_error
+            if production_wifi_error is not None:
+                raise production_wifi_error
     return failures
 
 
@@ -2402,6 +2670,10 @@ def make_parser() -> argparse.ArgumentParser:
     run_cmd.add_argument(
         "--config-backup", type=Path,
         help="exclusive private backup destination outside the CI checkout/temp directories",
+    )
+    run_cmd.add_argument(
+        "--production-wifi", action="store_true",
+        help="soak the restored exact production image with read-only full PhoneAPI config dumps",
     )
     return parser
 
@@ -2494,6 +2766,7 @@ def main() -> int:
             failures = full_run(
                 fixture, artifacts, args.timeout, args.skip_build,
                 release_image=args.release_image, config_backup=args.config_backup,
+                production_wifi=args.production_wifi,
             )
             print(f"artifacts: {artifacts}")
             return 1 if failures else 0

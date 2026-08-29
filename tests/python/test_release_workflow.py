@@ -44,6 +44,7 @@ class ReleaseWorkflowTests(unittest.TestCase):
         self.assertIn("os.fsync", block)
         self.assertIn("umask 077", block)
         self.assertIn("--release-image", block)
+        self.assertIn("--production-wifi", block)
         self.assertNotIn("runner.temp", block.split("steps:", 1)[0])
         self.assertEqual(block.count("${{ runner.temp }}"), 5)
         self.assertIn("timeout-minutes: 150", block)

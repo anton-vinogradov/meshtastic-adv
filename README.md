@@ -53,6 +53,8 @@ runner. The physical gate is radio-silent and identity-bound; it replays ordinar
 serialized `FromRadio` traffic through the production decoder, drives the real UI,
 overflows and reloads persistent history, checks 35 framebuffer captures, reboots,
 and finally restores and verifies the exact application bytes users will receive.
+That restored production image must then survive repeated complete, read-only WiFi
+config/NodeDB downloads for at least two minutes without a reconnect or reboot.
 See the honest [HIL coverage matrix](hil/README.md#coverage-matrix), including what
 still needs a camera, key jig or controlled RF lab for physical proof.
 Release hardening changes and migration notes are kept in the [changelog](CHANGELOG.md).

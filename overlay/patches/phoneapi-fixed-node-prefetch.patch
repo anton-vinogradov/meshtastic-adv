@@ -1,0 +1,184 @@
+diff --git a/src/mesh/PhoneAPI.cpp b/src/mesh/PhoneAPI.cpp
+index 6c2639cb1..be6ce3916 100644
+--- a/src/mesh/PhoneAPI.cpp
++++ b/src/mesh/PhoneAPI.cpp
+@@ -100,13 +100,12 @@ void PhoneAPI::handleStartConfig()
+     }
+ 
+     LOG_INFO("Start API client config millis=%u", millis());
+-    // Protect against concurrent BLE callbacks: they run in NimBLE's FreeRTOS task and also touch nodeInfoQueue.
++    // Protect against concurrent BLE callbacks: they run in NimBLE's FreeRTOS task and also touch this iterator state.
+     {
+         concurrency::LockGuard guard(&nodeInfoMutex);
+         nodeInfoForPhone = {};
+-        nodeInfoQueue.clear();
++        resetReadIndex();
+     }
+-    resetReadIndex();
+ }
+ 
+ void PhoneAPI::close()
+@@ -127,7 +126,6 @@ void PhoneAPI::close()
+ 
+     if (state != STATE_SEND_NOTHING) {
+         state = STATE_SEND_NOTHING;
+-        resetReadIndex();
+         unobserve(&service->fromNumChanged);
+ #ifdef FSCom
+         unobserve(&xModem.packetReady);
+@@ -143,7 +141,7 @@ void PhoneAPI::close()
+         {
+             concurrency::LockGuard guard(&nodeInfoMutex);
+             nodeInfoForPhone = {};
+-            nodeInfoQueue.clear();
++            resetReadIndex();
+         }
+         packetForPhone = NULL;
+         releaseFilesManifest(filesManifest);
+@@ -308,21 +306,17 @@ size_t PhoneAPI::getFromRadio(uint8_t *buf)
+ 
+     case STATE_SEND_OWN_NODEINFO: {
+         LOG_DEBUG("Send My NodeInfo");
+-        auto us = nodeDB->readNextMeshNode(readIndex);
+-        if (us) {
+-            auto info = TypeConversions::ConvertToNodeInfo(us);
+-            info.has_hops_away = false;
+-            info.is_favorite = true;
+-            {
+-                concurrency::LockGuard guard(&nodeInfoMutex);
+-                nodeInfoForPhone = info;
+-            }
+-            fromRadioScratch.which_payload_variant = meshtastic_FromRadio_node_info_tag;
+-            fromRadioScratch.node_info = info;
+-            // Should allow us to resume sending NodeInfo in STATE_SEND_OTHER_NODEINFOS
+-            {
+-                concurrency::LockGuard guard(&nodeInfoMutex);
+-                nodeInfoForPhone.num = 0;
++        {
++            // readIndex shares the lifecycle lock with close(), config restart
++            // and the allocation-free one-record prefetch path below.
++            concurrency::LockGuard guard(&nodeInfoMutex);
++            auto us = nodeDB->readNextMeshNode(readIndex);
++            if (us) {
++                auto info = TypeConversions::ConvertToNodeInfo(us);
++                info.has_hops_away = false;
++                info.is_favorite = true;
++                fromRadioScratch.which_payload_variant = meshtastic_FromRadio_node_info_tag;
++                fromRadioScratch.node_info = info;
+             }
+         }
+         if (config_nonce == SPECIAL_NONCE_ONLY_NODES) {
+@@ -516,11 +510,6 @@ size_t PhoneAPI::getFromRadio(uint8_t *buf)
+         meshtastic_NodeInfo infoToSend = {};
+         {
+             concurrency::LockGuard guard(&nodeInfoMutex);
+-            if (nodeInfoForPhone.num == 0 && !nodeInfoQueue.empty()) {
+-                // Serve the next cached node without re-reading from the DB iterator.
+-                nodeInfoForPhone = nodeInfoQueue.front();
+-                nodeInfoQueue.pop_front();
+-            }
+             infoToSend = nodeInfoForPhone;
+             if (infoToSend.num != 0)
+                 nodeInfoForPhone = {};
+@@ -540,8 +529,6 @@ size_t PhoneAPI::getFromRadio(uint8_t *buf)
+             prefetchNodeInfos();
+         } else {
+             LOG_DEBUG("Done sending %d of %d nodeinfos millis=%u", readIndex, nodeDB->getNumMeshNodes(), millis());
+-            concurrency::LockGuard guard(&nodeInfoMutex);
+-            nodeInfoQueue.clear();
+             state = STATE_SEND_FILEMANIFEST;
+             // Go ahead and send that ID right now
+             return getFromRadio(buf);
+@@ -664,35 +651,30 @@ void PhoneAPI::releaseQueueStatusPhonePacket()
+ 
+ void PhoneAPI::prefetchNodeInfos()
+ {
+-    bool added = false;
+-    bool wasEmpty = false;
+-    // Keep the queue topped up so BLE reads stay responsive even if DB fetches take a moment.
++    // advui-inject-fixed-node-prefetch: stage at most one record in the
++    // existing slot. getFromRadio() consumes it and immediately stages the next,
++    // preserving one-record lookahead without any dynamic allocation. State
++    // transitions already notify transports; refills must not emit one BLE
++    // notification per node before the encoded frame reaches its queue.
+     {
+         concurrency::LockGuard guard(&nodeInfoMutex);
+-        wasEmpty = nodeInfoQueue.empty();
+-        while (nodeInfoQueue.size() < kNodePrefetchDepth) {
++        if (nodeInfoForPhone.num == 0) {
+             auto nextNode = nodeDB->readNextMeshNode(readIndex);
+-            if (!nextNode)
+-                break;
+-
+-            auto info = TypeConversions::ConvertToNodeInfo(nextNode);
+-            bool isUs = info.num == nodeDB->getNodeNum();
+-            info.hops_away = isUs ? 0 : info.hops_away;
+-            info.last_heard = isUs ? getValidTime(RTCQualityFromNet) : info.last_heard;
+-            info.snr = isUs ? 0 : info.snr;
+-            info.via_mqtt = isUs ? false : info.via_mqtt;
+-            info.is_favorite = info.is_favorite || isUs;
+-            nodeInfoQueue.push_back(info);
+-            // Log progress here (at fetch time) so readIndex is accurate and each value logs only once.
+-            if (readIndex == 2 || readIndex % 20 == 0) {
+-                LOG_DEBUG("nodeinfo: %d/%d", readIndex, nodeDB->getNumMeshNodes());
++            if (nextNode) {
++                nodeInfoForPhone = TypeConversions::ConvertToNodeInfo(nextNode);
++                bool isUs = nodeInfoForPhone.num == nodeDB->getNodeNum();
++                nodeInfoForPhone.hops_away = isUs ? 0 : nodeInfoForPhone.hops_away;
++                nodeInfoForPhone.last_heard = isUs ? getValidTime(RTCQualityFromNet) : nodeInfoForPhone.last_heard;
++                nodeInfoForPhone.snr = isUs ? 0 : nodeInfoForPhone.snr;
++                nodeInfoForPhone.via_mqtt = isUs ? false : nodeInfoForPhone.via_mqtt;
++                nodeInfoForPhone.is_favorite = nodeInfoForPhone.is_favorite || isUs;
++                // Log progress here (at fetch time) so readIndex is accurate and each value logs only once.
++                if (readIndex == 2 || readIndex % 20 == 0) {
++                    LOG_DEBUG("nodeinfo: %d/%d", readIndex, nodeDB->getNumMeshNodes());
++                }
+             }
+-            added = true;
+         }
+     }
+-
+-    if (added && wasEmpty)
+-        onNowHasData(0);
+ }
+ 
+ void PhoneAPI::releaseMqttClientProxyPhonePacket()
+@@ -732,7 +714,7 @@ bool PhoneAPI::available()
+ 
+     case STATE_SEND_OTHER_NODEINFOS: {
+         concurrency::LockGuard guard(&nodeInfoMutex);
+-        if (nodeInfoQueue.empty()) {
++        if (nodeInfoForPhone.num == 0) {
+             // Drop the lock before prefetching; prefetchNodeInfos() will re-acquire it.
+             goto PREFETCH_NODEINFO;
+         }
+diff --git a/src/mesh/PhoneAPI.h b/src/mesh/PhoneAPI.h
+index 7f79b5792..1776013b9 100644
+--- a/src/mesh/PhoneAPI.h
++++ b/src/mesh/PhoneAPI.h
+@@ -4,7 +4,6 @@
+ #include "concurrency/Lock.h"
+ #include "mesh-pb-constants.h"
+ #include "meshtastic/portnums.pb.h"
+-#include <deque>
+ #include <iterator>
+ #include <string>
+ #include <unordered_map>
+@@ -79,13 +78,11 @@ class PhoneAPI
+     // Keep ClientNotification packet just as packetForPhone
+     meshtastic_ClientNotification *clientNotification = NULL;
+ 
+-    /// We temporarily keep the nodeInfo here between the call to available and getFromRadio
++    /// We temporarily keep the nodeInfo here between the call to available and getFromRadio.
++    /// advui-inject-fixed-node-prefetch: reuse this existing single slot instead
++    /// of growing a deque from the fragmented ESP32 heap during a config dump.
+     meshtastic_NodeInfo nodeInfoForPhone = meshtastic_NodeInfo_init_default;
+-    // Prefetched node info entries ready for immediate transmission to the phone.
+-    std::deque<meshtastic_NodeInfo> nodeInfoQueue;
+-    // Tunable size of the node info cache so we can keep BLE reads non-blocking.
+-    static constexpr size_t kNodePrefetchDepth = 4;
+-    // Protect nodeInfoForPhone + nodeInfoQueue because NimBLE callbacks run in a separate FreeRTOS task.
++    // Protect nodeInfoForPhone because NimBLE callbacks run in a separate FreeRTOS task.
+     concurrency::Lock nodeInfoMutex;
+ 
+     meshtastic_ToRadio toRadioScratch = {

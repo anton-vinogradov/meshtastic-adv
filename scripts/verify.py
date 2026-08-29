@@ -34,6 +34,10 @@ def parser() -> argparse.ArgumentParser:
     result.add_argument("--rf", action="store_true", help="opt in to the state-preserving two-node RF suite")
     result.add_argument("--usb", action="store_true", help="opt in to the Cardputer USB HIL suite")
     result.add_argument(
+        "--production-wifi", action="store_true",
+        help="after USB HIL, soak the restored exact production image through read-only PhoneAPI dumps",
+    )
+    result.add_argument(
         "--release-image", type=Path,
         help="exact production app artifact restored after USB HIL (requires --usb)",
     )
@@ -59,6 +63,10 @@ def validate_args(args: argparse.Namespace, source: argparse.ArgumentParser) -> 
         source.error("--release-image requires --usb")
     if args.config_backup is not None and not args.usb:
         source.error("--config-backup requires --usb")
+    if args.production_wifi and not args.usb:
+        source.error("--production-wifi requires --usb")
+    if args.production_wifi and args.release_image is None:
+        source.error("--production-wifi requires --release-image")
     if args.rf and args.backup_root is None:
         source.error("--rf requires --backup-root")
     if (
@@ -136,6 +144,8 @@ def build_plan(args: argparse.Namespace, artifacts: Path) -> list[Stage]:
             usb_command.extend(("--release-image", str(args.release_image)))
         if args.config_backup is not None:
             usb_command.extend(("--config-backup", str(args.config_backup)))
+        if args.production_wifi:
+            usb_command.append("--production-wifi")
         stages.append(Stage("hardware/usb-cardputer", tuple(usb_command), hardware=True))
     if args.rf:
         rf_command = [
@@ -242,7 +252,11 @@ def main(argv: list[str] | None = None) -> int:
         "started": datetime.now(timezone.utc).isoformat(),
         "status": "running",
         "planned": len(plan),
-        "hardware_opt_in": {"rf": args.rf, "usb": args.usb},
+        "hardware_opt_in": {
+            "rf": args.rf,
+            "usb": args.usb,
+            "production_wifi": args.production_wifi,
+        },
         "results": [],
     }
     write_report(report, artifacts)

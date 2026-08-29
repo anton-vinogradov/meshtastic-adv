@@ -5732,7 +5732,7 @@ void AdvUI::screenshot(const char *name)
 {
     if (!haveCanvas)
         return;
-    Serial.setTxTimeoutMs(1000); // blocking TX: the USB-CDC guard (0) drops bytes on big writes
+    Serial.setTxTimeoutMs(1000); // blocking TX: the 1 ms USB-CDC guard drops bytes on big writes
     const uint8_t *buf = (const uint8_t *)canvas.getBuffer();
     int w = display.width(), h = display.height();
     int stride = (int)(canvas.bufferLength() / h);
@@ -5754,7 +5754,7 @@ void AdvUI::screenshot(const char *name)
     }
     Serial.println("@@END");
     Serial.flush();
-    Serial.setTxTimeoutMs(0); // restore the USB-CDC guard
+    Serial.setTxTimeoutMs(1); // restore the minimum safe USB-CDC guard
     delay(30);
 }
 

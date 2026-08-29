@@ -68,8 +68,9 @@ TEMP_PATH_RE = re.compile(
 )
 TOKEN_ALLOWLIST = {
     "access", "devices", "expected_region", "expected_tx_power", "host", "kind",
-    "name", "port", "protected_devices", "read-only", "region", "schema",
-    "test", "tx_power", "usb_serial", "wifi_peers",
+    "expected_node_id", "min_nodes", "name", "port", "production_wifi",
+    "protected_devices", "read-only", "region", "schema", "test", "tx_power",
+    "usb_serial", "wifi_peers",
 }
 
 
@@ -581,6 +582,9 @@ def fixture_tokens(path: Path | None) -> list[str]:
         for device in devices.values():
             if isinstance(device, dict) and isinstance(device.get("name"), str):
                 identity_names.add(device["name"].strip())
+            production_wifi = device.get("production_wifi") if isinstance(device, dict) else None
+            if isinstance(production_wifi, dict) and isinstance(production_wifi.get("host"), str):
+                identity_names.add(production_wifi["host"].strip())
     for collection in ("protected_devices", "wifi_peers"):
         entries = fixture.get(collection) if isinstance(fixture, dict) else None
         if isinstance(entries, list):

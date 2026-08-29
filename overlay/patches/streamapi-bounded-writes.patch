@@ -1,0 +1,243 @@
+diff --git a/src/mesh/StreamAPI.cpp b/src/mesh/StreamAPI.cpp
+index 2c3362877..2d1b3e3a3 100644
+--- a/src/mesh/StreamAPI.cpp
++++ b/src/mesh/StreamAPI.cpp
+@@ -12,7 +12,8 @@
+ int32_t StreamAPI::runOncePart()
+ {
+     auto result = readStream();
+-    writeStream();
++    if (writeStream())
++        result = 0;
+     checkConnectionTimeout();
+     return result;
+ }
+@@ -20,7 +21,8 @@ int32_t StreamAPI::runOncePart()
+ int32_t StreamAPI::runOncePart(char *buf, uint16_t bufLen)
+ {
+     auto result = readStream(buf, bufLen);
+-    writeStream();
++    if (writeStream())
++        result = 0;
+     checkConnectionTimeout();
+     return result;
+ }
+@@ -45,16 +47,20 @@ int32_t StreamAPI::readStream(const char *buf, uint16_t bufLen)
+ /**
+  * call getFromRadio() and deliver encapsulated packets to the Stream
+  */
+-void StreamAPI::writeStream()
++bool StreamAPI::writeStream()
+ {
+-    if (canWrite) {
+-        uint32_t len;
+-        do {
+-            // Send every packet we can
+-            len = getFromRadio(txBuf + HEADER_LEN);
+-            emitTxBuffer(len);
+-        } while (len);
+-    }
++    if (!canWrite)
++        return false;
++
++    uint32_t len;
++    uint32_t started = millis();
++    do {
++        len = getFromRadio(txBuf + HEADER_LEN);
++        if (len != 0 && !emitTxBuffer(len))
++            return false;
++    } while (len && Throttle::isWithinTimespanMs(started, STREAM_WRITE_BUDGET_MSEC));
++
++    return len != 0;
+ }
+ 
+ int32_t StreamAPI::handleRecStream(const char *buf, uint16_t bufLen)
+@@ -169,21 +175,34 @@ int32_t StreamAPI::readStream()
+ /**
+  * Send the current txBuffer over our stream
+  */
+-void StreamAPI::emitTxBuffer(size_t len)
++bool StreamAPI::writeFrame(uint8_t *buf, size_t len)
+ {
+-    if (len != 0) {
+-        txBuf[0] = START1;
+-        txBuf[1] = START2;
+-        txBuf[2] = (len >> 8) & 0xff;
+-        txBuf[3] = len & 0xff;
+-
+-        auto totalLen = len + HEADER_LEN;
+-        // Serialize stream writes against `emitLogRecord` so a LOG_ firing
+-        // mid-packet-emission can't interleave bytes on the wire.
+-        concurrency::LockGuard guard(&streamLock);
+-        stream->write(txBuf, totalLen);
++    if (len == 0 || !canWrite)
++        return false;
++
++    buf[0] = START1;
++    buf[1] = START2;
++    buf[2] = (len >> 8) & 0xff;
++    buf[3] = len & 0xff;
++
++    auto totalLen = len + HEADER_LEN;
++    concurrency::LockGuard guard(&streamLock);
++    if (!canWriteFrame(totalLen))
++        return false;
++
++    size_t written = stream->write(buf, totalLen);
++    if (written == totalLen) {
+         stream->flush();
++        return true;
+     }
++
++    onFrameWriteFailed(totalLen, written);
++    return false;
++}
++
++bool StreamAPI::emitTxBuffer(size_t len)
++{
++    return writeFrame(txBuf, len);
+ }
+ 
+ void StreamAPI::emitRebooted()
+@@ -221,20 +240,7 @@ void StreamAPI::emitLogRecord(meshtastic_LogRecord_Level level, const char *src,
+ 
+     size_t len =
+         pb_encode_to_bytes(txBufLog + HEADER_LEN, meshtastic_FromRadio_size, &meshtastic_FromRadio_msg, &fromRadioScratchLog);
+-    if (len != 0) {
+-        txBufLog[0] = START1;
+-        txBufLog[1] = START2;
+-        txBufLog[2] = (len >> 8) & 0xff;
+-        txBufLog[3] = len & 0xff;
+-
+-        auto totalLen = len + HEADER_LEN;
+-        // Serialize stream writes against `emitTxBuffer` so a packet
+-        // emission in flight on another task doesn't interleave bytes
+-        // with this log record.
+-        concurrency::LockGuard guard(&streamLock);
+-        stream->write(txBufLog, totalLen);
+-        stream->flush();
+-    }
++    writeFrame(txBufLog, len);
+ }
+ 
+ /// Hookable to find out when connection changes
+@@ -249,4 +255,4 @@ void StreamAPI::onConnectionChanged(bool connected)
+         // received a packet in a while
+         powerFSM.trigger(EVENT_SERIAL_DISCONNECTED);
+     }
+-}
+\ No newline at end of file
++}
+diff --git a/src/mesh/StreamAPI.h b/src/mesh/StreamAPI.h
+index d3ad9ba79..757219ea4 100644
+--- a/src/mesh/StreamAPI.h
++++ b/src/mesh/StreamAPI.h
+@@ -9,6 +9,11 @@
+ // A To/FromRadio packet + our 32 bit header
+ #define MAX_STREAM_BUF_SIZE (MAX_TO_FROM_RADIO_SIZE + sizeof(uint32_t))
+ 
++// advui-inject-bounded-stream-writes: a full config dump can contain hundreds
++// of frames. Bound one cooperative
++// dispatch so loop() keeps feeding the watchdog between output slices.
++#define STREAM_WRITE_BUDGET_MSEC 100
++
+ /**
+  * A version of our 'phone' API that talks over a Stream.  So therefore well suited to use with serial links
+  * or TCP connections.
+@@ -64,10 +68,8 @@ class StreamAPI : public PhoneAPI
+     int32_t readStream(const char *buf, uint16_t bufLen);
+     int32_t handleRecStream(const char *buf, uint16_t bufLen);
+ 
+-    /**
+-     * call getFromRadio() and deliver encapsulated packets to the Stream
+-     */
+-    void writeStream();
++    /// Emit a bounded slice. True asks the caller to run again immediately.
++    bool writeStream();
+ 
+   protected:
+     /**
+@@ -80,7 +82,7 @@ class StreamAPI : public PhoneAPI
+     /**
+      * Send the current txBuffer over our stream
+      */
+-    void emitTxBuffer(size_t len);
++    bool emitTxBuffer(size_t len);
+ 
+     /// Are we allowed to write packets to our output stream (subclasses can turn this off - i.e. SerialConsole)
+     bool canWrite = true;
+@@ -91,7 +93,14 @@ class StreamAPI : public PhoneAPI
+     /// Low level function to emit a protobuf encapsulated log record
+     void emitLogRecord(meshtastic_LogRecord_Level level, const char *src, const char *format, va_list arg);
+ 
++    /// Let transports reject a frame before a potentially blocking write.
++    virtual bool canWriteFrame(size_t frameLen) { return true; }
++    /// Let transports close a connection after an incomplete frame write.
++    virtual void onFrameWriteFailed(size_t frameLen, size_t writtenLen) {}
++
+   private:
++    bool writeFrame(uint8_t *buf, size_t len);
++
+     /// Dedicated scratch + tx buffer for LogRecord emission.
+     ///
+     /// The main packet emission path (`writeStream` -> `getFromRadio` ->
+@@ -113,4 +122,4 @@ class StreamAPI : public PhoneAPI
+     meshtastic_FromRadio fromRadioScratchLog = {};
+     uint8_t txBufLog[MAX_STREAM_BUF_SIZE] = {0};
+     concurrency::Lock streamLock;
+-};
+\ No newline at end of file
++};
+diff --git a/src/mesh/api/ServerAPI.cpp b/src/mesh/api/ServerAPI.cpp
+index f3e7854ca..b2e8e0d2e 100644
+--- a/src/mesh/api/ServerAPI.cpp
++++ b/src/mesh/api/ServerAPI.cpp
+@@ -28,6 +28,27 @@ template <typename T> bool ServerAPI<T>::checkIsConnected()
+     return client.connected();
+ }
+ 
++template <typename T> bool ServerAPI<T>::canWriteFrame(size_t)
++{
++    if (!client.connected()) {
++        canWrite = false;
++        enabled = false;
++        LOG_WARN("TCP client disconnected before write, closing API service");
++        close();
++        return false;
++    }
++    return true;
++}
++
++template <typename T> void ServerAPI<T>::onFrameWriteFailed(size_t frameLen, size_t writtenLen)
++{
++    canWrite = false;
++    enabled = false;
++    LOG_WARN("TCP client write short (%lu/%lu bytes), closing API service", (unsigned long)writtenLen,
++             (unsigned long)frameLen);
++    close();
++}
++
+ template <class T> int32_t ServerAPI<T>::runOnce()
+ {
+     if (client.connected()) {
+@@ -95,4 +116,4 @@ template <class T, class U> int32_t APIServerPort<T, U>::runOnce()
+     waitTime = 100;
+ #endif
+     return 100; // only check occasionally for incoming connections
+-}
+\ No newline at end of file
++}
+diff --git a/src/mesh/api/ServerAPI.h b/src/mesh/api/ServerAPI.h
+index 2da77c8e9..aad03b0bf 100644
+--- a/src/mesh/api/ServerAPI.h
++++ b/src/mesh/api/ServerAPI.h
+@@ -26,6 +26,9 @@ template <class T> class ServerAPI : public StreamAPI, private concurrency::OSTh
+     virtual bool checkIsConnected() override;
+ 
+   protected:
++    virtual bool canWriteFrame(size_t frameLen) override;
++    virtual void onFrameWriteFailed(size_t frameLen, size_t writtenLen) override;
++
+     /// We override this method to prevent publishing EVENT_SERIAL_CONNECTED/DISCONNECTED for wifi links (we want the board to
+     /// stay in the POWERED state to prevent disabling wifi)
+     virtual void onConnectionChanged(bool connected) override {}

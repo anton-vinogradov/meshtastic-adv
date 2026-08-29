@@ -154,13 +154,20 @@ class DemoMediaTests(unittest.TestCase):
             source = root / "private"
             source.mkdir()
             (source / "summary.json").write_text(
-                json.dumps({"dut": "Private DUT", "protected": "Protected Node", "node": "!abcdef12"})
+                json.dumps({
+                    "dut": "Private DUT",
+                    "protected": "Protected Node",
+                    "node": "!abcdef12",
+                    "production_wifi_validated": True,
+                    "config_dump_cycles": 42,
+                })
             )
             logs = source / "logs"
             logs.mkdir()
             (logs / "hil.log").write_text(
                 "Protected Node N1 S2 LAB7 at 192.168.99.77 via /dev/cu.usbmodem-test "
-                "AA:BB:CC:DD:EE:FF; Z9 standalone; embeddedN1name stays; prefixZ9suffix stays "
+                "AA:BB:CC:DD:EE:FF; Z9 standalone; P1 standalone; embeddedN1name stays; "
+                "prefixZ9suffix stays; embeddedP1name stays "
                 "/private/var/folders/39/stable-user-token/T/hil/release.bin\n"
             )
             frames = source / "visual" / "frames"
@@ -169,7 +176,18 @@ class DemoMediaTests(unittest.TestCase):
             (frames / "a01.rgb332").write_bytes(b"private framebuffer")
             fixture = root / "fixture.json"
             fixture.write_text(json.dumps({
-                "devices": {"dut": {"name": "Private DUT"}, "Protected Node": {}},
+                "devices": {
+                    "dut": {
+                        "name": "Private DUT",
+                        "production_wifi": {
+                            "host": "P1",
+                            "port": 4403,
+                            "expected_node_id": "!abcdef12",
+                            "min_nodes": 32,
+                        },
+                    },
+                    "Protected Node": {},
+                },
                 "protected_devices": [{"name": "LAB7"}, {"name": "Z9"}],
                 "wifi_peers": [{"name": "N1"}, {"name": "S2"}],
             }))
@@ -182,12 +200,16 @@ class DemoMediaTests(unittest.TestCase):
             self.assertNotIn(" S2 ", published)
             self.assertNotIn(" LAB7 ", published)
             self.assertNotIn(" Z9 standalone", published)
+            self.assertNotIn(" P1 standalone", published)
             self.assertIn("embeddedN1name stays", published)
             self.assertIn("prefixZ9suffix stays", published)
+            self.assertIn("embeddedP1name stays", published)
             self.assertNotIn("192.168.99.77", published)
             self.assertNotIn("usbmodem-test", published)
             self.assertNotIn("stable-user-token", published)
             self.assertIn("<temp-path>", published)
+            self.assertIn("production_wifi_validated", published)
+            self.assertIn("config_dump_cycles", published)
             self.assertFalse(any(path.suffix in {".png", ".rgb332"} for path in public.rglob("*")))
 
     def test_public_evidence_fails_on_symlink(self):

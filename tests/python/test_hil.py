@@ -6,6 +6,7 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 from unittest import mock
 
 
@@ -22,6 +23,46 @@ class HilRunnerTests(unittest.TestCase):
         with mock.patch.dict(hil.os.environ, {"GITHUB_ACTIONS": ""}):
             return hil.full_run(*args, **kwargs)
 
+    @staticmethod
+    def production_fixture() -> dict[str, object]:
+        return {
+            "schema": 2,
+            "devices": {
+                "dut": {
+                    "usb_serial": "AA:BB:CC:DD:EE:FF",
+                    "production_wifi": {
+                        "host": "192.0.2.20",
+                        "port": 4403,
+                        "expected_node_id": "!aabbccdd",
+                        "min_nodes": 32,
+                    },
+                }
+            },
+        }
+
+    @staticmethod
+    def phoneapi_interface(
+        *, node: int = 0xAABBCCDD, environment: str = hil.RELEASE_ENV,
+        has_wifi: bool = True, reported_nodes: int = 40, received_nodes: int = 40,
+        reboot_count: int = 7,
+    ) -> SimpleNamespace:
+        connected = mock.Mock()
+        connected.is_set.return_value = True
+        return SimpleNamespace(
+            isConnected=connected,
+            myInfo=SimpleNamespace(
+                my_node_num=node,
+                pio_env=environment,
+                nodedb_count=reported_nodes,
+                reboot_count=reboot_count,
+            ),
+            metadata=SimpleNamespace(hasWifi=has_wifi),
+            nodesByNum={index: {} for index in range(received_nodes)},
+            close=mock.Mock(),
+            sendText=mock.Mock(),
+            localNode=SimpleNamespace(writeConfig=mock.Mock(), writeChannel=mock.Mock()),
+        )
+
     def test_init_writes_identity_fixture_owner_only(self):
         with tempfile.TemporaryDirectory() as directory:
             output = Path(directory) / "fixture.json"
@@ -34,6 +75,23 @@ class HilRunnerTests(unittest.TestCase):
             ):
                 self.assertEqual(hil.main(), 0)
             self.assertEqual(stat.S_IMODE(output.stat().st_mode), 0o600)
+
+    def test_kick_device_holds_native_usb_open_and_discards_boot_logs(self):
+        device = {"usb_serial": "AA:BB:CC:DD:EE:FF", "port": "/dev/tty-test"}
+        handle = mock.Mock()
+        serial = SimpleNamespace(Serial=mock.Mock(return_value=handle))
+        with (
+            mock.patch.object(hil, "require_serial", return_value=(serial, None)),
+            mock.patch.object(hil, "wait_for_usb_serial", return_value=device),
+            mock.patch.object(hil.time, "monotonic", side_effect=[10.0, 10.5, 11.5, 12.5, 13.0]),
+        ):
+            self.assertEqual(hil.kick_device(device["usb_serial"]), device)
+
+        handle.open.assert_called_once_with()
+        self.assertEqual(handle.read.call_args_list, [mock.call(512), mock.call(512), mock.call(512)])
+        handle.close.assert_called_once_with()
+        self.assertEqual(handle.port, device["port"])
+        self.assertEqual(handle.timeout, 0.25)
 
     def test_hil_firmware_forces_all_live_packet_egress_off(self):
         variant = (ROOT / "overlay/variants/esp32s3/m5stack_cardputer_adv_advui/platformio.ini").read_text()
@@ -52,6 +110,101 @@ class HilRunnerTests(unittest.TestCase):
         healing = source.split("// Nameless-node healing.", 1)[1].split("// First-boot onboarding:", 1)[0]
         self.assertIn("#ifndef ADVUI_HIL", healing)
         self.assertIn("nodeInfoModule->sendOurNodeInfo", healing)
+
+    def test_phoneapi_prefetch_never_allocates_from_fragmented_heap(self):
+        sync = (ROOT / "scripts/sync-overlay.sh").read_text()
+        patch = (ROOT / "overlay/patches/phoneapi-fixed-node-prefetch.patch").read_text()
+
+        self.assertIn("phoneapi-fixed-node-prefetch.patch", sync)
+        self.assertEqual(sync.count("advui-inject-fixed-node-prefetch"), 3)
+        self.assertIn("if (nodeInfoForPhone.num == 0)", patch)
+        self.assertIn("nodeInfoForPhone = TypeConversions::ConvertToNodeInfo(nextNode)", patch)
+        self.assertIn("+        resetReadIndex();", patch)
+        added = "\n".join(line[1:] for line in patch.splitlines() if line.startswith("+") and not line.startswith("+++"))
+        own_node = added.split("readIndex shares the lifecycle lock", 1)[1].split("if (config_nonce", 1)[0]
+        self.assertLess(own_node.index("LockGuard guard"), own_node.index("readNextMeshNode(readIndex)"))
+        self.assertNotIn("+    std::array", patch)
+        self.assertNotIn("+    std::deque", patch)
+        self.assertNotIn("+    std::vector", patch)
+        self.assertNotIn("+    meshtastic_NodeInfo", patch)
+        self.assertNotIn("+        resetReadIndex();\n+        unobserve", patch)
+        self.assertNotIn("nodeInfoQueue", "\n".join(line for line in patch.splitlines() if line.startswith("+")))
+        self.assertNotIn("+    std::deque<meshtastic_NodeInfo>", patch)
+        self.assertNotIn("+            nodeInfoQueue.push_back", patch)
+        self.assertNotIn("+                nodeInfoQueue.pop_front", patch)
+        self.assertNotIn("onNowHasData(0)", added)
+
+    def test_phoneapi_other_config_memory_is_bounded(self):
+        sync = (ROOT / "scripts/sync-overlay.sh").read_text()
+        patch = (ROOT / "overlay/patches/phoneapi-bounded-memory.patch").read_text()
+        added = "\n".join(
+            line[1:] for line in patch.splitlines()
+            if line.startswith("+") and not line.startswith("+++")
+        )
+
+        self.assertIn("phoneapi-bounded-memory.patch", sync)
+        self.assertEqual(sync.count("advui-inject-bounded-phone-memory"), 2)
+        self.assertIn("releaseFilesManifest(filesManifest);", patch)
+        self.assertIn("filesManifestPrepared = false;", patch)
+        self.assertIn("if (!filesManifestPrepared", patch)
+        self.assertLess(
+            patch.index("case STATE_SEND_FILEMANIFEST"),
+            patch.rindex('filesManifest = getFiles("/"'),
+        )
+        self.assertIn("uint32_t lastPortNumToRadio[RATE_LIMIT_SLOT_COUNT]", patch)
+        self.assertIn("default:\n+        return nullptr;", patch)
+        self.assertIn("if (lastPortTimestamp)\n+        *lastPortTimestamp = millis();", patch)
+        self.assertNotIn("unordered_map", added)
+        self.assertNotIn("lastPortNumToRadio[p.decoded.portnum]", added)
+
+    def test_streamapi_retains_partial_frames_on_nonblocking_transports(self):
+        sync = (ROOT / "scripts/sync-overlay.sh").read_text()
+        patch = (ROOT / "overlay/patches/streamapi-bounded-writes.patch").read_text()
+        retained = (ROOT / "overlay/patches/streamapi-retained-nonblocking-writes.patch").read_text()
+
+        self.assertIn("streamapi-bounded-writes.patch", sync)
+        self.assertEqual(sync.count("advui-inject-bounded-stream-writes"), 2)
+        self.assertIn("streamapi-retained-nonblocking-writes.patch", sync)
+        self.assertIn("STREAM_WRITE_BUDGET_MSEC 100", patch)
+        self.assertIn("Throttle::isWithinTimespanMs(started, STREAM_WRITE_BUDGET_MSEC)", patch)
+        self.assertIn("if (len != 0 && !emitTxBuffer(len))", patch)
+        self.assertIn("if (writeStream())", patch)
+        self.assertIn("finishPendingFrame()", retained)
+        self.assertIn("pendingFrameOffset += written", retained)
+        self.assertIn("MSG_DONTWAIT", retained)
+        self.assertIn("#ifdef ARCH_ESP32", retained)
+        self.assertIn("HWCDC::isConnected()", retained)
+        self.assertIn("delegate.availableForWrite()", retained)
+        self.assertIn("frameWriter.reset()", retained)
+        self.assertIn("resetStreamInput()", retained)
+        self.assertIn("if (!canWrite)", retained)
+        self.assertIn("draining ? 50 : 1", retained)
+        self.assertNotIn("setTxTimeoutMs(0)", retained)
+        self.assertIn("Serial.setTxTimeoutMs(1)", sync)
+        self.assertNotIn("Serial.setTxTimeoutMs(0)", sync)
+        self.assertNotIn(
+            "Serial.setTxTimeoutMs(0)",
+            (ROOT / "overlay/src/advui/AdvUI.cpp").read_text(),
+        )
+        self.assertNotIn("advui-inject-txto", sync)
+
+    def test_nodedb_reserves_exact_capacity_before_decode(self):
+        sync = (ROOT / "scripts/sync-overlay.sh").read_text()
+        patch = (ROOT / "overlay/patches/nodedb-reserve-before-decode.patch").read_text()
+
+        self.assertIn("nodedb-reserve-before-decode.patch", sync)
+        self.assertEqual(sync.count("advui-inject-nodedb-reserve"), 2)
+        self.assertIn("+    nodeDatabase.nodes.clear();", patch)
+        self.assertIn("+    nodeDatabase.nodes.reserve(MAX_NUM_NODES);", patch)
+        self.assertLess(patch.index("nodes.reserve(MAX_NUM_NODES)"), patch.index("auto state = loadProto"))
+        self.assertIn("vec->size() < MAX_NUM_NODES", patch)
+        self.assertIn("if (!pb_decode(istream, meshtastic_NodeInfoLite_fields, &node))", patch)
+        self.assertIn("+                return false;", patch)
+        self.assertIn("state != LoadFileResult::LOAD_SUCCESS", patch)
+        added = "\n".join(line[1:] for line in patch.splitlines() if line.startswith("+") and not line.startswith("+++"))
+        default_db = added.split("Reuse an exact-capacity buffer", 1)[1].split("advui-inject-nodedb-reserve", 1)[0]
+        self.assertIn("nodeDatabase.nodes.resize(MAX_NUM_NODES)", default_db)
+        self.assertNotIn("std::vector<meshtastic_NodeInfoLite>(MAX_NUM_NODES)", default_db)
 
     def test_demo_network_frames_do_not_mutate_live_engine_config(self):
         source = (ROOT / "overlay/src/advui/AdvUI.cpp").read_text()
@@ -739,6 +892,116 @@ class HilRunnerTests(unittest.TestCase):
             with self.assertRaises(hil.HilError):
                 hil.load_fixture(path)
 
+    def test_fixture_validates_and_normalizes_production_wifi(self):
+        fixture = self.production_fixture()
+        fixture["devices"]["dut"]["production_wifi"]["expected_node_id"] = "!AABBCCDD"
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "fixture.json"
+            path.write_text(json.dumps(fixture))
+            loaded = hil.load_fixture(path)
+        self.assertEqual(
+            loaded["devices"]["dut"]["production_wifi"]["expected_node_id"],
+            "!aabbccdd",
+        )
+
+    def test_production_wifi_fixture_rejects_ambiguous_or_weak_values(self):
+        base = self.production_fixture()["devices"]["dut"]["production_wifi"]
+        cases = (
+            {**base, "host": "http://192.0.2.20"},
+            {**base, "port": True},
+            {**base, "expected_node_id": "aabbccdd"},
+            {**base, "min_nodes": 31},
+            {**base, "secret": "must-not-be-accepted"},
+        )
+        for config in cases:
+            with self.subTest(config=set(config)):
+                with self.assertRaises(hil.HilError):
+                    hil.validate_production_wifi_config(config)
+
+    def test_production_wifi_dump_validates_full_read_only_config_stream(self):
+        fixture = self.production_fixture()
+        config = fixture["devices"]["dut"]["production_wifi"]
+        interface = self.phoneapi_interface()
+
+        def open_interface(host, port, timeout):
+            self.assertEqual((host, port), ("192.0.2.20", 4403))
+            self.assertEqual(timeout, hil.PRODUCTION_WIFI_CONFIG_TIMEOUT_SECONDS)
+            return interface
+
+        snapshot = hil.production_wifi_dump(config, opener=open_interface)
+        self.assertEqual(snapshot, hil.ProductionWifiSnapshot(reboot_count=7, node_count=40))
+        interface.close.assert_called_once()
+        interface.sendText.assert_not_called()
+        interface.localNode.writeConfig.assert_not_called()
+        interface.localNode.writeChannel.assert_not_called()
+
+    def test_production_wifi_dump_fails_closed_on_identity_environment_wifi_or_nodedb(self):
+        config = self.production_fixture()["devices"]["dut"]["production_wifi"]
+        interfaces = (
+            self.phoneapi_interface(node=0x01020304),
+            self.phoneapi_interface(environment="wrong-environment"),
+            self.phoneapi_interface(has_wifi=False),
+            self.phoneapi_interface(reported_nodes=31),
+            self.phoneapi_interface(received_nodes=31),
+        )
+        for interface in interfaces:
+            with self.subTest(interface=interface):
+                with self.assertRaises(hil.HilError):
+                    hil.production_wifi_dump(config, opener=lambda *_args: interface)
+                interface.close.assert_called_once()
+
+    def test_production_wifi_soak_enforces_dump_count_duration_and_final_dump(self):
+        now = [0.0]
+
+        def sleep(seconds):
+            now[0] += seconds
+
+        snapshot = hil.ProductionWifiSnapshot(reboot_count=7, node_count=40)
+        with mock.patch.object(hil, "production_wifi_dump", return_value=snapshot) as dump:
+            evidence = hil.production_wifi_soak(
+                self.production_fixture(), monotonic=lambda: now[0], sleep=sleep
+            )
+
+        self.assertGreaterEqual(evidence["config_dump_cycles"], 10)
+        self.assertGreaterEqual(evidence["soak_seconds"], 120)
+        self.assertEqual(evidence["config_dump_cycles"], dump.call_count)
+        self.assertTrue(evidence["stable_reboot_counter"])
+        self.assertEqual(evidence["mesh_writes"], 0)
+        self.assertGreaterEqual(dump.call_count - 2, hil.PRODUCTION_WIFI_MIN_SOAK_DUMPS)
+
+    def test_production_wifi_soak_never_retries_a_post_baseline_failure(self):
+        now = [0.0]
+        snapshot = hil.ProductionWifiSnapshot(reboot_count=7, node_count=40)
+        with mock.patch.object(
+            hil,
+            "production_wifi_dump",
+            side_effect=[snapshot, hil.ProductionWifiConnectionError("connection lost")],
+        ) as dump:
+            with self.assertRaises(hil.ProductionWifiConnectionError):
+                hil.production_wifi_soak(
+                    self.production_fixture(),
+                    monotonic=lambda: now[0],
+                    sleep=lambda seconds: now.__setitem__(0, now[0] + seconds),
+                )
+        self.assertEqual(dump.call_count, 2)
+
+    def test_production_wifi_soak_detects_reboot_after_baseline(self):
+        now = [0.0]
+        with mock.patch.object(
+            hil,
+            "production_wifi_dump",
+            side_effect=[
+                hil.ProductionWifiSnapshot(reboot_count=7, node_count=40),
+                hil.ProductionWifiSnapshot(reboot_count=8, node_count=40),
+            ],
+        ):
+            with self.assertRaises(hil.UnexpectedReboot):
+                hil.production_wifi_soak(
+                    self.production_fixture(),
+                    monotonic=lambda: now[0],
+                    sleep=lambda seconds: now.__setitem__(0, now[0] + seconds),
+                )
+
     def test_full_run_attempts_restore_after_hil_flash_error(self):
         with tempfile.TemporaryDirectory() as directory:
             artifacts = Path(directory) / "artifacts"
@@ -865,6 +1128,120 @@ class HilRunnerTests(unittest.TestCase):
                     self.local_full_run({"schema": 1}, artifacts, timeout=1, skip_build=True)
 
         self.assertEqual(events[:4], ["backup", "marker", "hil", "production"])
+
+    def test_full_run_soaks_exact_production_before_final_config_fingerprint(self):
+        events = []
+        report = mock.Mock(failed=0)
+
+        def capture(_fixture, _temporary, label, preserve=None):
+            events.append(f"config-{label}")
+            return b"same"
+
+        def flash(_fixture, release=False, image_override=None):
+            events.append("production-flash" if release else "hil-flash")
+            return {"role": "dut"}
+
+        def soak(_fixture):
+            events.append("production-soak")
+            return {
+                "validated": True,
+                "config_dump_cycles": 10,
+                "soak_seconds": 135.0,
+                "stable_reboot_counter": True,
+            }
+
+        with tempfile.TemporaryDirectory() as directory:
+            artifacts = Path(directory) / "artifacts"
+            with (
+                mock.patch.object(hil, "validate_app_image", return_value=Path("/exact.bin")),
+                mock.patch.object(
+                    hil, "stage_release_image", return_value=(Path("/staged.bin"), "f" * 64)
+                ),
+                mock.patch.object(hil, "capture_config_fingerprint", side_effect=capture),
+                mock.patch.object(hil, "write_flash_marker"),
+                mock.patch.object(hil, "flash", side_effect=flash),
+                mock.patch.object(hil, "smoke", return_value=report),
+                mock.patch.object(hil, "message_flow", return_value=report),
+                mock.patch.object(hil, "visual", return_value=report),
+                mock.patch.object(hil, "production_wifi_soak", side_effect=soak),
+            ):
+                self.assertEqual(
+                    self.local_full_run(
+                        self.production_fixture(), artifacts, timeout=1, skip_build=True,
+                        release_image=Path("/exact.bin"), production_wifi=True,
+                    ),
+                    0,
+                )
+
+            summary = json.loads((artifacts / "summary.json").read_text())
+        self.assertLess(events.index("production-flash"), events.index("production-soak"))
+        self.assertLess(events.index("production-soak"), events.index("config-after"))
+        self.assertTrue(summary["production_wifi_validated"])
+        self.assertTrue(summary["configuration_preserved"])
+        self.assertNotIn("192.0.2.20", json.dumps(summary))
+        self.assertNotIn("!aabbccdd", json.dumps(summary))
+
+    def test_full_run_checks_config_and_recovery_path_after_production_soak_failure(self):
+        events = []
+        report = mock.Mock(failed=0)
+
+        def capture(_fixture, _temporary, label, preserve=None):
+            events.append(f"config-{label}")
+            return b"same"
+
+        def flash(_fixture, release=False, image_override=None):
+            events.append("production-flash" if release else "hil-flash")
+            return {"role": "dut"}
+
+        def fail_soak(_fixture):
+            events.append("production-soak")
+            raise hil.UnexpectedReboot("production rebooted")
+
+        with tempfile.TemporaryDirectory() as directory:
+            artifacts = Path(directory) / "artifacts"
+            with (
+                mock.patch.object(hil, "validate_app_image", return_value=Path("/exact.bin")),
+                mock.patch.object(
+                    hil, "stage_release_image", return_value=(Path("/staged.bin"), "0" * 64)
+                ),
+                mock.patch.object(hil, "capture_config_fingerprint", side_effect=capture),
+                mock.patch.object(hil, "write_flash_marker"),
+                mock.patch.object(hil, "flash", side_effect=flash),
+                mock.patch.object(hil, "smoke", return_value=report),
+                mock.patch.object(hil, "message_flow", return_value=report),
+                mock.patch.object(hil, "visual", return_value=report),
+                mock.patch.object(hil, "production_wifi_soak", side_effect=fail_soak),
+            ):
+                with self.assertRaises(hil.UnexpectedReboot):
+                    self.local_full_run(
+                        self.production_fixture(), artifacts, timeout=1, skip_build=True,
+                        release_image=Path("/exact.bin"), production_wifi=True,
+                    )
+
+            summary = json.loads((artifacts / "summary.json").read_text())
+        self.assertLess(events.index("production-soak"), events.index("config-after"))
+        self.assertTrue(summary["configuration_preserved"])
+        self.assertFalse(summary["production_wifi_validated"])
+        self.assertEqual(summary["production_wifi_failure_type"], "UnexpectedReboot")
+
+    def test_full_run_rejects_production_soak_without_exact_release_before_flash(self):
+        with mock.patch.object(hil, "flash") as flash:
+            with self.assertRaisesRegex(hil.HilError, "exact --release-image"):
+                self.local_full_run(
+                    self.production_fixture(), Path("/tmp/artifacts"), timeout=1,
+                    skip_build=True, production_wifi=True,
+                )
+        flash.assert_not_called()
+
+    def test_full_run_rejects_missing_production_wifi_fixture_before_flash(self):
+        fixture = {"schema": 2, "devices": {"dut": {"usb_serial": "AA:BB"}}}
+        with mock.patch.object(hil, "flash") as flash:
+            with self.assertRaisesRegex(hil.HilError, "production_wifi"):
+                self.local_full_run(
+                    fixture, Path("/tmp/artifacts"), timeout=1, skip_build=True,
+                    release_image=Path("/exact.bin"), production_wifi=True,
+                )
+        flash.assert_not_called()
 
     def test_external_release_image_requires_valid_esp_app(self):
         with tempfile.TemporaryDirectory() as directory:

@@ -5,7 +5,43 @@ release notes remain available on the [GitHub Releases page](https://github.com/
 
 ## [Unreleased]
 
-No user-visible changes are pending after 1.0.5.
+No user-visible changes are pending after 1.0.6.
+
+## [1.0.6] - 2026-08-29
+
+### Added
+
+- Stable release HIL now soaks the restored exact production image through at
+  least eight complete, read-only WiFi PhoneAPI config/NodeDB dumps over two
+  minutes. Identity, build environment, WiFi capability, node count and reboot
+  counter must remain exact; reconnects, writes and post-baseline retries are
+  forbidden.
+
+### Changed
+
+- PhoneAPI node prefetch now reuses one fixed record instead of growing a deque,
+  and NodeDB reserves its exact 150-record capacity before decode. File manifests
+  are built only after the node stream finishes, while per-port rate limiting
+  uses six fixed timestamp slots instead of an attacker-expandable hash map.
+- Full USB/TCP config streams are emitted in bounded cooperative slices. ESP32
+  WiFi uses zero-wait socket writes, and incomplete required frames are retained
+  until the transport accepts the exact remaining bytes.
+
+### Fixed
+
+- Large real-world NodeDB dumps no longer exhaust fragmented heap in
+  `PhoneAPI::prefetchNodeInfos()` or starve the loop watchdog under TCP
+  backpressure.
+- Native USB CDC short writes, temporary internal disconnect state and physical
+  session teardown can no longer silently truncate, duplicate or splice framed
+  Client API traffic. Partial input/output state is discarded only when the old
+  physical USB session has definitively ended. Dead-host logging uses the
+  framework's minimum safe timeout instead of triggering its zero-timeout retry
+  counter underflow when a terminal disconnects.
+- Corrupt, failed or forward-version NodeDB cache decodes now fail closed and
+  reuse the already allocated buffer instead of briefly doubling large node
+  storage. Persistent identity, channels and the intentional US/26 dBm radio
+  profile remain untouched.
 
 ## [1.0.5] - 2026-08-28
 
@@ -164,7 +200,8 @@ The 1.0 release line delivered the following product and release-engineering sco
   cannot reuse stale output, and prereleases cannot enter stable distribution
   channels.
 
-[Unreleased]: https://github.com/anton-vinogradov/meshtastic-adv/compare/v1.0.5...HEAD
+[Unreleased]: https://github.com/anton-vinogradov/meshtastic-adv/compare/v1.0.6...HEAD
+[1.0.6]: https://github.com/anton-vinogradov/meshtastic-adv/compare/v1.0.5...v1.0.6
 [1.0.5]: https://github.com/anton-vinogradov/meshtastic-adv/compare/v1.0.4...v1.0.5
 [1.0.4]: https://github.com/anton-vinogradov/meshtastic-adv/compare/v1.0.3...v1.0.4
 [1.0.3]: https://github.com/anton-vinogradov/meshtastic-adv/compare/v1.0.2...v1.0.3

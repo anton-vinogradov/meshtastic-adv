@@ -1,0 +1,806 @@
+diff --git a/src/SerialConsole.cpp b/src/SerialConsole.cpp
+index e2744f5ec..d182a7fbb 100644
+--- a/src/SerialConsole.cpp
++++ b/src/SerialConsole.cpp
+@@ -3,7 +3,9 @@
+ #include "NodeDB.h"
+ #include "PowerFSM.h"
+ #include "Throttle.h"
++#include "concurrency/LockGuard.h"
+ #include "configuration.h"
++#include "main.h"
+ #include "time.h"
+ 
+ #if defined(ARDUINO_USB_CDC_ON_BOOT) && ARDUINO_USB_CDC_ON_BOOT
+@@ -50,7 +52,11 @@ void consolePrintf(const char *format, ...)
+     console->flush();
+ }
+ 
+-SerialConsole::SerialConsole() : StreamAPI(&Port), RedirectablePrint(&Port), concurrency::OSThread("SerialConsole")
++SerialConsole::SerialConsole()
++    : StreamAPI(&Port), RedirectablePrint(&Port), concurrency::OSThread("SerialConsole")
++#ifdef IS_USB_SERIAL
++      , usbFrameStream(Port)
++#endif
+ {
+     api_type = TYPE_SERIAL;
+     assert(!console);
+@@ -62,6 +68,9 @@ SerialConsole::SerialConsole() : StreamAPI(&Port), RedirectablePrint(&Port), con
+     Port.setRX(SERIAL2_RX);
+ #endif
+     Port.begin(SERIAL_BAUD);
++#ifdef IS_USB_SERIAL
++    usbWasPlugged = HWCDC::isPlugged();
++#endif
+ #if defined(ARCH_NRF52) || defined(CONFIG_IDF_TARGET_ESP32S2) || defined(CONFIG_IDF_TARGET_ESP32S3) || defined(ARCH_RP2040) ||   \
+     defined(CONFIG_IDF_TARGET_ESP32C3) || defined(CONFIG_IDF_TARGET_ESP32C6)
+     time_t timeout = millis();
+@@ -91,10 +100,34 @@ int32_t SerialConsole::runOnce()
+     }
+ #endif
+ 
++#ifdef IS_USB_SERIAL
++    const bool usbPlugged = HWCDC::isPlugged();
++    if (usbPlugged) {
++        usbWasPlugged = true;
++        usbDisconnectPending = false;
++    } else if (usbWasPlugged) {
++        // isPlugged() is SOF-watchdog based and can briefly flap on a healthy
++        // link. Require a sustained loss before discarding the session.
++        if (!usbDisconnectPending) {
++            usbDisconnectPending = true;
++            usbDisconnectStartedMsec = millis();
++        } else if (!Throttle::isWithinTimespanMs(usbDisconnectStartedMsec, 500)) {
++            close();
++            usbWasPlugged = false;
++            usbDisconnectPending = false;
++        }
++    }
++    if (!checkIsConnected())
++        setHostDraining(false);
++#endif
+     int32_t delay = runOncePart();
+ #if defined(SERIAL_HAS_ON_RECEIVE) || defined(CONFIG_IDF_TARGET_ESP32S2)
++    if (hasRetainedFrame())
++        return delay < 25 ? delay : 25;
+     return Port.available() ? delay : INT32_MAX;
+ #elif defined(IS_USB_SERIAL)
++    if (usbDisconnectPending)
++        return delay < 25 ? delay : 25;
+     return HWCDC::isPlugged() ? delay : (1000 * 20);
+ #else
+     return delay;
+@@ -103,9 +136,25 @@ int32_t SerialConsole::runOnce()
+ 
+ void SerialConsole::flush()
+ {
++    // HWCDC::flush() can discard queued bytes when the host stops draining.
++    // Framed output is completed by StreamFrameWriter instead.
++    if (usingProtobufs)
++        return;
++
+     Port.flush();
+ }
+ 
++size_t SerialConsole::write(uint8_t c)
++{
++    // Unframed bytes after protobuf activation corrupt the API stream.
++    if (usingProtobufs)
++        return 1;
++
++    if (c == '\n')
++        RedirectablePrint::write('\r');
++    return RedirectablePrint::write(c);
++}
++
+ // trigger tx of serial data
+ void SerialConsole::onNowHasData(uint32_t fromRadioNum)
+ {
+@@ -124,6 +173,107 @@ bool SerialConsole::checkIsConnected()
+     return Throttle::isWithinTimespanMs(lastContactMsec, SERIAL_CONNECTION_TIMEOUT);
+ }
+ 
++void SerialConsole::setHostDraining(bool draining)
++{
++#ifdef IS_USB_SERIAL
++    // Arduino-ESP32 2.0.17 underflows HWCDC's retry counter at exactly zero.
++    // One millisecond is the minimum safe dead-host bound; while an API host
++    // is alive, retained frames get a still-bounded opportunity to drain.
++    Port.setTxTimeoutMs(draining ? 50 : 1);
++#else
++    (void)draining;
++#endif
++}
++
++void SerialConsole::onConnectionChanged(bool connected)
++{
++    if (!connected) {
++        setHostDraining(false);
++        // Keep any disconnect-side logs inside the old framed session, then
++        // discard every byte and pointer belonging to that session.
++        StreamAPI::onConnectionChanged(false);
++#ifdef IS_USB_SERIAL
++        // A retained tail belongs to the old physical session. Clear both its
++        // metadata and HWCDC's queued prefix before a new wantConfig can start.
++        // Disable framed writes under the same lock first: a concurrent LOG_
++        // that passed its optimistic admission check must not enqueue stale
++        // bytes between reset() and flush().
++        {
++            concurrency::LockGuard guard(&streamLock);
++            canWrite = false;
++            frameWriter.reset();
++            Port.setTxTimeoutMs(50);
++            Port.flush();
++            Port.setTxTimeoutMs(1);
++
++            resetStreamInput();
++            if (!HWCDC::isPlugged()) {
++                int unread = Port.available();
++                while (unread-- > 0)
++                    Port.read();
++            }
++            usingProtobufs = false;
++        }
++#else
++        canWrite = false;
++        resetStreamInput();
++        usingProtobufs = false;
++#endif
++        return;
++    }
++
++    StreamAPI::onConnectionChanged(true);
++    setHostDraining(true);
++}
++
++bool SerialConsole::finishPendingFrame()
++{
++#ifdef IS_USB_SERIAL
++    concurrency::LockGuard guard(&streamLock);
++    return frameWriter.finishPendingFrame(usbFrameStream);
++#else
++    return true;
++#endif
++}
++
++bool SerialConsole::hasRetainedFrame()
++{
++#ifdef IS_USB_SERIAL
++    concurrency::LockGuard guard(&streamLock);
++    return !frameWriter.isIdle();
++#else
++    return false;
++#endif
++}
++
++bool SerialConsole::canEncodeLogRecord()
++{
++#ifdef IS_USB_SERIAL
++    concurrency::LockGuard guard(&streamLock);
++    return frameWriter.isIdle();
++#else
++    return true;
++#endif
++}
++
++bool SerialConsole::writeFrame(uint8_t *buf, size_t len, bool bestEffort)
++{
++#ifdef IS_USB_SERIAL
++    if (len == 0)
++        return false;
++
++    const size_t totalLen = buildFrameHeader(buf, len);
++    concurrency::LockGuard guard(&streamLock);
++    // Re-check under the teardown lock. The connection may have closed after
++    // the caller's admission check but before this writer acquired the lock.
++    if (!canWrite)
++        return false;
++    return frameWriter.writeFrame(usbFrameStream, buf, totalLen, bestEffort);
++#else
++    return StreamAPI::writeFrame(buf, len, bestEffort);
++#endif
++}
++
+ /**
+  * we override this to notice when we've received a protobuf over the serial
+  * stream.  Then we shut off debug serial output.
+@@ -132,6 +282,7 @@ bool SerialConsole::handleToRadio(const uint8_t *buf, size_t len)
+ {
+     // only talk to the API once the configuration has been loaded and we're sure the serial port is not disabled.
+     if (config.has_lora && config.security.serial_enabled) {
++        setHostDraining(true);
+         // Switch to protobufs for log messages
+         usingProtobufs = true;
+         canWrite = true;
+@@ -144,10 +295,14 @@ bool SerialConsole::handleToRadio(const uint8_t *buf, size_t len)
+ 
+ void SerialConsole::log_to_serial(const char *logLevel, const char *format, va_list arg)
+ {
+-    if (usingProtobufs && config.security.debug_log_api_enabled) {
+-        meshtastic_LogRecord_Level ll = RedirectablePrint::getLogLevel(logLevel);
+-        auto thread = concurrency::OSThread::currentThread;
+-        emitLogRecord(ll, thread ? thread->ThreadName.c_str() : "", format, arg);
+-    } else
+-        RedirectablePrint::log_to_serial(logLevel, format, arg);
+-}
+\ No newline at end of file
++    if (usingProtobufs) {
++        if (config.security.debug_log_api_enabled && !pauseBluetoothLogging) {
++            meshtastic_LogRecord_Level ll = RedirectablePrint::getLogLevel(logLevel);
++            auto thread = concurrency::OSThread::currentThread;
++            emitLogRecord(ll, thread ? thread->ThreadName.c_str() : "", format, arg);
++        }
++        return;
++    }
++
++    RedirectablePrint::log_to_serial(logLevel, format, arg);
++}
+diff --git a/src/SerialConsole.h b/src/SerialConsole.h
+index 98577e4bc..f06a65ba8 100644
+--- a/src/SerialConsole.h
++++ b/src/SerialConsole.h
+@@ -2,6 +2,12 @@
+ 
+ #include "RedirectablePrint.h"
+ #include "StreamAPI.h"
++#include "mesh/StreamFrameWriter.h"
++
++#if defined(ARDUINO_USB_CDC_ON_BOOT) && ARDUINO_USB_CDC_ON_BOOT
++#include "HWCDC.h"
++#include "mesh/UsbSessionStream.h"
++#endif
+ /**
+  * Provides both debug printing and, if the client starts sending protobufs to us, switches to send/receive protobufs
+  * (and starts dropping debug printing - FIXME, eventually those prints should be encapsulated in protobufs).
+@@ -22,12 +28,7 @@ class SerialConsole : public StreamAPI, public RedirectablePrint, private concur
+      */
+     virtual bool handleToRadio(const uint8_t *buf, size_t len) override;
+ 
+-    virtual size_t write(uint8_t c) override
+-    {
+-        if (c == '\n') // prefix any newlines with carriage return
+-            RedirectablePrint::write('\r');
+-        return RedirectablePrint::write(c);
+-    }
++    virtual size_t write(uint8_t c) override;
+ 
+     virtual int32_t runOnce() override;
+ 
+@@ -40,12 +41,30 @@ class SerialConsole : public StreamAPI, public RedirectablePrint, private concur
+ 
+     virtual void onNowHasData(uint32_t fromRadioNum) override;
+ 
++    virtual void onConnectionChanged(bool connected) override;
++
+     /// Possibly switch to protobufs if we see a valid protobuf message
+     virtual void log_to_serial(const char *logLevel, const char *format, va_list arg);
++
++    virtual bool finishPendingFrame() override;
++    virtual bool hasRetainedFrame() override;
++    virtual bool canEncodeLogRecord() override;
++    virtual bool writeFrame(uint8_t *buf, size_t len, bool bestEffort) override;
++
++  private:
++    void setHostDraining(bool draining);
++
++#if defined(ARDUINO_USB_CDC_ON_BOOT) && ARDUINO_USB_CDC_ON_BOOT
++    UsbSessionStream usbFrameStream;
++    StreamFrameWriter frameWriter;
++    bool usbWasPlugged = false;
++    bool usbDisconnectPending = false;
++    uint32_t usbDisconnectStartedMsec = 0;
++#endif
+ };
+ 
+ // A simple wrapper to allow non class aware code write to the console
+ void consolePrintf(const char *format, ...);
+ void consoleInit();
+ 
+-extern SerialConsole *console;
+\ No newline at end of file
++extern SerialConsole *console;
+diff --git a/src/mesh/StreamAPI.cpp b/src/mesh/StreamAPI.cpp
+index 2d1b3e3a3..9be8c44f1 100644
+--- a/src/mesh/StreamAPI.cpp
++++ b/src/mesh/StreamAPI.cpp
+@@ -52,6 +52,11 @@ bool StreamAPI::writeStream()
+     if (!canWrite)
+         return false;
+ 
++    // A retained short frame must complete before getFromRadio() advances the
++    // PhoneAPI state or releases a queued packet.
++    if (!finishPendingFrame())
++        return false;
++
+     uint32_t len;
+     uint32_t started = millis();
+     do {
+@@ -172,20 +177,30 @@ int32_t StreamAPI::readStream()
+     }
+ }
+ 
+-/**
+- * Send the current txBuffer over our stream
+- */
+-bool StreamAPI::writeFrame(uint8_t *buf, size_t len)
++size_t StreamAPI::buildFrameHeader(uint8_t *buf, size_t payloadLen)
+ {
+-    if (len == 0 || !canWrite)
+-        return false;
+-
+     buf[0] = START1;
+     buf[1] = START2;
+-    buf[2] = (len >> 8) & 0xff;
+-    buf[3] = len & 0xff;
++    buf[2] = (payloadLen >> 8) & 0xff;
++    buf[3] = payloadLen & 0xff;
++    return payloadLen + HEADER_LEN;
++}
+ 
+-    auto totalLen = len + HEADER_LEN;
++void StreamAPI::resetStreamInput()
++{
++    rxPtr = 0;
++    lastRxMsec = 0;
++    memset(rxBuf, 0, sizeof(rxBuf));
++}
++
++/** Send one framed payload using the transport's failure semantics. */
++bool StreamAPI::writeFrame(uint8_t *buf, size_t len, bool bestEffort)
++{
++    (void)bestEffort;
++    if (len == 0 || !canWrite)
++        return false;
++
++    const size_t totalLen = buildFrameHeader(buf, len);
+     concurrency::LockGuard guard(&streamLock);
+     if (!canWriteFrame(totalLen))
+         return false;
+@@ -202,7 +217,7 @@ bool StreamAPI::writeFrame(uint8_t *buf, size_t len)
+ 
+ bool StreamAPI::emitTxBuffer(size_t len)
+ {
+-    return writeFrame(txBuf, len);
++    return writeFrame(txBuf, len, false);
+ }
+ 
+ void StreamAPI::emitRebooted()
+@@ -218,6 +233,10 @@ void StreamAPI::emitRebooted()
+ 
+ void StreamAPI::emitLogRecord(meshtastic_LogRecord_Level level, const char *src, const char *format, va_list arg)
+ {
++    // A retained short log frame still points into txBufLog, so do not overwrite it.
++    if (!canEncodeLogRecord())
++        return;
++
+     // IMPORTANT: do NOT touch `fromRadioScratch` or `txBuf` here — those
+     // belong to the main packet-emission path and a LOG_ firing during
+     // `writeStream()` would corrupt an in-flight encode. We keep a
+@@ -240,7 +259,7 @@ void StreamAPI::emitLogRecord(meshtastic_LogRecord_Level level, const char *src,
+ 
+     size_t len =
+         pb_encode_to_bytes(txBufLog + HEADER_LEN, meshtastic_FromRadio_size, &meshtastic_FromRadio_msg, &fromRadioScratchLog);
+-    writeFrame(txBufLog, len);
++    writeFrame(txBufLog, len, true);
+ }
+ 
+ /// Hookable to find out when connection changes
+diff --git a/src/mesh/StreamAPI.h b/src/mesh/StreamAPI.h
+index 68d08718b..c46921184 100644
+--- a/src/mesh/StreamAPI.h
++++ b/src/mesh/StreamAPI.h
+@@ -10,8 +10,9 @@
+ #define MAX_STREAM_BUF_SIZE (MAX_TO_FROM_RADIO_SIZE + sizeof(uint32_t))
+ 
+ // advui-inject-bounded-stream-writes: a full config dump can contain hundreds
+-// of frames. Bound one cooperative
+-// dispatch so loop() keeps feeding the watchdog between output slices.
++// of frames. Bound one cooperative dispatch so loop() keeps feeding the
++// watchdog between output slices. Transports must also make each individual
++// write bounded (WiFiServerAPI uses non-blocking socket writes).
+ #define STREAM_WRITE_BUDGET_MSEC 100
+ 
+ /**
+@@ -94,13 +95,29 @@ class StreamAPI : public PhoneAPI
+     /// Low level function to emit a protobuf encapsulated log record
+     void emitLogRecord(meshtastic_LogRecord_Level level, const char *src, const char *format, va_list arg);
+ 
+-    /// Let transports reject a frame before a potentially blocking write.
++    /// Return whether the transport can accept a frame of the requested size.
+     virtual bool canWriteFrame(size_t frameLen) { return true; }
+-    /// Let transports close a connection after an incomplete frame write.
++    /// Let transports recover from or close after an incomplete write.
+     virtual void onFrameWriteFailed(size_t frameLen, size_t writtenLen) {}
+ 
++    /// Fill in the 4-byte 0x94C3 length header; returns the total frame length.
++    static size_t buildFrameHeader(uint8_t *buf, size_t payloadLen);
++
++    /// Complete retained transport output before dequeuing another PhoneAPI packet.
++    virtual bool finishPendingFrame() { return true; }
++    /// Return whether the transport retains an incomplete frame awaiting TX space.
++    virtual bool hasRetainedFrame() { return false; }
++    /// Return whether the dedicated log buffer is available for encoding.
++    virtual bool canEncodeLogRecord() { return true; }
++    /// Frame and write a payload, optionally using best-effort admission.
++    virtual bool writeFrame(uint8_t *buf, size_t len, bool bestEffort);
++
++    /// Discard a partial inbound frame when the physical transport session ends.
++    void resetStreamInput();
++
++    concurrency::Lock streamLock;
++
+   private:
+-    bool writeFrame(uint8_t *buf, size_t len);
+ 
+     /// Dedicated scratch + tx buffer for LogRecord emission.
+     ///
+@@ -122,5 +139,4 @@ class StreamAPI : public PhoneAPI
+     /// interleave on the wire.
+     meshtastic_FromRadio fromRadioScratchLog = {};
+     uint8_t txBufLog[MAX_STREAM_BUF_SIZE] = {0};
+-    concurrency::Lock streamLock;
+ };
+diff --git a/src/mesh/StreamFrameWriter.cpp b/src/mesh/StreamFrameWriter.cpp
+new file mode 100644
+index 000000000..0a4a50b0d
+--- /dev/null
++++ b/src/mesh/StreamFrameWriter.cpp
+@@ -0,0 +1,72 @@
++#include "StreamFrameWriter.h"
++
++#include <cassert>
++
++bool StreamFrameWriter::writeFrame(Stream &stream, uint8_t *frame, size_t frameLen, bool bestEffort)
++{
++    if (!finishPendingFrame(stream)) {
++        // writeStream() gates the single required-frame producer on
++        // finishPendingFrame(), so a second required frame cannot arrive here.
++        assert(bestEffort || !deferredFrame);
++
++        if (!bestEffort && !deferredFrame) {
++            deferredFrame = frame;
++            deferredFrameLen = frameLen;
++        }
++        return false;
++    }
++
++    // Never start best-effort output unless the transport is writable now.
++    if (bestEffort && stream.availableForWrite() < (int)frameLen)
++        return false;
++
++    size_t written = stream.write(frame, frameLen);
++    if (written > frameLen)
++        written = frameLen;
++    if (written == frameLen)
++        return true;
++
++    pendingFrame = frame;
++    pendingFrameLen = frameLen;
++    pendingFrameOffset = written;
++    return false;
++}
++
++bool StreamFrameWriter::finishPendingFrame(Stream &stream)
++{
++    if (!pendingFrame)
++        return true;
++
++    size_t remaining = pendingFrameLen - pendingFrameOffset;
++    size_t written = stream.write(pendingFrame + pendingFrameOffset, remaining);
++    if (written > remaining)
++        written = remaining;
++    pendingFrameOffset += written;
++
++    if (pendingFrameOffset < pendingFrameLen)
++        return false;
++
++    pendingFrame = nullptr;
++    pendingFrameLen = 0;
++    pendingFrameOffset = 0;
++
++    // Promote required output without starting another write in this call.
++    if (deferredFrame) {
++        pendingFrame = deferredFrame;
++        pendingFrameLen = deferredFrameLen;
++        deferredFrame = nullptr;
++        deferredFrameLen = 0;
++        return false;
++    }
++
++    return true;
++}
++
++void StreamFrameWriter::reset()
++{
++    pendingFrame = nullptr;
++    pendingFrameLen = 0;
++    pendingFrameOffset = 0;
++    deferredFrame = nullptr;
++    deferredFrameLen = 0;
++}
+diff --git a/src/mesh/StreamFrameWriter.h b/src/mesh/StreamFrameWriter.h
+new file mode 100644
+index 000000000..59f586c0a
+--- /dev/null
++++ b/src/mesh/StreamFrameWriter.h
+@@ -0,0 +1,29 @@
++#pragma once
++
++#include "Stream.h"
++#include <cstddef>
++#include <cstdint>
++
++/** Caller-owned frame storage must remain valid and unchanged until isIdle(). */
++class StreamFrameWriter
++{
++  public:
++    /// Start a complete frame, or retain a required frame behind pending output.
++    bool writeFrame(Stream &stream, uint8_t *frame, size_t frameLen, bool bestEffort);
++
++    /// Make one bounded attempt to finish pending output.
++    bool finishPendingFrame(Stream &stream);
++
++    /// Return true when no frame buffer is retained.
++    bool isIdle() const { return pendingFrame == nullptr && deferredFrame == nullptr; }
++
++    /// Forget retained bytes when their physical transport session is gone.
++    void reset();
++
++  private:
++    uint8_t *pendingFrame = nullptr;
++    size_t pendingFrameLen = 0;
++    size_t pendingFrameOffset = 0;
++    uint8_t *deferredFrame = nullptr;
++    size_t deferredFrameLen = 0;
++};
+diff --git a/src/mesh/UsbSessionStream.h b/src/mesh/UsbSessionStream.h
+new file mode 100644
+index 000000000..c360c60f0
+--- /dev/null
++++ b/src/mesh/UsbSessionStream.h
+@@ -0,0 +1,45 @@
++#pragma once
++
++#include "HWCDC.h"
++#include "Stream.h"
++
++/** Prevent stock HWCDC's disconnected FIFO policy from accepting/dropping a
++ * frame while the cable is absent or its internal CDC state is recovering
++ * from backpressure. */
++class UsbSessionStream : public Stream
++{
++  public:
++    explicit UsbSessionStream(Stream &_delegate) : delegate(_delegate) {}
++
++    int available() override { return delegate.available(); }
++    int read() override { return delegate.read(); }
++    int peek() override { return delegate.peek(); }
++    void flush() override { delegate.flush(); }
++    size_t write(uint8_t value) override { return write(&value, 1); }
++    size_t write(const uint8_t *buffer, size_t size) override
++    {
++        // Stock Arduino-ESP32 HWCDC::write() reports the full size while its
++        // internal `connected` flag is false, even though it drops the bytes.
++        // isConnected() also arms the IN_EMPTY interrupt so a draining host
++        // can recover that flag; retain the frame until it does.
++        if (!canTransmit())
++            return 0;
++
++        // Never ask stock HWCDC to wait for more ring space. Its timeout path
++        // can mark CDC disconnected after enqueuing a prefix and then report a
++        // short write with destructive FIFO semantics. Limiting the call to
++        // the space already available makes that internal tail path
++        // unreachable; StreamFrameWriter retains our remaining bytes instead.
++        const int available = delegate.availableForWrite();
++        if (available <= 0)
++            return 0;
++        const size_t chunk = size < static_cast<size_t>(available) ? size : static_cast<size_t>(available);
++        return delegate.write(buffer, chunk);
++    }
++    int availableForWrite() override { return canTransmit() ? delegate.availableForWrite() : 0; }
++
++  private:
++    static bool canTransmit() { return HWCDC::isPlugged() && HWCDC::isConnected(); }
++
++    Stream &delegate;
++};
+diff --git a/src/mesh/api/ServerAPI.h b/src/mesh/api/ServerAPI.h
+index aad03b0bf..fc53780b0 100644
+--- a/src/mesh/api/ServerAPI.h
++++ b/src/mesh/api/ServerAPI.h
+@@ -11,7 +11,7 @@
+  */
+ template <class T> class ServerAPI : public StreamAPI, private concurrency::OSThread
+ {
+-  private:
++  protected:
+     T client;
+ 
+   public:
+diff --git a/src/mesh/api/WiFiServerAPI.cpp b/src/mesh/api/WiFiServerAPI.cpp
+index 4d729f5c7..66fa045c7 100644
+--- a/src/mesh/api/WiFiServerAPI.cpp
++++ b/src/mesh/api/WiFiServerAPI.cpp
+@@ -3,6 +3,14 @@
+ 
+ #if HAS_WIFI
+ #include "WiFiServerAPI.h"
++#ifdef ARCH_ESP32
++#include "concurrency/LockGuard.h"
++
++#include <cerrno>
++#include <climits>
++#include <sys/select.h>
++#include <sys/socket.h>
++#endif
+ 
+ static WiFiServerPort *apiPort;
+ 
+@@ -23,11 +31,94 @@ void deInitApiServer()
+     }
+ }
+ 
++#ifdef ARCH_ESP32
++size_t NonBlockingWiFiStream::write(const uint8_t *buffer, size_t size)
++{
++    if (fatalWrite || !client.connected() || client.fd() < 0) {
++        fatalWrite = true;
++        return 0;
++    }
++
++    const int result = ::send(client.fd(), buffer, size, MSG_DONTWAIT);
++    if (result > 0)
++        return static_cast<size_t>(result);
++    if (result < 0 && (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR))
++        return 0;
++
++    fatalWrite = true;
++    return 0;
++}
++
++int NonBlockingWiFiStream::availableForWrite()
++{
++    if (fatalWrite || !client.connected() || client.fd() < 0)
++        return 0;
++
++    fd_set writeSet;
++    FD_ZERO(&writeSet);
++    FD_SET(client.fd(), &writeSet);
++    timeval timeout = {0, 0};
++    const int result = select(client.fd() + 1, nullptr, &writeSet, nullptr, &timeout);
++    if (result > 0 && FD_ISSET(client.fd(), &writeSet))
++        return INT_MAX;
++    if (result < 0 && errno != EINTR)
++        fatalWrite = true;
++    return 0;
++}
++
++WiFiServerAPI::WiFiServerAPI(WiFiClient &_client) : ServerAPI(_client), nonBlockingStream(client)
++{
++    api_type = TYPE_WIFI;
++    LOG_INFO("Incoming wifi connection");
++}
++
++bool WiFiServerAPI::handleFatalWrite()
++{
++    if (!nonBlockingStream.failed())
++        return false;
++
++    canWrite = false;
++    LOG_WARN("TCP socket write failed, closing API service");
++    ServerAPI<WiFiClient>::close();
++    return true;
++}
++
++bool WiFiServerAPI::finishPendingFrame()
++{
++    concurrency::LockGuard guard(&streamLock);
++    const bool complete = frameWriter.finishPendingFrame(nonBlockingStream);
++    return handleFatalWrite() ? false : complete;
++}
++
++bool WiFiServerAPI::hasRetainedFrame()
++{
++    concurrency::LockGuard guard(&streamLock);
++    return !frameWriter.isIdle();
++}
++
++bool WiFiServerAPI::canEncodeLogRecord()
++{
++    concurrency::LockGuard guard(&streamLock);
++    return frameWriter.isIdle();
++}
++
++bool WiFiServerAPI::writeFrame(uint8_t *buf, size_t len, bool bestEffort)
++{
++    if (len == 0 || !canWrite)
++        return false;
++
++    const size_t totalLen = buildFrameHeader(buf, len);
++    concurrency::LockGuard guard(&streamLock);
++    const bool complete = frameWriter.writeFrame(nonBlockingStream, buf, totalLen, bestEffort);
++    return handleFatalWrite() ? false : complete;
++}
++#else
+ WiFiServerAPI::WiFiServerAPI(WiFiClient &_client) : ServerAPI(_client)
+ {
+     api_type = TYPE_WIFI;
+     LOG_INFO("Incoming wifi connection");
+ }
++#endif
+ 
+ WiFiServerPort::WiFiServerPort(int port) : APIServerPort(port) {}
+-#endif
+\ No newline at end of file
++#endif
+diff --git a/src/mesh/api/WiFiServerAPI.h b/src/mesh/api/WiFiServerAPI.h
+index 5f2019983..0a7b12798 100644
+--- a/src/mesh/api/WiFiServerAPI.h
++++ b/src/mesh/api/WiFiServerAPI.h
+@@ -1,6 +1,7 @@
+ #pragma once
+ 
+ #include "ServerAPI.h"
++#include "mesh/StreamFrameWriter.h"
+ #include <WiFi.h>
+ 
+ #if HAS_ETHERNET && defined(USE_WS5500)
+@@ -8,6 +9,30 @@
+ #define ETH ETH2
+ #endif // HAS_ETHERNET
+ 
++#ifdef ARCH_ESP32
++/** A zero-wait socket writer used only for outbound PhoneAPI frames.
++ * ESP32's WiFiClient exposes its lwIP descriptor; other WiFi platforms do not. */
++class NonBlockingWiFiStream : public Stream
++{
++  public:
++    explicit NonBlockingWiFiStream(WiFiClient &_client) : client(_client) {}
++
++    int available() override { return client.available(); }
++    int read() override { return client.read(); }
++    int peek() override { return client.peek(); }
++    void flush() override {}
++    size_t write(uint8_t value) override { return write(&value, 1); }
++    size_t write(const uint8_t *buffer, size_t size) override;
++    int availableForWrite() override;
++
++    bool failed() const { return fatalWrite; }
++
++  private:
++    WiFiClient &client;
++    bool fatalWrite = false;
++};
++#endif
++
+ /**
+  * Provides both debug printing and, if the client starts sending protobufs to us, switches to send/receive protobufs
+  * (and starts dropping debug printing - FIXME, eventually those prints should be encapsulated in protobufs).
+@@ -16,6 +41,20 @@ class WiFiServerAPI : public ServerAPI<WiFiClient>
+ {
+   public:
+     explicit WiFiServerAPI(WiFiClient &_client);
++
++#ifdef ARCH_ESP32
++  protected:
++    bool finishPendingFrame() override;
++    bool hasRetainedFrame() override;
++    bool canEncodeLogRecord() override;
++    bool writeFrame(uint8_t *buf, size_t len, bool bestEffort) override;
++
++  private:
++    bool handleFatalWrite();
++
++    NonBlockingWiFiStream nonBlockingStream;
++    StreamFrameWriter frameWriter;
++#endif
+ };
+ 
+ /**
+@@ -28,4 +67,4 @@ class WiFiServerPort : public APIServerPort<WiFiServerAPI, WiFiServer>
+ };
+ 
+ void initApiServer(int port = SERVER_API_DEFAULT_PORT);
+-void deInitApiServer();
+\ No newline at end of file
++void deInitApiServer();

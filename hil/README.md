@@ -35,6 +35,12 @@ opened. Network fixtures live in `wifi_peers`; `read-only` is the default policy
 and future RF traffic/configuration suites must additionally require `access:
 "test"` for every participating endpoint.
 
+The restored production image has a separate, release-only
+`devices.dut.production_wifi` endpoint. It is the WiFi address of the same
+USB-identity-bound Cardputer, not another mesh node. The private fixture pins
+its expected node ID and a realistic minimum NodeDB population so the release
+gate cannot accidentally soak a nearby node or a trivially small database.
+
 Flashing deliberately does **not** use PlatformIO's `upload` target. The hybrid
 Arduino/ESP-IDF builder starts a child PlatformIO process that can drop the
 explicit upload port and fall back to auto-detection. The HIL runner instead
@@ -66,6 +72,22 @@ the generator restricts the local file to its owner (`0600`). Merely
 listing a WiFi endpoint does not authorize transmissions or configuration
 changes: `init` records every endpoint as `read-only`.
 
+For an exact-release production soak, add this object below `devices.dut` in
+the private fixture (never commit the real values):
+
+```json
+"production_wifi": {
+  "host": "192.0.2.20",
+  "port": 4403,
+  "expected_node_id": "!aabbccdd",
+  "min_nodes": 32
+}
+```
+
+`min_nodes` must be in `32..250`; choose the normal production population, not
+the smallest accepted value. The endpoint is used only after the exact
+production app has been restored.
+
 ## Run
 
 ```sh
@@ -85,6 +107,12 @@ python3 scripts/verify.py --rf --usb \
 
 # Complete fail-safe cycle: build both images, test, and always restore release.
 python3 scripts/hil.py run
+
+# Release-equivalent run: after restoring these exact app bytes, receive full
+# config/NodeDB streams over WiFi and prove that the reboot counter stays fixed.
+python3 scripts/hil.py run \
+  --release-image /absolute/path/to/exact-release-app.bin \
+  --production-wifi
 
 # Or run individual stages while developing the suite.
 # Build and flash only the MAC assigned to devices.dut.
@@ -351,8 +379,10 @@ Configure the protected GitHub environment `release-hil` with:
 - secret `HIL_FIXTURE_JSON`: a schema-2 fixture binding the Cardputer DUT by USB
   MAC, listing every forbidden USB device under
   `protected_devices`, and pinning its intentional `expected_region: "US"` and
-  `expected_tx_power: 26`. No WiFi peers or RF credentials are required by the
-  release job.
+  `expected_tx_power: 26`. Its `devices.dut.production_wifi` object must contain
+  the Cardputer's private `host`, port `4403`, expected `!xxxxxxxx` node ID and
+  a realistic `min_nodes`. No WiFi peer, channel key or RF credential is
+  required by the release job.
 - variable `HIL_RECOVERY_ROOT`: an existing owner-only absolute directory on the
   persistent self-hosted runner, outside both the checkout and `RUNNER_TEMP`.
   Provision it once with mode `0700`; the workflow creates exclusive
@@ -389,5 +419,15 @@ commit, or copy it into HIL evidence.
 
 The job writes the fixture only below the runner's private temporary directory
 with owner-only permissions. Stable USB identities and local serial paths are
-redacted from JSON and logs, as is the DUT's stable mesh node ID. It uploads the remaining JSON, JUnit and logs, then
-removes the fixture in an `always()` cleanup step.
+redacted from JSON and logs, as are the production host and DUT mesh node ID.
+After exact-image recovery, the job allows up to 90 seconds for the first full
+PhoneAPI config/NodeDB stream, establishes its reboot counter as the baseline,
+then performs at least eight more complete dumps for at least 120 seconds and a
+final dump after a 15-second quiet period. There are no retries after the
+baseline: a partial stream, disconnect, identity/environment/WiFi mismatch,
+undersized NodeDB or changed reboot counter blocks publication. The client sends
+only PhoneAPI config, heartbeat and disconnect control envelopes; it never
+sends mesh packets, admin writes or chat messages. Only aggregate counts,
+durations and boolean assertions enter public evidence; raw config and NodeDB
+records remain in memory. The job uploads the remaining JSON, JUnit and logs,
+then removes the fixture in an `always()` cleanup step.

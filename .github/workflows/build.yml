@@ -201,6 +201,7 @@ jobs:
         run: |
           python scripts/verify.py \
             --usb \
+            --production-wifi \
             --release-image "${{ steps.release_app.outputs.path }}" \
             --config-backup "$HIL_CONFIG_BACKUP" \
             --fixture "$HIL_FIXTURE" \

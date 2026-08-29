@@ -5,14 +5,14 @@ release notes remain available on the [GitHub Releases page](https://github.com/
 
 ## [Unreleased]
 
-No user-visible changes are pending after 1.0.10.
+No user-visible changes are pending after 1.0.11.
 
-## [1.0.10] - 2026-08-29
+## [1.0.11] - 2026-08-29
 
 ### Fixed
 
-- Rolls forward the unpublished 1.0.9 candidate. Web UI server startup and
-  request processing now fail softly on fragmented-heap `std::bad_alloc`
+- Rolls forward the unpublished 1.0.9 and 1.0.10 candidates. Web UI server
+  startup and request processing now fail softly on fragmented-heap `std::bad_alloc`
   instead of rebooting the whole device; the HTTP listener also uses the
   existing two-client resource bound. WiFi PhoneAPI listener initialization
   releases a fully constructed temporary object if its `init()` allocation
@@ -274,7 +274,8 @@ The 1.0 release line delivered the following product and release-engineering sco
   cannot reuse stale output, and prereleases cannot enter stable distribution
   channels.
 
-[Unreleased]: https://github.com/anton-vinogradov/meshtastic-adv/compare/v1.0.9...HEAD
+[Unreleased]: https://github.com/anton-vinogradov/meshtastic-adv/compare/v1.0.11...HEAD
+[1.0.11]: https://github.com/anton-vinogradov/meshtastic-adv/compare/v1.0.9...v1.0.11
 [1.0.9]: https://github.com/anton-vinogradov/meshtastic-adv/compare/v1.0.8...v1.0.9
 [1.0.8]: https://github.com/anton-vinogradov/meshtastic-adv/compare/v1.0.7...v1.0.8
 [1.0.7]: https://github.com/anton-vinogradov/meshtastic-adv/compare/v1.0.6...v1.0.7

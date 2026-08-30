@@ -38,6 +38,7 @@ You get a device that boots straight into a usable messenger: pick a contact, ty
 - **🕘 Timestamps** — compact local `HH:MM` on every message, with a UTC-offset (city) picker and a manual clock setting for meshes with no time source.
 - **📡 WiFi + MQTT, on-device** — join WiFi and bridge the mesh to the internet over MQTT (default public broker or your own), configured right on the device — no phone needed. WiFi also sets the clock via NTP.
 - **💾 History that survives reboots — and eviction** — the live conversation window is persisted to flash, and older messages move to a 256-deep flash archive you can page back into right in the thread.
+- **🛟 Automatic SD settings profile** — identity and keys, channels, radio/WiFi/MQTT configuration, companion choice, UI preferences and every favourite are synchronized in the background and restored automatically after a clean ADV reinstall. Messages stay private to internal flash and are not copied.
 - **⚙️ On-device settings** — name, region, modem preset, frequency, channel, role, hop limit, TX power, rebroadcast mode, UTC, WiFi and MQTT, all editable on the device (long-press **ESC**).
 - **🔋 Screen auto-off** — the display powers down after 15 s…5 min idle (your pick); any key wakes it, alerts still beep and flash the LED while it's dark.
 - **📱 Phone app still works** — the stock Bluetooth API stays on: pair the official Meshtastic app (the Cardputer shows the pairing PIN) and use it alongside the on-device UI whenever Bluetooth is free.
@@ -75,6 +76,29 @@ The easiest way is the **[web installer](https://anton-vinogradov.github.io/mesh
 - **M5Launcher from SD card** — use `meshtastic-adv-cardputer-adv-merged.bin` from the [latest release](https://github.com/anton-vinogradov/meshtastic-adv/releases) and flash it as a **full firmware** (written to address `0x0`, replacing the launcher) — *not* as an app/OTA install. An app-slot install runs this firmware on the launcher's partition layout, which ends in restarts and a dead keyboard. Don't use `factory.bin` here: it lacks the Unicode font.
 
 Prefer the CLI? Grab `meshtastic-adv-vX.Y.Z.factory.bin` from the [latest release](https://github.com/anton-vinogradov/meshtastic-adv/releases) and flash it at offset `0x0` with esptool; add `unifont.bin` at `0x340000` for broad Unicode glyph coverage (or drop it on the SD card root instead) — or just take `meshtastic-adv-cardputer-adv-merged.bin`, which contains both in one file.
+
+### Automatic settings restore from SD
+
+Leave a microSD card inserted and ADV maintains three checked generations under
+`/meshtastic-adv/<device-id>/`. The first profile appears after this version has
+booted with the card and remained storage/API-idle for about ten seconds; later
+settings changes are synchronized after the same short quiet period. A phone or
+WiFi configuration dump safely postpones SD work until its heap-heavy stream
+finishes. On a clean ADV
+installation, the newest valid generation is restored before the UI starts and
+the device reboots once — there is no Restore button to press. A missing card,
+read error or corrupt profile never causes defaults to overwrite the backup;
+the firmware keeps the internal settings and retries later.
+
+The profile includes Meshtastic identity/private keys, owner, channels, LoRa,
+Bluetooth, WiFi and MQTT settings, plus ADV radio mode, UI preferences and up to
+the full 150-node favourite set. It deliberately excludes messages, history,
+the learned node cache and transient crash guards. One card can hold profiles
+for several Cardputers because every directory is bound to the hardware ID.
+
+> **Security:** the profile contains network, channel and identity secrets and is
+> not encrypted. Treat the SD card like a private-key backup; do not share its
+> `meshtastic-adv` directory or attach it to bug reports.
 
 ## How to drive it
 

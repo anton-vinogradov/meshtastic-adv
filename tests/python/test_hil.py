@@ -135,17 +135,18 @@ class HilRunnerTests(unittest.TestCase):
                 self.assertEqual(hil.main(), 0)
             self.assertEqual(stat.S_IMODE(output.stat().st_mode), 0o600)
 
-    def test_kick_device_holds_native_usb_open_and_discards_boot_logs(self):
+    def test_kick_device_waits_past_real_boot_and_discards_boot_logs(self):
         device = {"usb_serial": "AA:BB:CC:DD:EE:FF", "port": "/dev/tty-test"}
         handle = mock.Mock()
         serial = SimpleNamespace(Serial=mock.Mock(return_value=handle))
         with (
             mock.patch.object(hil, "require_serial", return_value=(serial, None)),
             mock.patch.object(hil, "wait_for_usb_serial", return_value=device),
-            mock.patch.object(hil.time, "monotonic", side_effect=[10.0, 10.5, 11.5, 12.5, 13.0]),
+            mock.patch.object(hil.time, "monotonic", side_effect=[10.0, 10.5, 15.0, 29.9, 30.0]),
         ):
             self.assertEqual(hil.kick_device(device["usb_serial"]), device)
 
+        self.assertGreaterEqual(hil.USB_BOOT_SETTLE_SECONDS, 20.0)
         handle.open.assert_called_once_with()
         self.assertEqual(handle.read.call_args_list, [mock.call(512), mock.call(512), mock.call(512)])
         handle.close.assert_called_once_with()

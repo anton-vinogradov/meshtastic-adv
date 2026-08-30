@@ -1,0 +1,66 @@
+diff --git a/src/mesh/PhoneAPI.cpp b/src/mesh/PhoneAPI.cpp
+--- a/src/mesh/PhoneAPI.cpp
++++ b/src/mesh/PhoneAPI.cpp
+@@ -10,6 +10,9 @@
+ #include "NodeDB.h"
+ #include "PacketHistory.h"
+ #include "PhoneAPI.h"
++#ifdef ADVUI_PROFILE_SYNC
++#include "advui/AdvProfile.h"
++#endif
+ #include "PowerFSM.h"
+ #include "RadioInterface.h"
+ #include "Router.h"
+@@ -61,6 +64,13 @@ PhoneAPI::~PhoneAPI()
+ 
+ void PhoneAPI::handleStartConfig()
+ {
++#ifdef ADVUI_PROFILE_SYNC
++    if (!advProfileConfigActive) {
++        advui::advProfileApiConfigStart(); // advui-inject-profile-api-gate
++        advProfileConfigActive = true;
++    }
++#endif
++
+     // Must be before setting state (because state is how we know !connected)
+     if (!isConnected()) {
+         onConnectionChanged(true);
+@@ -100,5 +110,11 @@ void PhoneAPI::handleStartConfig()
+ void PhoneAPI::close()
+ {
+     LOG_DEBUG("PhoneAPI::close()");
++#ifdef ADVUI_PROFILE_SYNC
++    if (advProfileConfigActive) {
++        advProfileConfigActive = false;
++        advui::advProfileApiConfigEnd();
++    }
++#endif
+     if (service->api_state == service->STATE_BLE && api_type == TYPE_BLE)
+         service->api_state = service->STATE_DISCONNECTED;
+@@ -642,6 +658,12 @@ void PhoneAPI::sendConfigComplete()
+     onConfigComplete();
+ 
+     pauseBluetoothLogging = false;
++#ifdef ADVUI_PROFILE_SYNC
++    if (advProfileConfigActive) {
++        advProfileConfigActive = false;
++        advui::advProfileApiConfigEnd();
++    }
++#endif
+ }
+ 
+ void PhoneAPI::releasePhonePacket()
+diff --git a/src/mesh/PhoneAPI.h b/src/mesh/PhoneAPI.h
+--- a/src/mesh/PhoneAPI.h
++++ b/src/mesh/PhoneAPI.h
+@@ -47,6 +47,10 @@ class PhoneAPI
+ 
+     State state = STATE_SEND_NOTHING;
+ 
++#ifdef ADVUI_PROFILE_SYNC
++    bool advProfileConfigActive = false; // advui-inject-profile-api-gate
++#endif
++
+     uint8_t config_state = 0;
+ 
+     // advui-inject-bounded-phone-memory: only these six production rate-limit

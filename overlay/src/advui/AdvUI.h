@@ -110,6 +110,7 @@ class AdvUI : public concurrency::OSThread
     void hilPersist();     // force the HIL message store to disk for reboot tests
     void hilLoadLegacyStore(); // write/load a synthetic AVS4 migration fixture
     void hilSeenSaturation(); // prove a full recency ledger admits a fresh sender
+    void hilSeedFavouriteNodes(); // deterministic two-node list for key-repeat assertions
 #endif
     bool applyName(); // returns true if it scheduled a reboot (frequency/channel)
     void applyLoRa(int target, int value);
@@ -122,6 +123,7 @@ class AdvUI : public concurrency::OSThread
     uint32_t nodeNumAt(int i);
     void favNode(uint32_t num, bool on);
     void favEntry(int s, bool on);
+    void favSelectedEntry(bool on); // keep the cursor bound to the same row after favourite sorting
     bool handleFromRadio(const meshtastic_FromRadio &fr); // true only when visible message state changed
     SendFailure sendMessage(uint32_t to, const char *text, uint32_t replyId = 0);
     SendFailure sendChannel(int chIdx, const char *text, uint32_t replyId = 0);
@@ -232,5 +234,6 @@ class AdvUI : public concurrency::OSThread
 };
 
 void advuiSetup();
+void advuiFavouriteChanged(uint32_t nodeNum, bool favourite); // NodeDB/phone writes join the portable ADV profile
 
 } // namespace advui

@@ -215,6 +215,11 @@ bool sdFontReady()
     return g_ready;
 }
 
+bool sdFontUsesSd()
+{
+    return g_ready && !g_map;
+}
+
 int sdGlyph(uint32_t cp, uint8_t *out)
 {
     if (g_map) {

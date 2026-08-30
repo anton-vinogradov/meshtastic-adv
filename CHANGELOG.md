@@ -5,7 +5,45 @@ release notes remain available on the [GitHub Releases page](https://github.com/
 
 ## [Unreleased]
 
-No user-visible changes are pending after 1.0.19.
+No user-visible changes are pending after 1.1.0.
+
+## [1.1.0] - 2026-08-30
+
+### Added
+
+- A device-bound SD profile now synchronizes all Meshtastic and ADV settings,
+  including the complete favourite-node/channel set, and restores the newest
+  valid generation automatically after a clean ADV reinstall. Three CRC-checked
+  generations are rotated atomically; messages, history and the learned NodeDB
+  cache are deliberately excluded.
+- The portable ADV settings file now owns node-list presentation, companion
+  selection, favourite channels/nodes, Cyrillic input, UTC and screen timeout,
+  so deleting message history cannot reset preferences.
+
+### Fixed
+
+- Favouriting a row no longer leaves the cursor on its old numeric index after
+  the list re-sorts. Held-key repeat now stays attached to the original node or
+  channel instead of marking several neighbours yellow.
+- A missing SD, corrupt generation or interrupted restore can no longer turn a
+  clean-install probe into a valid marker or let default settings overwrite the
+  only backup. Restore stages and verifies every file before committing it and
+  rolls the group back on failure.
+- SD profile transactions and heap-heavy PhoneAPI configuration streams are
+  serialized, preventing their temporary allocations from colliding on the
+  no-PSRAM Cardputer.
+- Successful SD writes no longer impose the five-minute failure backoff on the
+  next settings change, and a change committed during streaming remains queued
+  for its own generation instead of losing its dirty notification.
+
+### Release engineering
+
+- Behavioral HIL now seeds two deterministic nodes and proves that repeated
+  favourite/un-favourite key events affect exactly one identity. Host contract
+  tests cover the profile allow-list, secret-bearing/excluded data boundary,
+  device binding, generation rotation, clean-install gate and rollback order.
+- Post-flash HIL now holds and drains native USB through the measured Cardputer
+  boot window before opening a full 150-node production PhoneAPI stream.
 
 ## [1.0.19] - 2026-08-30
 
@@ -386,7 +424,8 @@ The 1.0 release line delivered the following product and release-engineering sco
   cannot reuse stale output, and prereleases cannot enter stable distribution
   channels.
 
-[Unreleased]: https://github.com/anton-vinogradov/meshtastic-adv/compare/v1.0.19...HEAD
+[Unreleased]: https://github.com/anton-vinogradov/meshtastic-adv/compare/v1.1.0...HEAD
+[1.1.0]: https://github.com/anton-vinogradov/meshtastic-adv/compare/v1.0.19...v1.1.0
 [1.0.19]: https://github.com/anton-vinogradov/meshtastic-adv/compare/v1.0.18...v1.0.19
 [1.0.18]: https://github.com/anton-vinogradov/meshtastic-adv/compare/v1.0.17...v1.0.18
 [1.0.17]: https://github.com/anton-vinogradov/meshtastic-adv/compare/v1.0.16...v1.0.17

@@ -246,7 +246,10 @@ two conversations contain the same packet ID, and that deleting one conversation
 removes only its reaction while preserving the other live/archived target. It fills the 2048-record seen-node
 ledger before admitting a fresh sender by bounded oldest-entry replacement. The keyboard path also changes the
 node sort and name style, commits their atomic UI configuration and proves both
-values and exact reaction targets survive the same reboot. A synthetic isolated
+values and exact reaction targets survive the same reboot. It also seeds two
+known nodes, repeats the favourite and un-favourite key events after the list
+re-sorts, and requires that exactly the original node changes on every repeat.
+A synthetic isolated
 `AVS4` save also proves old target-less reactions migrate conservatively into
 the current format. Lightweight single-record current-heap checkpoints keep the
 diagnostic USB protocol itself out of the measurement, and engine-owned NodeInfo
@@ -343,7 +346,7 @@ synthetic marketing poster.
 | Routing ACK/NAK | injected production handler path plus explicit ACK for private directed RF in both directions | programmable attenuator for deterministic failure/retry thresholds |
 | PKI DM | policy-bound WiFi fixtures and directed RF foundation | state-preserving PKI-key/message assertions |
 | BLE companion state mirroring | serialized `my_info`, 66-node bounded mirror, channel/config and queued mesh-packet replay through production `AdvBle` routing | actual BLE GATT fixture for reconnect/admin and PIN handling |
-| Persistence and reboot recovery | native storage tests; HIL-isolated save/reload, selective deletion, saturated seen-ledger replacement and pre/post production-config equality | power-cycle controller and filesystem snapshots |
+| Persistence and reboot recovery | native storage tests; HIL-isolated save/reload, selective deletion, saturated seen-ledger replacement, SD-profile format/transaction contract tests and pre/post production-config equality | controlled spare SD, power-cycle controller and filesystem snapshots for a destructive clean-install restore |
 | WiFi, MQTT and NTP | read-only UI coverage | isolated AP/broker with test credentials |
 | Speaker, RGB LED, battery and second display | code/build coverage | microphone, photodiode, programmable supply and panel fixture |
 

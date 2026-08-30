@@ -1,4 +1,5 @@
 #include "AdvUI.h"
+#include "AdvProfile.h"
 #include "AdvBle.h"
 #include "AdvVersion.h"
 #include "AdvFont.h"
@@ -118,11 +119,9 @@ const char *nodeName(const meshtastic_NodeInfoLite *n)
     return nodeLongName(n)[0] ? nodeLongName(n) : nodeShortName(n);
 }
 
-// Favourites the Cardputer owns, as opposed to the ones living in a node database.
-// In companion mode the database belongs to the node being driven, not to us, so the
-// flag there is not ours to set — which is why the arrows silently did nothing in that
-// mode while channel favourites, which were always local state, worked fine.
-constexpr int kMaxFavNodes = 24;
+// Portable canonical favourite IDs. Known onboard nodes mirror the same state into
+// NodeDB for phone compatibility; unknown and companion nodes still live here.
+constexpr int kMaxFavNodes = 150;
 uint32_t g_favNodes[kMaxFavNodes];
 uint8_t g_favNodeCount = 0;
 
@@ -153,9 +152,7 @@ bool setFavNodeLocal(uint32_t num, bool on)
 
 bool isFav(const meshtastic_NodeInfoLite *n)
 {
-    if (nodeIsFavorite(n))
-        return true;
-    return g_favNodeCount && favNodeLocal(n->num);
+    return nodeIsFavorite(n) || (g_favNodeCount && favNodeLocal(n->num));
 }
 
 // Case-insensitive substring match; empty needle matches everything.
@@ -533,6 +530,7 @@ const char *kUiCfgPath = "/advui_ui.bin";
 int32_t g_screenOffSec = 300; // screen auto-off timeout; 0 = never
 bool g_uiCfgDirty = false;
 uint32_t g_lastUiCfgSaveMs = 0;
+bool g_uiCfgPortable = false;
 
 // Transliterated Cyrillic input layer (Fn+L); persisted with the messages so the
 // chosen layout survives a reboot.
@@ -573,6 +571,8 @@ bool persistRadioCfg()
     const bool saved = saveRadioCfg();
     g_radioCfgDirty = !saved;
     g_lastRadioCfgSaveMs = millis();
+    if (saved)
+        advProfileMarkDirty();
     return saved;
 }
 
@@ -1014,11 +1014,13 @@ static bool loadMsgsCounted(File &f, bool v3Messages, bool v4Reactions)
     g_msgCount = mkeep;
     g_reactCount = rkeep;
     g_reactNext = rkeep % kMaxReacts;
-    g_favChannels = favChannels;
-    g_utcOffsetMin = off;
-    g_ruMode = ru != 0;
-    if (so == 0 || (so >= 15 && so <= 3600))
-        g_screenOffSec = so;
+    if (!g_uiCfgPortable) {
+        g_favChannels = favChannels;
+        g_utcOffsetMin = off;
+        g_ruMode = ru != 0;
+        if (so == 0 || (so >= 15 && so <= 3600))
+            g_screenOffSec = so;
+    }
     return true;
 }
 
@@ -1860,17 +1862,21 @@ constexpr int kSortCount = (int)(sizeof(kSortOpts) / sizeof(kSortOpts[0]));
 // real charge (the "100% on USB, 58% on battery" surprise). Persisted so a
 // boot on USB shows the last honest figure instead of a fresh lie. -1 = unknown.
 int g_battRest = -1;
+constexpr uint32_t kUiCfgMagic = 0x32495541; // "AUI2"
 
 bool saveUiCfg()
 {
     SafeFile f(kUiCfgPath, true);
-    bool ok = f.write(&g_nodeSort, 1) == 1;
+    uint32_t magic = kUiCfgMagic;
+    uint8_t version = 1;
     int8_t b = (int8_t)g_battRest; // -1 when never sampled off-charge
-    ok = ok && f.write((uint8_t *)&b, 1) == 1;
-    ok = ok && f.write(&g_nameShort, 1) == 1;
-    uint8_t on = g_extRot ? 1 : 0; // v0.5.0 wrote the pair; keep the shape, derive both
-    ok = ok && f.write(&on, 1) == 1;
-    ok = ok && f.write(&g_extRot, 1) == 1;
+    uint8_t ru = g_ruMode ? 1 : 0;
+    bool ok = f.write((uint8_t *)&magic, sizeof(magic)) == sizeof(magic) && f.write(&version, 1) == 1 &&
+              f.write(&g_nodeSort, 1) == 1 && f.write((uint8_t *)&b, 1) == 1 &&
+              f.write(&g_nameShort, 1) == 1 && f.write(&g_extRot, 1) == 1 &&
+              f.write(&g_favChannels, 1) == 1 && f.write(&ru, 1) == 1 &&
+              f.write((uint8_t *)&g_utcOffsetMin, sizeof(g_utcOffsetMin)) == sizeof(g_utcOffsetMin) &&
+              f.write((uint8_t *)&g_screenOffSec, sizeof(g_screenOffSec)) == sizeof(g_screenOffSec);
     ok = ok && f.write(&g_favNodeCount, 1) == 1;
     for (uint8_t i = 0; ok && i < g_favNodeCount; i++)
         ok = f.write((uint8_t *)&g_favNodes[i], 4) == 4;
@@ -1878,13 +1884,17 @@ bool saveUiCfg()
         LOG_ERROR("advui: UI config save failed; previous file kept");
         return false;
     }
+    g_uiCfgPortable = true;
     return true;
 }
 
 void persistUiCfg()
 {
-    g_uiCfgDirty = !saveUiCfg();
+    const bool saved = saveUiCfg();
+    g_uiCfgDirty = !saved;
     g_lastUiCfgSaveMs = millis();
+    if (saved)
+        advProfileMarkDirty();
 }
 
 void loadUiCfg()
@@ -1892,6 +1902,46 @@ void loadUiCfg()
     auto f = openAdvFile(kUiCfgPath, FILE_O_READ);
     if (!f)
         return;
+    uint32_t magic = 0;
+    if (f.read((uint8_t *)&magic, sizeof(magic)) == sizeof(magic) && magic == kUiCfgMagic) {
+        uint8_t version = 0, sort = 0, ns = 0, er = 0, favChannels = 0, ru = 0, fc = 0;
+        int8_t batt = -1;
+        int32_t utc = 0, screen = 300;
+        bool ok = f.read(&version, 1) == 1 && version == 1 && f.read(&sort, 1) == 1 && sort < kSortCount &&
+                  f.read((uint8_t *)&batt, 1) == 1 && f.read(&ns, 1) == 1 && ns <= 1 &&
+                  f.read(&er, 1) == 1 && (er == 0 || er == 1 || er == 3 || er == 5 || er == 7) &&
+                  f.read(&favChannels, 1) == 1 && f.read(&ru, 1) == 1 && ru <= 1 &&
+                  f.read((uint8_t *)&utc, sizeof(utc)) == sizeof(utc) && validUtcOffsetMinutes(utc) &&
+                  f.read((uint8_t *)&screen, sizeof(screen)) == sizeof(screen) &&
+                  (screen == 0 || (screen >= 15 && screen <= 3600)) && f.read(&fc, 1) == 1 && fc <= kMaxFavNodes;
+        uint32_t favourites[kMaxFavNodes] = {};
+        for (uint8_t i = 0; ok && i < fc; i++)
+            ok = f.read((uint8_t *)&favourites[i], 4) == 4 && favourites[i] != 0;
+        if (ok) {
+            g_nodeSort = sort;
+            g_battRest = batt >= 0 && batt <= 100 ? batt : -1;
+            g_nameShort = ns;
+            g_extRot = er;
+            g_favChannels = favChannels;
+            g_ruMode = ru != 0;
+            g_utcOffsetMin = utc;
+            g_screenOffSec = screen;
+            g_favNodeCount = fc;
+            memcpy(g_favNodes, favourites, sizeof(g_favNodes));
+            g_uiCfgPortable = true;
+        } else {
+            LOG_ERROR("advui: rejected corrupt portable UI config");
+        }
+        f.close();
+        return;
+    }
+
+    // Legacy v0.5-v1.0.19 shape. The remaining settings are migrated from the
+    // message header once, then all settings live independently of chat data.
+    if (!f.seek(0)) {
+        f.close();
+        return;
+    }
     uint8_t v = 0;
     if (f.read(&v, 1) == 1 && v < kSortCount)
         g_nodeSort = v;
@@ -1918,6 +1968,21 @@ void loadUiCfg()
         }
     }
     f.close();
+}
+
+void migrateDbFavourites()
+{
+    if (!nodeDB)
+        return;
+    bool changed = false;
+    const size_t count = nodeDB->getNumMeshNodes();
+    for (size_t i = 0; i < count; i++) {
+        const meshtastic_NodeInfoLite *node = nodeDB->getMeshNodeByIndex(i);
+        if (nodeIsFavorite(node))
+            changed = setFavNodeLocal(node->num, true) || changed;
+    }
+    if (changed)
+        persistUiCfg();
 }
 const EnumOpt kRoleOpts2[] = {
     {"Client", 0},        {"Client Mute", 1},  {"Router", 2},       {"Router Client", 3},
@@ -2862,6 +2927,9 @@ void AdvUI::initHardware()
 
     sdFontInit(); // flash font partition (or /unifont.bin on SD) unlocks full-BMP text
     loadMsgs(); // restore the saved conversation from flash
+    migrateDbFavourites();
+    if (!g_uiCfgPortable)
+        persistUiCfg(); // one-time migration: settings no longer depend on message history
     if (g_radioCompanion) {
         // The companion is a terminal to another node: free the RAM the stock BT
         // peripheral would take (no phone connects to us) — SMP pairing on the
@@ -3515,19 +3583,14 @@ void AdvUI::deleteConversation(const Conv &c)
 // after the node list was fixed.
 void AdvUI::favNode(uint32_t num, bool on)
 {
-    // Onboard, the node database is ours and its flag is the one the phone app and the
-    // rest of Meshtastic read. A message can arrive before its NodeInfo, though: in
-    // that case there is no database row to mutate yet, so retain the choice locally
-    // just like companion mode does. Once the node is known, migrate ownership back
-    // to NodeDB and remove any stale local fallback.
+    // Keep one portable canonical set, then mirror known onboard nodes into NodeDB
+    // so the stock phone API and Meshtastic alert logic see the same choice.
+    const bool localChanged = setFavNodeLocal(num, on);
     meshtastic_NodeInfoLite *known = nodeDB && !g_radioCompanion ? nodeDB->getMeshNode(num) : nullptr;
-    if (known) {
+    if (known)
         nodeDB->set_favorite(on, num);
-        if (setFavNodeLocal(num, false))
-            persistUiCfg();
-    } else if (setFavNodeLocal(num, on)) {
+    if (localChanged)
         persistUiCfg();
-    }
 }
 
 // Node number at a position in the filtered list, or 0 when there is nothing there.
@@ -3547,11 +3610,37 @@ void AdvUI::favEntry(int s, bool on)
             g_favChannels |= (1u << ci);
         else
             g_favChannels &= ~(1u << ci);
-        markMsgsDirty(); // persisted alongside the messages
+        persistUiCfg();
+        markMsgsDirty(); // keep the legacy message header current for downgrade safety
     } else {
         meshtastic_NodeInfoLite *node = nodeAt(filtered[s - chanCount]);
         if (node)
             favNode(node->num, on);
+    }
+}
+
+void AdvUI::favSelectedEntry(bool on)
+{
+    const int total = chanCount + filteredCount;
+    if (sel < 0 || sel >= total)
+        return;
+    const bool wasChannel = sel < chanCount;
+    const int channel = wasChannel ? chanList[sel] : -1;
+    const uint32_t node = wasChannel ? 0 : nodeNumAt(sel - chanCount);
+    favEntry(sel, on);
+    rebuildFiltered();
+    if (wasChannel) {
+        for (int i = 0; i < chanCount; i++)
+            if (chanList[i] == channel) {
+                sel = i;
+                return;
+            }
+    } else if (node) {
+        for (int i = 0; i < filteredCount; i++)
+            if (nodeNumAt(i) == node) {
+                sel = chanCount + i;
+                return;
+            }
     }
 }
 
@@ -5595,6 +5684,54 @@ void AdvUI::hilHome()
     Serial.flush();
 }
 
+void AdvUI::hilSeedFavouriteNodes()
+{
+    constexpr uint32_t first = 0x00FA7701;
+    constexpr uint32_t target = 0x00FA7702;
+    g_favNodeCount = 0;
+    memset(g_favNodes, 0, sizeof(g_favNodes));
+    if (nodeDB) {
+        const size_t count = nodeDB->getNumMeshNodes();
+        for (size_t i = 0; i < count; i++) {
+            meshtastic_NodeInfoLite *node = nodeDB->getMeshNodeByIndex(i);
+            if (node)
+                node->is_favorite = false;
+        }
+        meshtastic_User userA = meshtastic_User_init_default;
+        meshtastic_User userB = meshtastic_User_init_default;
+        snprintf(userA.long_name, sizeof(userA.long_name), "Favourite guard A");
+        snprintf(userA.short_name, sizeof(userA.short_name), "FGA");
+        snprintf(userB.long_name, sizeof(userB.long_name), "Favourite guard B");
+        snprintf(userB.short_name, sizeof(userB.short_name), "FGB");
+        nodeDB->updateUser(first, userA);
+        nodeDB->updateUser(target, userB);
+        meshtastic_NodeInfoLite *a = nodeDB->getMeshNode(first);
+        meshtastic_NodeInfoLite *b = nodeDB->getMeshNode(target);
+        if (a) {
+            a->last_heard = 200;
+        }
+        if (b) {
+            b->last_heard = 100;
+        }
+    }
+    mode = MODE_NODES;
+    query[0] = 0;
+    queryLen = 0;
+    sel = 0;
+    scrollTop = 0;
+    rebuildFiltered();
+    for (int i = 0; i < filteredCount; i++)
+        if (nodeNumAt(i) == target) {
+            sel = chanCount + i;
+            break;
+        }
+    uiDirty = true;
+    Serial.printf("@@FSEED v=1 ok=%u target=%08x selected=%08x filtered=%d\n",
+                  nodeDB && nodeNumAt(sel - chanCount) == target ? 1U : 0U, (unsigned)target,
+                  sel >= chanCount ? (unsigned)nodeNumAt(sel - chanCount) : 0U, filteredCount);
+    Serial.flush();
+}
+
 void AdvUI::hilInject(const uint8_t *bytes, uint16_t len)
 {
     static meshtastic_FromRadio fr;
@@ -6341,7 +6478,8 @@ void AdvUI::handleKey(char ch)
     if (c == AdvKeyboard::kLang) { // Fn+L: toggle transliterated Cyrillic input
         g_ruMode = !g_ruMode;
         pendingLat = 0;
-        markMsgsDirty(); // the layout choice is persisted with the message file
+        persistUiCfg();
+        markMsgsDirty(); // keep the legacy message header current for downgrade safety
         return;
     }
 
@@ -6580,12 +6718,14 @@ void AdvUI::handleKey(char ch)
                 else
                     sdFontUnload();
                 mode = MODE_SETTINGS;
-            } else if (pickTarget == 4) { // screen auto-off: applied live, persisted with msgs
+            } else if (pickTarget == 4) { // screen auto-off: applied live
                 g_screenOffSec = kScreenOpts[pickSel].value;
+                persistUiCfg();
                 markMsgsDirty();
                 mode = MODE_SETTINGS;
-            } else if (pickTarget == 2) { // UTC offset: applied live, persisted with msgs
+            } else if (pickTarget == 2) { // UTC offset: applied live
                 g_utcOffsetMin = kUtcOpts[pickSel].value;
+                persistUiCfg();
                 markMsgsDirty();
                 mode = MODE_SETTINGS;
             } else if (pickTarget == 3) { // radio backend: persist + reboot into the new role
@@ -6881,6 +7021,7 @@ void AdvUI::handleKey(char ch)
                         g_favChannels |= (1u << c.ch);
                     else
                         g_favChannels &= ~(1u << c.ch);
+                    persistUiCfg();
                     markMsgsDirty();
                 } else {
                     favNode(c.node, left);
@@ -6930,8 +7071,7 @@ void AdvUI::handleKey(char ch)
             return;
         }
         if (left || right) { // favourite / unfavourite the selected entry (channel or node)
-            if (sel < total)
-                favEntry(sel, left);
+            favSelectedEntry(left);
             return;
         }
         if (!printable)
@@ -6974,24 +7114,7 @@ void AdvUI::handleKey(char ch)
         return;
     }
     if (left || right) { // favourite / unfavourite the selected entry
-        if (sel < total) {
-            // Favouriting re-sorts the list under the cursor: the node jumps to the top
-            // and a different one takes its place at this index. Held down, the key
-            // repeat then favourited whatever slid underneath, painting a run of nodes
-            // yellow. Follow the node instead of the index, so the cursor stays on the
-            // one the user was pointing at, wherever the sort has moved it.
-            const bool isChan = sel < chanCount;
-            const uint32_t was = isChan ? 0 : nodeNumAt(sel - chanCount);
-            favEntry(sel, left);
-            if (!isChan && was) {
-                rebuildFiltered();
-                for (int i = 0; i < filteredCount; i++)
-                    if (nodeNumAt(i) == was) {
-                        sel = chanCount + i;
-                        break;
-                    }
-            }
-        }
+        favSelectedEntry(left);
         return;
     }
     if (bksp) {
@@ -7211,6 +7334,8 @@ int32_t AdvUI::runOnce()
             hilLoadLegacyStore();
         } else if (sc == 'V') {
             hilSeenSaturation();
+        } else if (sc == 'Z') {
+            hilSeedFavouriteNodes();
         } else if (sc == 'E') {
             hilClearData();
         } else if (sc == 'B') {
@@ -7464,6 +7589,7 @@ int32_t AdvUI::runOnce()
         persistUiCfg();
     if (g_radioCfgDirty && !Throttle::isWithinTimespanMs(g_lastRadioCfgSaveMs, 3000))
         persistRadioCfg();
+    advProfileSyncTick();
 
     // Persist after three quiet seconds. The previous fixed-cadence throttle
     // could launch a full atomic ring rewrite in the middle of a receive burst,
@@ -7625,9 +7751,16 @@ void advuiSetup()
     // still before initLoRa().
     pinMode(12, OUTPUT);
     digitalWrite(12, HIGH);
+    advProfileRestoreIfNeeded();
 
     static AdvUI advUI;
     static AdvRxModule advRx(&advUI); // registers with the module list built in setupModules()
+}
+
+void advuiFavouriteChanged(uint32_t nodeNum, bool favourite)
+{
+    if (setFavNodeLocal(nodeNum, favourite))
+        persistUiCfg();
 }
 
 } // namespace advui

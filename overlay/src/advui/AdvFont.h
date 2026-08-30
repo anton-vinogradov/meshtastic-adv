@@ -13,6 +13,7 @@ namespace advui
 
 void sdFontInit(); // map the flash partition if present (call after the SPI bus is up)
 bool sdFontReady();
+bool sdFontUsesSd(); // profile sync must not unmount a font-backed SD session
 
 // With no font partition (M5Launcher installs, bare esptool flashes) the card
 // can still carry the font — but mounting it costs ~32 KB of heap, which on

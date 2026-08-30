@@ -42,6 +42,7 @@ PRODUCTION_WIFI_CLOSE_SETTLE_SECONDS = 3.0
 PRODUCTION_WIFI_FINAL_QUIET_SECONDS = 15.0
 PRODUCTION_WIFI_CONNECT_TIMEOUT_SECONDS = 5
 PRODUCTION_WIFI_CONFIG_TIMEOUT_SECONDS = 90
+USB_BOOT_SETTLE_SECONDS = 20.0
 DISPLAY_POWER_CYCLE_COUNT = 12
 DISPLAY_POWER_CYCLE_RETAINED_TOLERANCE = 512
 MAX_APP_IMAGE_BYTES = 3_000_000
@@ -518,7 +519,13 @@ def kick_device(usb_serial: str) -> dict[str, object]:
         # crossed the ROM/bootloader handoff. Keep the host side present while
         # draining (and deliberately discarding) early logs so a production
         # Wi-Fi soak does not depend on someone opening a serial terminal.
-        deadline = time.monotonic() + 3.0
+        # Cardputer's native USB can enumerate several seconds before ADV has
+        # finished UI/NodeDB startup. Starting a 150-node PhoneAPI dump in that
+        # window can strand the first connection until its full timeout even
+        # though the same production image is healthy once boot settles. The
+        # field-observed boot crosses UI readiness after ~5 s; keep a generous,
+        # deterministic margin and discard every private boot-log byte.
+        deadline = time.monotonic() + USB_BOOT_SETTLE_SECONDS
         while time.monotonic() < deadline:
             handle.read(512)
         handle.close()
@@ -1777,6 +1784,12 @@ class HilSession:
     def test_seen_saturation(self) -> dict[str, str]:
         return parse_fields(self.exchange(b"V", "@@SEEN", timeout=12), "@@SEEN")
 
+    def seed_favourite_nodes(self) -> dict[str, str]:
+        result = parse_fields(self.exchange(b"Z", "@@FSEED"), "@@FSEED")
+        require_fields(result, {"ok": "1", "target": "00fa7702", "selected": "00fa7702"})
+        self.wait_state({"mode": "nodes", "selected": "00000000"})
+        return result
+
     def reaction_state(self) -> dict[str, str]:
         return parse_fields(self.exchange(b"R", "@@REACT"), "@@REACT")
 
@@ -2213,6 +2226,34 @@ def message_flow(fixture: dict[str, object], artifacts: Path) -> Report:
             return {"before": before, "on": on, "highlighted": highlighted, "off": off, "restored": restored}
 
         report.check("ui/favourite-node-select-unselect", favourite_node_selection_case)
+
+        def favourite_single_target_case():
+            seeded = session.seed_favourite_nodes()
+            first_on = require_fields(
+                session.key("<", {"mode": "nodes", "fav_nodes": "1"}),
+                {"fav_first": "00fa7702"},
+            )
+            repeated_on = require_fields(
+                session.key("<", {"mode": "nodes", "fav_nodes": "1"}),
+                {"fav_first": "00fa7702"},
+            )
+            first_off = session.key(">", {"mode": "nodes", "fav_nodes": "0", "fav_first": "00000000"})
+            repeated_off = session.key(">", {"mode": "nodes", "fav_nodes": "0", "fav_first": "00000000"})
+
+            # Restore the single-DM fixture expected by the following ingress cases.
+            session.clear()
+            session.inject(make_text_frame(source, me, 0x1001, "Привет из FromRadio 👋", rx_time=1_750_000_100))
+            session.home()
+            session.key("<", {"mode": "chats", "fav_nodes": "1"})
+            return {
+                "seeded": seeded,
+                "first_on": first_on,
+                "repeated_on": repeated_on,
+                "first_off": first_off,
+                "repeated_off": repeated_off,
+            }
+
+        report.check("ui/favourite-key-repeat-keeps-single-target", favourite_single_target_case)
 
         def duplicate_case():
             duplicate = session.inject(make_text_frame(source, me, 0x1001, "duplicate must be ignored"))

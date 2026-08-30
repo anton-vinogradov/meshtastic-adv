@@ -1,0 +1,35 @@
+diff --git a/src/mesh/NodeDB.cpp b/src/mesh/NodeDB.cpp
+index 7e25d434..a49b038d 100644
+--- a/src/mesh/NodeDB.cpp
++++ b/src/mesh/NodeDB.cpp
+@@ -18,6 +18,10 @@
+ #include "SafeFile.h"
+ #include "TransmitHistory.h"
+ #include "TypeConversions.h"
++#ifdef ADVUI_PROFILE_SYNC
++#include "advui/AdvProfile.h"
++#include "advui/AdvUI.h"
++#endif
+ #include "error.h"
+ #include "main.h"
+ #include "mesh-pb-constants.h"
+@@ -1633,6 +1637,10 @@ bool NodeDB::saveToDiskNoRetry(int saveWhat)
+     if (saveWhat & SEGMENT_NODEDATABASE) {
+         success &= saveNodeDatabaseToDisk();
+     }
++#ifdef ADVUI_PROFILE_SYNC
++    if (success && (saveWhat & (SEGMENT_CONFIG | SEGMENT_MODULECONFIG | SEGMENT_DEVICESTATE | SEGMENT_CHANNELS)))
++        advui::advProfileMarkDirty();
++#endif
+ 
+     return success;
+ }
+@@ -1983,5 +1991,8 @@ void NodeDB::set_favorite(bool is_favorite, uint32_t nodeId)
+         lite->is_favorite = is_favorite;
+         sortMeshDB();
+         saveNodeDatabaseToDisk();
++#ifdef ADVUI_PROFILE_SYNC
++        advui::advuiFavouriteChanged(nodeId, is_favorite);
++#endif
+     }
+ }

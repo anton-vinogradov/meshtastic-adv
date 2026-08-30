@@ -84,6 +84,13 @@ if [ -f "$MC" ] && ! grep -q 'advui/AdvUI.h" // advui-inject' "$MC"; then
   perl -0pi -e 's{(\n[ \t]*consoleInit\(\); // Set serial baud rate and init our mesh console\n)}{$1#if defined(ARDUINO_USB_CDC_ON_BOOT) && ARDUINO_USB_CDC_ON_BOOT\n    Serial.setTxTimeoutMs(1); // advui-inject: minimum safe HWCDC timeout when the host is not draining\n#endif\n}' "$MC"
   echo "injected advui hooks into main.cpp"
 fi
+if [ -f "$MC" ] && ! grep -q 'advui/AdvProfile.h" // advui-inject-profile' "$MC"; then
+  perl -0pi -e 's{#include "advui/AdvUI\.h" // advui-inject\n}{#include "advui/AdvUI.h" // advui-inject\n#include "advui/AdvProfile.h" // advui-inject-profile\n}' "$MC"
+fi
+if [ -f "$MC" ] && ! grep -q 'advProfileCaptureBootState(); // advui-inject-profile' "$MC"; then
+  perl -0pi -e 's{(\n[ \t]*fsInit\(\);\n)}{$1    advui::advProfileCaptureBootState(); // advui-inject-profile\n}' "$MC"
+fi
+test "$(grep -c 'advui-inject-profile' "$MC" || true)" -eq 2
 
 # SerialConsole.cpp: in the ADVUI_SCREENSHOT dev build the remote-debug driver owns serial
 #     input (keys/screenshots); the stock console polls-and-drains the same
@@ -290,6 +297,18 @@ if [ -f "$PHONE_API" ] && [ -f "$PHONE_API_H" ] && \
 fi
 test "$(grep -c 'advui-inject-bounded-phone-memory' "$PHONE_API_H" || true)" -eq 1
 
+# A full 150-node PhoneAPI config stream and the SD profile transaction each fit
+# independently, but their heap peaks must never overlap on the no-PSRAM S3.
+# The gate is symmetric: config start waits for an already-running atomic SD
+# operation, while profile work defers until the stream and its quiet period end.
+if [ -f "$PHONE_API" ] && [ -f "$PHONE_API_H" ] && \
+   ! grep -q 'advui-inject-profile-api-gate' "$PHONE_API_H"; then
+  git -C "$FW" apply "$ROOT/overlay/patches/phoneapi-profile-gate.patch"
+  echo "injected PhoneAPI/SD-profile heap gate"
+fi
+test "$(grep -c 'advui-inject-profile-api-gate' "$PHONE_API" || true)" -eq 1
+test "$(grep -c 'advui-inject-profile-api-gate' "$PHONE_API_H" || true)" -eq 1
+
 # ContentHandler request allocations are caught by WebServer::loop(). Make the
 # multipart parser and SPI lock unwind with them so fail-soft HTTP cannot retain
 # a parser or permanently strand the shared radio/storage bus lock.
@@ -392,6 +411,15 @@ if [ -f "$ND" ] && ! grep -q 'advui-inject-nodedb-reserve' "$ND"; then
   echo "reserved exact NodeDB capacity before decode"
 fi
 test "$(grep -c 'advui-inject-nodedb-reserve' "$ND" || true)" -eq 1
+
+# Every committed Meshtastic settings write and phone-originated favourite
+# change must feed the portable ADV SD profile, not only edits made in our UI.
+if [ -f "$ND" ] && ! grep -q 'advProfileMarkDirty' "$ND"; then
+  git -C "$FW" apply "$ROOT/overlay/patches/nodedb-profile-sync.patch"
+  echo "injected automatic ADV settings-profile synchronization"
+fi
+test "$(grep -c 'advProfileMarkDirty' "$ND" || true)" -eq 1
+test "$(grep -c 'advuiFavouriteChanged' "$ND" || true)" -eq 1
 
 # ADV sends need the synchronous queue-admission result. Existing callers may
 # ignore the returned ErrorCode, so widening the API is source-compatible.

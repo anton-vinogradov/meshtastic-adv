@@ -2192,6 +2192,28 @@ def message_flow(fixture: dict[str, object], artifacts: Path) -> Report:
 
         report.check("ingress/incoming-unicode-dm", incoming_case)
 
+        def favourite_node_selection_case():
+            # Exercise the same key path as the physical keyboard. The synthetic
+            # sender deliberately has no NodeInfo yet: choosing a favourite from
+            # an already-arrived DM must still work and persist locally.
+            session.home()
+            before = session.frame("chats")
+            on = require_fields(
+                session.key("<", {"mode": "chats", "fav_nodes": "1"}),
+                {"fav_first": f"{source:08x}"},
+            )
+            highlighted = session.frame("chats")
+            if highlighted.get("fnv") == before.get("fnv"):
+                raise HilError(f"favouriting the DM did not change its rendered row: {highlighted}")
+            off = session.key(">", {"mode": "chats", "fav_nodes": "0", "fav_first": "00000000"})
+            restored = require_fields(
+                session.key("<", {"mode": "chats", "fav_nodes": "1"}),
+                {"fav_first": f"{source:08x}"},
+            )
+            return {"before": before, "on": on, "highlighted": highlighted, "off": off, "restored": restored}
+
+        report.check("ui/favourite-node-select-unselect", favourite_node_selection_case)
+
         def duplicate_case():
             duplicate = session.inject(make_text_frame(source, me, 0x1001, "duplicate must be ignored"))
             require_fields(duplicate, {"changed": "0"})
@@ -2234,7 +2256,7 @@ def message_flow(fixture: dict[str, object], artifacts: Path) -> Report:
             )
             return require_fields(
                 session.wait_state({"messages": "2", "incoming": "2"}),
-                {"id": "00001002", "reply": "00001001"},
+                {"id": "00001002", "reply": "00001001", "alert_fav": "1"},
             )
 
         report.check("ingress/reply-link", reply_case)
@@ -2271,6 +2293,22 @@ def message_flow(fixture: dict[str, object], artifacts: Path) -> Report:
             )
 
         report.check("ingress/channel-broadcast", broadcast_case)
+
+        def favourite_channel_selection_case():
+            # The channel broadcast is now the newest conversation (row zero).
+            # Toggle it both ways, prove the yellow-row render, then leave it on
+            # so the later reboot gate verifies message-store persistence.
+            session.home()
+            before = session.frame("chats")
+            on = session.key("<", {"mode": "chats", "fav_channels": "04"})
+            highlighted = session.frame("chats")
+            if highlighted.get("fnv") == before.get("fnv"):
+                raise HilError(f"favouriting the channel did not change its rendered row: {highlighted}")
+            off = session.key(">", {"mode": "chats", "fav_channels": "00"})
+            restored = session.key("<", {"mode": "chats", "fav_channels": "04"})
+            return {"before": before, "on": on, "highlighted": highlighted, "off": off, "restored": restored}
+
+        report.check("ui/favourite-channel-select-unselect", favourite_channel_selection_case)
 
         def ack_case():
             # Drive the actual chat/compose/send UI. The HIL RadioLib interface
@@ -2697,7 +2735,8 @@ def message_flow(fixture: dict[str, object], artifacts: Path) -> Report:
             expected_after_persist = {
                 key: state[key]
                 for key in (
-                    "messages", "hist", "reactions", "incoming", "delivered", "failed", "sort", "names"
+                    "messages", "hist", "reactions", "incoming", "delivered", "failed", "sort", "names",
+                    "fav_channels", "fav_nodes", "fav_first"
                 )
             }
             ack = session.persist()

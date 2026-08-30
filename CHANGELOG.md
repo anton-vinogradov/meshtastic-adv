@@ -5,7 +5,24 @@ release notes remain available on the [GitHub Releases page](https://github.com/
 
 ## [Unreleased]
 
-No user-visible changes are pending after 1.0.18.
+No user-visible changes are pending after 1.0.19.
+
+## [1.0.19] - 2026-08-30
+
+### Fixed
+
+- A direct-message peer can now be added to favourites before its NodeInfo has
+  arrived. The choice falls back to the messenger's local atomic settings
+  instead of silently doing nothing, then migrates to the Meshtastic NodeDB
+  when that peer becomes known.
+- The English and Russian interface guides now document the actual controls:
+  left adds the selected peer or channel to favourites and right removes it.
+
+### Release engineering
+
+- Physical release HIL now toggles both DM-peer and channel favourites through
+  the real keyboard path, proves their yellow-row framebuffer change, checks
+  favourite-only alert routing, and verifies both stores after a real reboot.
 
 ## [1.0.18] - 2026-08-29
 
@@ -369,7 +386,8 @@ The 1.0 release line delivered the following product and release-engineering sco
   cannot reuse stale output, and prereleases cannot enter stable distribution
   channels.
 
-[Unreleased]: https://github.com/anton-vinogradov/meshtastic-adv/compare/v1.0.18...HEAD
+[Unreleased]: https://github.com/anton-vinogradov/meshtastic-adv/compare/v1.0.19...HEAD
+[1.0.19]: https://github.com/anton-vinogradov/meshtastic-adv/compare/v1.0.18...v1.0.19
 [1.0.18]: https://github.com/anton-vinogradov/meshtastic-adv/compare/v1.0.17...v1.0.18
 [1.0.17]: https://github.com/anton-vinogradov/meshtastic-adv/compare/v1.0.16...v1.0.17
 [1.0.16]: https://github.com/anton-vinogradov/meshtastic-adv/compare/v1.0.15...v1.0.16

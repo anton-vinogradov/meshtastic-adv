@@ -491,6 +491,22 @@ class HilRunnerTests(unittest.TestCase):
         runner = (ROOT / "scripts/hil.py").read_text()
         self.assertIn('require_fields(duplicate, {"changed": "0"})', runner)
 
+    def test_release_hil_selects_and_persists_node_and_channel_favourites(self):
+        source = (ROOT / "overlay/src/advui/AdvUI.cpp").read_text()
+        runner = (ROOT / "scripts/hil.py").read_text()
+        fav_node = source.split("void AdvUI::favNode", 1)[1].split("uint32_t AdvUI::nodeNumAt", 1)[0]
+        self.assertIn("nodeDB->getMeshNode(num)", fav_node)
+        self.assertIn("setFavNodeLocal(num, on)", fav_node)
+        self.assertIn("fav_channels=%02x fav_nodes=%u fav_first=%08x alert_fav=%u", source)
+        self.assertIn('report.check("ui/favourite-node-select-unselect"', runner)
+        self.assertIn('report.check("ui/favourite-channel-select-unselect"', runner)
+        persist = runner.split("def persist_case()", 1)[1].split(
+            'report.check("storage/persist-before-reboot"', 1
+        )[0]
+        for field in ("fav_channels", "fav_nodes", "fav_first"):
+            self.assertIn(f'"{field}"', persist)
+        self.assertIn('"alert_fav": "1"', runner)
+
     def test_name_editor_enforces_wire_byte_limits_before_owner_broadcast(self):
         source = (ROOT / "overlay/src/advui/AdvUI.cpp").read_text()
         editor = source.split("if (mode == MODE_SETNAME)", 1)[1].split("if (mode == MODE_BTPIN)", 1)[0]

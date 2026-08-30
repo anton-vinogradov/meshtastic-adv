@@ -79,6 +79,7 @@ extern uint8_t g_nameShort;
 ErrorCode g_hilNextSendError = ERRNO_OK;
 uint8_t g_hilLastSendError = ERRNO_OK;
 uint32_t g_hilLastTxReply = 0;
+uint8_t g_hilLastAlertFav = 0;
 #endif
 
 #ifdef ADVUI_SCREENSHOT
@@ -3020,6 +3021,12 @@ bool AdvUI::handleFromRadio(const meshtastic_FromRadio &fr)
         bool fav = (p.to == NODENUM_BROADCAST)
                        ? chanFav(p.channel)
                        : ((!g_radioCompanion && nodeDB && nodeDB->isFavorite(p.from)) || favNodeLocal(p.from));
+#ifdef ADVUI_HIL
+        // The release fixture cannot hear the codec or see the LED electrically,
+        // but it can prove that production ingress chose the favourite alert branch
+        // that drives both outputs below.
+        g_hilLastAlertFav = fav ? 1U : 0U;
+#endif
 #ifdef HAS_NEOPIXEL
         // LED flash on any incoming: green from a favourite, blue otherwise.
         if (fav)
@@ -3509,12 +3516,18 @@ void AdvUI::deleteConversation(const Conv &c)
 void AdvUI::favNode(uint32_t num, bool on)
 {
     // Onboard, the node database is ours and its flag is the one the phone app and the
-    // rest of Meshtastic read. In companion mode that database belongs to the node we
-    // are driving, so the favourite is kept here instead.
-    if (nodeDB && !g_radioCompanion)
+    // rest of Meshtastic read. A message can arrive before its NodeInfo, though: in
+    // that case there is no database row to mutate yet, so retain the choice locally
+    // just like companion mode does. Once the node is known, migrate ownership back
+    // to NodeDB and remove any stale local fallback.
+    meshtastic_NodeInfoLite *known = nodeDB && !g_radioCompanion ? nodeDB->getMeshNode(num) : nullptr;
+    if (known) {
         nodeDB->set_favorite(on, num);
-    else if (setFavNodeLocal(num, on))
+        if (setFavNodeLocal(num, false))
+            persistUiCfg();
+    } else if (setFavNodeLocal(num, on)) {
         persistUiCfg();
+    }
 }
 
 // Node number at a position in the filtered list, or 0 when there is nothing there.
@@ -5425,12 +5438,15 @@ void AdvUI::hilState()
     // short as well as enabling bounded blocking for the dev-only protocol.
     Serial.setTxTimeoutMs(1000);
     Serial.printf("@@STATE v=2 boot=%08x reset=%d mode=%s splash=%u screen=%u keyboard=%u canvas=%u node=%08x selected=%08x channel=%d "
-                  "compose=%u send_error=%u send_errno=%u query=%u set_section=%d set_sel=%d net_page=%d backend=%s\n",
+                  "compose=%u send_error=%u send_errno=%u query=%u set_section=%d set_sel=%d net_page=%d backend=%s "
+                  "fav_channels=%02x fav_nodes=%u fav_first=%08x alert_fav=%u\n",
                   (unsigned)hilBootId(), (int)esp_reset_reason(), hilModeName(), splashDone ? 1U : 0U,
                   screenOn ? 1U : 0U, kbMissing ? 0U : 1U,
                   haveCanvas ? 1U : 0U, (unsigned)myNodeNum(), (unsigned)selectedNum, selectedChannel, (unsigned)msgLen,
                   (unsigned)sendFailure, (unsigned)g_hilLastSendError, (unsigned)queryLen, setSection, setSel, netPage,
-                  g_radioCompanion ? "companion" : "onboard");
+                  g_radioCompanion ? "companion" : "onboard", (unsigned)g_favChannels,
+                  (unsigned)g_favNodeCount, g_favNodeCount ? (unsigned)g_favNodes[0] : 0U,
+                  (unsigned)g_hilLastAlertFav);
     Serial.printf("@@STATS v=2 messages=%d hist=%d unread=%d reactions=%d conversations=%d filtered=%d heap=%u "
                   "min_heap=%u link=%u rx_drop=%u tx_drop=%u radio_tx=%u rf_region=%d rf_power=%d sort=%u names=%u\n",
                   g_msgCount, histTotal(), unreadCount(), g_reactCount, convCount, filteredCount, (unsigned)ESP.getFreeHeap(),
@@ -5628,6 +5644,10 @@ void AdvUI::hilClearData()
     g_reactNext = 0;
     memset(g_reacts, 0, sizeof(g_reacts));
     g_msgsDirty = false;
+    g_favChannels = 0;
+    g_favNodeCount = 0;
+    memset(g_favNodes, 0, sizeof(g_favNodes));
+    g_hilLastAlertFav = 0;
     g_hilSaveCount = 0;
     g_hilSaveHeapBefore = g_hilSaveHeapAfter = 0;
     g_hilSaveMinBefore = g_hilSaveMinAfter = 0;

@@ -50,7 +50,7 @@ Your recent conversations — DMs and channels mixed, newest first.
   envelope marks unread. The preview shows the sender's short name in channels and `>` when
   the last word was yours.
 - **Enter** opens the conversation **at the first unread message**.
-- **← / →** un-favourite / favourite the selected contact or channel.
+- **← / →** favourite / un-favourite the selected contact or channel.
 - **Typing** searches *all* nodes to start a new chat; **Tab** switches to the full node list.
 - In companion mode a small **Bluetooth rune** next to the title shows the link state
   (green = linked, yellow = reconnecting, red = down).

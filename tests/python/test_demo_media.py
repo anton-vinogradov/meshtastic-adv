@@ -5,6 +5,7 @@ import struct
 import sys
 import tempfile
 import unittest
+import xml.etree.ElementTree as ET
 import zlib
 from pathlib import Path
 
@@ -221,6 +222,32 @@ class DemoMediaTests(unittest.TestCase):
             (source / "escape.log").symlink_to(source / "report.json")
             with self.assertRaisesRegex(demo_media.MediaError, "symlink"):
                 demo_media.stage_evidence(source, None, None, root / "public")
+
+    def test_failed_junit_redaction_preserves_xml_and_escapes_placeholders(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = root / "private"
+            source.mkdir()
+            suite = ET.Element("testsuite", tests="1", failures="1")
+            case = ET.SubElement(suite, "testcase", name="fixture check")
+            failure = ET.SubElement(case, "failure", message="selected=abcdef12 at 192.168.99.77")
+            failure.text = "{'selected': 'abcdef12', 'node': '<dut-node>'} Private DUT"
+            failure.tail = "via AA:BB:CC:DD:EE:FF"
+            ET.ElementTree(suite).write(source / "junit.xml", encoding="utf-8", xml_declaration=True)
+            fixture = root / "fixture.json"
+            fixture.write_text(json.dumps({"devices": {"dut": {"name": "Private DUT"}}}))
+            public = root / "public"
+            demo_media.stage_evidence(source, None, fixture, public)
+            clean = (public / "junit.xml").read_text()
+            for private in ("abcdef12", "192.168.99.77", "Private DUT", "AA:BB:CC:DD:EE:FF"):
+                self.assertNotIn(private, clean)
+            parsed = ET.fromstring(clean)
+            self.assertEqual(parsed.get("failures"), "1")
+            result = parsed.find("testcase/failure")
+            self.assertEqual(result.get("message"), "selected=<node-id> at <local-ip>")
+            self.assertIn("<dut-node>", result.text)
+            self.assertIn("<lab-redacted>", result.text)
+            self.assertEqual(result.tail, "via <usb-identity>")
 
     def test_redaction_removes_complete_local_ipv4_addresses(self):
         clean = demo_media.redact_text(

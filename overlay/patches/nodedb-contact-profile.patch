@@ -1,0 +1,15 @@
+diff --git a/src/mesh/NodeDB.cpp b/src/mesh/NodeDB.cpp
+--- a/src/mesh/NodeDB.cpp
++++ b/src/mesh/NodeDB.cpp
+@@ -1870,5 +1870,11 @@ void NodeDB::addFromContact(meshtastic_SharedContact contact)
+         sortMeshDB();
+         notifyObservers(true); // Force an update whether or not our node counts have changed
+     }
++#ifdef ADVUI_PROFILE_SYNC
++    // Sorting can move the entry: resolve its identity again before mirroring.
++    const auto *savedContact = getMeshNode(contact.node_num);
++    if (savedContact)
++        advui::advuiFavouriteChanged(contact.node_num, savedContact->is_favorite);
++#endif
+     saveNodeDatabaseToDisk();
+ }

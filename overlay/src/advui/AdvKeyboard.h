@@ -17,6 +17,7 @@ class AdvKeyboard : public TCA8418KeyboardBase
     static constexpr uint8_t kLongEsc = 0x1c;
     // Emitted by Fn+L: toggles the transliterated Cyrillic input layer (RU/EN).
     static constexpr uint8_t kLang = 0x0e;
+    static constexpr uint8_t kInputHelp = 0x0f; // Fn+H: Cyrillic input map
 
     AdvKeyboard();
     void begin();           // init the TCA8418 over the keyboard I2C bus (GPIO 8/9)

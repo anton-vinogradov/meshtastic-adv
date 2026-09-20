@@ -256,6 +256,12 @@ stream_retained_ready
 grep -q 'delegate.availableForWrite()' "$FW/src/mesh/UsbSessionStream.h"
 grep -q 'resetStreamInput' "$SC"
 
+if ! grep -q 'advui-inject-log-format-bounds' "$STREAM_API"; then
+  git -C "$FW" apply "$ROOT/overlay/patches/streamapi-log-format-bounds.patch"
+  echo "injected bounded StreamAPI log formatting"
+fi
+test "$(grep -c 'advui-inject-log-format-bounds' "$STREAM_API" || true)" -eq 1
+
 # Per-connection PhoneAPI objects and the WiFi listener are normally small, but
 # both constructors allocate thread/stream state from the fragmented internal
 # heap. Refuse that connection or listener start instead of allowing bad_alloc
@@ -419,7 +425,27 @@ if [ -f "$ND" ] && ! grep -q 'advProfileMarkDirty' "$ND"; then
   echo "injected automatic ADV settings-profile synchronization"
 fi
 test "$(grep -c 'advProfileMarkDirty' "$ND" || true)" -eq 1
-test "$(grep -c 'advuiFavouriteChanged' "$ND" || true)" -eq 1
+test "$(grep -c 'advuiFavouriteChanged' "$ND" || true)" -ge 1
+
+# Restored favourite IDs must join newly discovered entries, and an idempotent
+# phone unstar must still update the portable set even if the DB flag was false.
+if [ -f "$ND" ] && ! grep -q 'advuiRestoreFavourite' "$ND"; then
+  git -C "$FW" apply "$ROOT/overlay/patches/nodedb-favourites-reconcile.patch"
+  echo "reconciled portable favourites with NodeDB"
+fi
+test "$(grep -c 'advuiRestoreFavourite' "$ND" || true)" -eq 1
+
+if [ -f "$ND" ] && ! grep -q 'advuiFavouriteChanged(contact.node_num' "$ND"; then
+  git -C "$FW" apply "$ROOT/overlay/patches/nodedb-contact-profile.patch"
+  echo "mirrored contact import/ignore favourite changes into the portable profile"
+fi
+test "$(grep -c 'advuiFavouriteChanged(contact.node_num' "$ND" || true)" -eq 1
+
+if [ -f "$ND" ] && ! grep -q 'advui-inject-pinned-capacity' "$ND"; then
+  git -C "$FW" apply "$ROOT/overlay/patches/nodedb-full-pinned-guard.patch"
+  echo "guarded node admission when every cache entry is pinned"
+fi
+test "$(grep -c 'advui-inject-pinned-capacity' "$ND" || true)" -eq 1
 
 # ADV sends need the synchronous queue-admission result. Existing callers may
 # ignore the returned ErrorCode, so widening the API is source-compatible.

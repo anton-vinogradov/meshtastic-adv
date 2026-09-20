@@ -10,9 +10,11 @@
 #include <SPI.h>
 #include <algorithm>
 #include <atomic>
+#include <cerrno>
 #include <cstring>
 #include <esp_system.h>
 #include <new>
+#include <sys/stat.h>
 
 namespace advui
 {
@@ -180,12 +182,13 @@ const EntrySpec *findSpec(uint8_t id)
     return nullptr;
 }
 
-bool readInternalMarker(InternalMarker *out)
+bool readInternalMarker(InternalMarker *out, const char *path = kMarkerPath)
 {
-    auto file = FSCom.open(kMarkerPath, FILE_READ);
+    auto file = FSCom.open(path, FILE_READ);
     InternalMarker marker = {};
-    const bool ok = file && readExact(file, &marker, sizeof(marker)) && marker.magic == kMarkerMagic &&
-                    marker.version == kMarkerVersion && marker.deviceId == deviceId() && marker.crc == markerCrc(marker);
+    const bool ok = file && file.size() == sizeof(marker) && readExact(file, &marker, sizeof(marker)) &&
+                    marker.magic == kMarkerMagic && marker.version == kMarkerVersion &&
+                    marker.deviceId == deviceId() && marker.crc == markerCrc(marker);
     if (file)
         file.close();
     if (ok && out)
@@ -204,11 +207,12 @@ bool writeInternalMarker(uint32_t generation)
         file.flush();
         file.close();
     }
-    if (!written) {
+    InternalMarker verified = {};
+    if (!written || !readInternalMarker(&verified, kMarkerTmpPath) || verified.generation != generation) {
         FSCom.remove(kMarkerTmpPath);
         return false;
     }
-    FSCom.remove(kMarkerPath);
+    // LittleFS rename replaces atomically. Keep the old marker if it fails.
     if (!FSCom.rename(kMarkerTmpPath, kMarkerPath)) {
         FSCom.remove(kMarkerTmpPath);
         return false;
@@ -228,19 +232,37 @@ void profilePath(char *out, size_t size, const char *name)
     snprintf(out, size, "%s/%s", directory, name);
 }
 
-bool mountSd(bool *owned)
+class SdSession
 {
-    *owned = !sdFontUsesSd();
-    if (!*owned || SD.begin(kSdCs, SPI, kSdHz))
-        return true;
-    SD.end();
-    return false;
-}
+  public:
+    // Construct before begin(): even a partially completed mount can throw.
+    SdSession() : owned(!sdFontUsesSd()) {}
+    ~SdSession()
+    {
+        if (owned)
+            SD.end();
+    }
+    bool begin() { return !owned || SD.begin(kSdCs, SPI, kSdHz); }
+    SdSession(const SdSession &) = delete;
+    SdSession &operator=(const SdSession &) = delete;
 
-void unmountSd(bool owned)
+  private:
+    bool owned;
+};
+
+enum class SdPathState { Missing, Present, Unavailable };
+
+SdPathState sdPathState(const char *path)
 {
-    if (owned)
-        SD.end();
+    // Arduino FS::exists() conflates missing files with I/O/allocation errors.
+    // Use the SD VFS mount's errno to prove absence before initializing a new
+    // profile. Both the font and profile use Arduino SD's default /sd mount.
+    char mountedPath[96];
+    snprintf(mountedPath, sizeof(mountedPath), "/sd%s", path);
+    struct stat info = {};
+    if (stat(mountedPath, &info) == 0)
+        return S_ISREG(info.st_mode) ? SdPathState::Present : SdPathState::Unavailable;
+    return errno == ENOENT ? SdPathState::Missing : SdPathState::Unavailable;
 }
 
 bool ensureProfileDirectory()
@@ -296,11 +318,24 @@ bool collectEntryStates(EntryState *states, uint32_t *sourceCrc)
     return true;
 }
 
-bool validateArchive(fs::FS &filesystem, const char *path, ArchiveHeader *result, bool requireDevice)
+bool validateArchive(fs::FS &filesystem, const char *path, ArchiveHeader *result, bool requireDevice,
+                     bool *unavailable = nullptr)
 {
     auto file = filesystem.open(path, FILE_READ);
     ArchiveHeader header = {};
-    if (!file || !readExact(file, &header, sizeof(header)) || header.magic != kArchiveMagic ||
+    if (!file) {
+        if (unavailable)
+            *unavailable = true;
+        return false;
+    }
+    if (file.size() < sizeof(header))
+        return false;
+    if (!readExact(file, &header, sizeof(header))) {
+        if (unavailable)
+            *unavailable = true;
+        return false;
+    }
+    if (header.magic != kArchiveMagic ||
         header.version != kArchiveVersion || header.entryCount != kSpecCount ||
         header.generation == 0 || (requireDevice && header.deviceId != deviceId()) ||
         header.headerCrc != headerCrc(header) ||
@@ -316,6 +351,8 @@ bool validateArchive(fs::FS &filesystem, const char *path, ArchiveHeader *result
     for (size_t i = 0; i < header.entryCount; i++) {
         WireEntry entry = {};
         if (!readExact(file, &entry, sizeof(entry))) {
+            if (unavailable)
+                *unavailable = true;
             file.close();
             return false;
         }
@@ -333,6 +370,8 @@ bool validateArchive(fs::FS &filesystem, const char *path, ArchiveHeader *result
         while (remaining) {
             const size_t wanted = std::min(sizeof(buffer), static_cast<size_t>(remaining));
             if (!readExact(file, buffer, wanted)) {
+                if (unavailable)
+                    *unavailable = true;
                 file.close();
                 return false;
             }
@@ -359,18 +398,35 @@ bool validateArchive(fs::FS &filesystem, const char *path, ArchiveHeader *result
     return true;
 }
 
-bool newestArchive(char *path, size_t pathSize, ArchiveHeader *header)
+bool newestArchive(char *path, size_t pathSize, ArchiveHeader *header,
+                   bool *unavailable = nullptr, bool *anySlot = nullptr)
 {
     bool found = false;
     ArchiveHeader newest = {};
     char candidate[80];
     for (const char *slot : kSlotNames) {
         profilePath(candidate, sizeof(candidate), slot);
+        const SdPathState state = sdPathState(candidate);
+        if (state == SdPathState::Unavailable) {
+            if (unavailable)
+                *unavailable = true;
+            return false;
+        }
+        if (state == SdPathState::Missing)
+            continue;
+        if (anySlot)
+            *anySlot = true;
         ArchiveHeader current = {};
-        if (validateArchive(SD, candidate, &current, true) && (!found || current.generation > newest.generation)) {
+        bool readFailed = false;
+        if (validateArchive(SD, candidate, &current, true, &readFailed) && (!found || current.generation > newest.generation)) {
             found = true;
             newest = current;
             snprintf(path, pathSize, "%s", candidate);
+        }
+        if (readFailed) {
+            if (unavailable)
+                *unavailable = true;
+            return false;
         }
     }
     if (found && header)
@@ -442,7 +498,12 @@ bool writeArchive(const EntryState *states, uint32_t sourceCrc, uint32_t generat
     for (size_t i = 0; i < kSlotCount; i++) {
         profilePath(candidate, sizeof(candidate), kSlotNames[i]);
         ArchiveHeader current = {};
-        if (!validateArchive(SD, candidate, &current, true)) {
+        const SdPathState state = sdPathState(candidate);
+        bool readFailed = false;
+        const bool valid = state == SdPathState::Present && validateArchive(SD, candidate, &current, true, &readFailed);
+        if (state == SdPathState::Unavailable || readFailed)
+            return false;
+        if (!valid) {
             targetIndex = i;
             oldestGeneration = 0;
             break;
@@ -587,27 +648,22 @@ bool restoreArchive(const char *path, const ArchiveHeader &header)
 RestoreAttempt attemptRestore()
 {
     concurrency::LockGuard guard(spiLock);
-    bool owned = false;
-    if (!mountSd(&owned))
+    SdSession sd;
+    if (!sd.begin())
         return {RestoreResult::Unavailable, 0};
 
     bool anySlot = false;
-    char candidate[80];
-    for (const char *slot : kSlotNames) {
-        profilePath(candidate, sizeof(candidate), slot);
-        anySlot = anySlot || SD.exists(candidate);
-    }
-
+    bool unavailable = false;
     char path[80];
     ArchiveHeader header = {};
-    if (!newestArchive(path, sizeof(path), &header)) {
+    if (!newestArchive(path, sizeof(path), &header, &unavailable, &anySlot)) {
+        if (unavailable)
+            return {RestoreResult::Unavailable, 0};
         const RestoreResult result = anySlot ? RestoreResult::Corrupt
                                              : (writeInternalMarker(0) ? RestoreResult::Initialized : RestoreResult::Failed);
-        unmountSd(owned);
         return {result, 0};
     }
     const bool restored = restoreArchive(path, header);
-    unmountSd(owned);
     return {restored ? RestoreResult::Restored : RestoreResult::Failed, header.generation};
 }
 
@@ -620,26 +676,28 @@ bool syncProfile()
         LOG_WARN("advui: SD profile deferred; internal settings are incomplete");
         return false;
     }
-    bool owned = false;
-    if (!mountSd(&owned))
+    SdSession sd;
+    if (!sd.begin())
         return false;
     char latestPath[80];
     ArchiveHeader latest = {};
-    const bool haveLatest = newestArchive(latestPath, sizeof(latestPath), &latest);
+    bool unavailable = false;
+    const bool haveLatest = newestArchive(latestPath, sizeof(latestPath), &latest, &unavailable);
+    if (unavailable)
+        return false;
     if (haveLatest && latest.sourceCrc == sourceCrc) {
-        unmountSd(owned);
-        return true;
+        InternalMarker marker = {};
+        return (readInternalMarker(&marker) && marker.generation == latest.generation) ||
+               writeInternalMarker(latest.generation);
     }
     if (haveLatest && latest.generation == UINT32_MAX) {
         LOG_ERROR("advui: SD profile generation exhausted; refusing to overwrite the backup");
-        unmountSd(owned);
         return false;
     }
     const uint32_t generation = haveLatest ? latest.generation + 1 : 1;
     bool ok = writeArchive(states, sourceCrc, generation);
     if (ok)
         ok = writeInternalMarker(generation);
-    unmountSd(owned);
     if (ok)
         LOG_INFO("advui: settings profile synchronized to SD generation %u", (unsigned)generation);
     return ok;

@@ -110,8 +110,7 @@ jobs:
             CHANGELOG.md docs/unifont.bin docs/img/demo-story.json \
             docs/img/mockup.json docs/img/device.png docs/m5burner-card.txt \
             requirements/pip.txt requirements/release.txt \
-            scripts/demo_media.py scripts/mkcover.py scripts/mkm5burner.sh \
-            scripts/release_notes.py scripts/release_tag.py \
+            scripts \
             | tar -x -C /tmp/tag-source
           python -m pip install --require-hashes --no-deps \
             -r /tmp/tag-source/requirements/pip.txt
@@ -138,7 +137,24 @@ jobs:
           ' finish-hil/report.json >/dev/null
           jq -e '
             .failures == 0 and .hil_flash_attempted == true and
-            .production_restored == true and .configuration_preserved == true
+            .production_restored == true and .configuration_preserved == true and
+            .filesystem_captured == true and .filesystem_restored == true and
+            .production_wifi_requested == true and .production_wifi_validated == true and
+            .production_wifi.validated == true and .production_wifi.stable_reboot_counter == true and
+            (.production_wifi.soak_seconds | type) == "number" and
+            (.production_wifi.required_soak_seconds | type) == "number" and
+            .production_wifi.soak_seconds >= .production_wifi.required_soak_seconds and
+            .production_wifi.required_soak_seconds >= 120 and
+            .production_wifi.mesh_writes == 0 and .production_wifi.admin_writes == 0 and
+            .production_wifi.chat_writes == 0 and
+            (.production_wifi_transport == null or
+              (.production_wifi_transport.kind == "zoo-ssh" and
+               .production_wifi_transport.started == true and
+               .production_wifi_transport.healthy == true and
+               .production_wifi_transport.closed == true and
+               .production_wifi_transport.validated == true)) and
+            .zoo_hil.required == true and .zoo_hil.validated == true and
+            .zoo_hil.ownership_preserved == true and .zoo_hil.release_acknowledged == true
           ' finish-hil/usb/summary.json >/dev/null
           for suite in smoke-before message-flow visual smoke-after; do
             jq -e '
@@ -165,9 +181,10 @@ jobs:
               "storage/legacy-avs4-reaction-migrates-conservatively"] -
               [.cases[].name] | length) == 0
           ' finish-hil/usb/message-flow/report.json >/dev/null
-          jq -e '
+          expected_frames=$(PYTHONPATH=/tmp/tag-source/scripts python -c 'import hil; print(len(hil.EXPECTED_DEMO_FRAMES))')
+          jq -e --argjson expected_frames "$expected_frames" '
             ([.cases[] | select(.name == "visual/demo-matrix" and
-              .data.frames == 35 and .data.unique == 35 and
+              .data.frames == $expected_frames and .data.unique == $expected_frames and
               .data.post_reboot.radio_tx == "0" and
               .data.post_reboot.backend == "onboard" and
               .data.post_reboot.mode == "chats")] | length) == 1

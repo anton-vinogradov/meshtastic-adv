@@ -1,0 +1,24 @@
+diff --git a/src/mesh/NodeDB.cpp b/src/mesh/NodeDB.cpp
+--- a/src/mesh/NodeDB.cpp
++++ b/src/mesh/NodeDB.cpp
+@@ -1990,9 +1990,9 @@ void NodeDB::set_favorite(bool is_favorite, uint32_t nodeId)
+         lite->is_favorite = is_favorite;
+         sortMeshDB();
+         saveNodeDatabaseToDisk();
++    }
+ #ifdef ADVUI_PROFILE_SYNC
+-        advui::advuiFavouriteChanged(nodeId, is_favorite);
++    advui::advuiFavouriteChanged(nodeId, is_favorite);
+ #endif
+-    }
+ }
+ 
+@@ -2183,5 +2183,8 @@ meshtastic_NodeInfoLite *NodeDB::getOrCreateMeshNode(NodeNum n)
+         // everything is missing except the nodenum
+         memset(lite, 0, sizeof(*lite));
+         lite->num = n;
++#ifdef ADVUI_PROFILE_SYNC
++        lite->is_favorite = advui::advuiRestoreFavourite(n, false);
++#endif
+         LOG_INFO("Adding node to database with %i nodes and %u bytes free!", numMeshNodes, memGet.getFreeHeap());
+     }

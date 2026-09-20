@@ -52,7 +52,7 @@ Every `v*` tag is held until the exact source passes the hardware-free tests,
 both firmware builds and size budgets, then a real Cardputer ADV on a trusted
 runner. The physical gate is radio-silent and identity-bound; it replays ordinary
 serialized `FromRadio` traffic through the production decoder, drives the real UI,
-overflows and reloads persistent history, checks 35 framebuffer captures, reboots,
+overflows and reloads persistent history, checks 37 framebuffer captures, reboots,
 and finally restores and verifies the exact application bytes users will receive.
 That restored production image must then survive repeated complete, read-only WiFi
 config/NodeDB downloads for at least two minutes without a reconnect or reboot.
@@ -95,6 +95,8 @@ Bluetooth, WiFi and MQTT settings, plus ADV radio mode, UI preferences and up to
 the full 150-node favourite set. It deliberately excludes messages, history,
 the learned node cache and transient crash guards. One card can hold profiles
 for several Cardputers because every directory is bound to the hardware ID.
+Restored favourite IDs also mark matching nodes in the onboard NodeDB, including
+nodes discovered later; phone favourite changes update the same portable set.
 
 > **Security:** the profile contains network, channel and identity secrets and is
 > not encrypted. Treat the SD card like a private-key backup; do not share its
@@ -112,6 +114,7 @@ Everything is keyboard-driven. The footer of each screen shows the live hints.
 | Chats (home) | **Tab** | switch to the full node list (and back) |
 | Conversation | *type* · **Enter** | write a reply · send |
 | Conversation | **Fn+L** | toggle Cyrillic (translit) input |
+| Lists / conversation / editor | **Fn+H** | complete Cyrillic key map; Esc returns without changing the draft |
 | Conversation | **Tab** | emoji palette |
 | Conversation | **↑ / ↓** | scroll through history |
 | Conversation | **ESC** | back |
@@ -180,6 +183,9 @@ Run syntax and unit tests, sanitizers, both firmware builds and their flash/DRAM
 ```sh
 python3 scripts/verify.py
 ```
+
+Host checks require a C++17 compiler with AddressSanitizer/UBSan and `jq`;
+release-workflow regressions execute the actual evidence filters.
 
 Hardware remains an explicit opt-in; commands, fixture safeguards and the coverage matrix live in [hil/](hil/README.md). The private RF runner is a separate integration diagnostic, not a re-test of the embedded Meshtastic routing engine. When moving back from a 2.8 development build, ADV discards only its incompatible, rebuildable node cache; node identity, channels and radio settings remain untouched. Take a verified configuration backup before any physical flash anyway.
 

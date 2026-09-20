@@ -15,4 +15,13 @@ trap 'rm -rf "$build_dir"' EXIT
   -o "$build_dir/test_hardening"
 
 "$build_dir/test_hardening"
+
+"${CXX:-c++}" \
+  -std=c++17 -Wall -Wextra -Wpedantic -Werror \
+  -fsanitize=address,undefined -fno-omit-frame-pointer \
+  -I"$repo_dir/tests/native/profile_stubs" \
+  "$repo_dir/tests/native/test_profile.cpp" \
+  -o "$build_dir/test_profile"
+"$build_dir/test_profile"
+"${PYTHON:-python3}" "$repo_dir/tests/native/test_ui.py"
 echo "host hardening tests: OK"

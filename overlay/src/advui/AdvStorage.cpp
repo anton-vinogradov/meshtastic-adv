@@ -72,7 +72,9 @@ bool parseBleAddress(const char *address, uint8_t octets[6])
 {
     if (!address)
         return false;
-    if (strlen(address) != 17)
+    // Persisted ADR records have an 18-byte field, which may have lost its
+    // terminator. Never search beyond that field, even when validating it.
+    if (strnlen(address, 18) != 17)
         return false;
     uint8_t parsed[6];
     for (size_t i = 0; i < sizeof(parsed); i++) {

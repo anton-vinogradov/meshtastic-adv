@@ -508,6 +508,23 @@ class HilRunnerTests(unittest.TestCase):
             self.assertIn(f'"{field}"', persist)
         self.assertIn('"alert_fav": "1"', runner)
 
+    def test_favourite_seed_is_independent_of_a_previously_opened_dm(self):
+        session = hil.HilSession.__new__(hil.HilSession)
+        session.exchange = mock.Mock(return_value="@@FSEED v=1 ok=1 target=00fa7702 selected=00fa7702")
+        session.wait_state = mock.Mock(side_effect=lambda expected: hil.require_fields(
+            {"mode": "nodes", "selected": "000beef1"}, expected
+        ))
+        self.assertEqual(session.seed_favourite_nodes()["selected"], "00fa7702")
+        session.wait_state.assert_called_once_with({"mode": "nodes"})
+
+    def test_favourite_seed_still_rejects_the_wrong_list_cursor(self):
+        session = hil.HilSession.__new__(hil.HilSession)
+        session.exchange = mock.Mock(return_value="@@FSEED v=1 ok=1 target=00fa7702 selected=00fa7701")
+        session.wait_state = mock.Mock()
+        with self.assertRaises(hil.HilError):
+            session.seed_favourite_nodes()
+        session.wait_state.assert_not_called()
+
     def test_name_editor_enforces_wire_byte_limits_before_owner_broadcast(self):
         source = (ROOT / "overlay/src/advui/AdvUI.cpp").read_text()
         editor = source.split("if (mode == MODE_SETNAME)", 1)[1].split("if (mode == MODE_BTPIN)", 1)[0]
@@ -516,6 +533,28 @@ class HilRunnerTests(unittest.TestCase):
         self.assertIn("utf8CopyValid(owner.long_name", apply_name)
         self.assertIn("utf8CopyValid(owner.short_name", apply_name)
         self.assertIn("utf8CopyValid(ch.settings.name", apply_name)
+
+    def test_release_hil_covers_cyrillic_disambiguation_and_buffer_limits(self):
+        runner = (ROOT / "scripts/hil.py").read_text()
+        case = runner.split("def cyrillic_input_case():", 1)[1].split("def incoming_case():", 1)[0]
+        self.assertIn('ui/cyrillic-sch-shch-editing-and-byte-limit', case)
+        self.assertIn('Schyot sch Shchuka shch SCH SHCH', case)
+        self.assertIn('Wuka w Ashhabad', case)
+        self.assertIn('"text_fnv": fnv1a32(encoded)', case)
+        self.assertIn('"a" * 98 + "shch.sh"', case)
+        self.assertIn('"radio_tx": "0"', case)
+        self.assertIn('session.frame("inputhelp")', case)
+        self.assertIn('finally:', case)
+        self.assertNotIn('sendText', case)
+
+    def test_cyrillic_help_has_keyboard_and_settings_entry_points(self):
+        keyboard = (ROOT / "overlay/src/advui/AdvKeyboard.cpp").read_text()
+        source = (ROOT / "overlay/src/advui/AdvUI.cpp").read_text()
+        self.assertIn("{'h', 'H', AdvKeyboard::kInputHelp}", keyboard)
+        self.assertIn('"2nd screen", "RU keys"', source)
+        self.assertIn('else if (mode == MODE_INPUTHELP)\n        drawInputHelp();', source)
+        runner = (ROOT / "scripts/hil.py").read_text()
+        self.assertIn('ui/input-help/settings-pages-back', runner)
 
     def test_send_failures_preserve_compose_and_consume_queue_status(self):
         source = (ROOT / "overlay/src/advui/AdvUI.cpp").read_text()
@@ -619,7 +658,8 @@ class HilRunnerTests(unittest.TestCase):
             [f"a{index:02d}" for index in range(1, 20)],
         )
         self.assertEqual(hil.EXPECTED_DEMO_FRAMES[-19:], story_names)
-        self.assertEqual(len(hil.EXPECTED_DEMO_FRAMES), 35)
+        self.assertEqual(hil.EXPECTED_DEMO_FRAMES[-21:-19], ["ru1", "ru2"])
+        self.assertEqual(len(hil.EXPECTED_DEMO_FRAMES), 37)
 
     def test_visual_retries_one_transport_loss_after_a_proven_reboot(self):
         capture_one = mock.MagicMock()
@@ -1005,6 +1045,26 @@ class HilRunnerTests(unittest.TestCase):
         with self.assertRaises(hil.HilError):
             hil.make_text_frame(0x1_0000_0000, 1, 1, "bad")
 
+    def test_companion_owner_fixture_preserves_optional_flags(self):
+        self.assertEqual(
+            hil.make_companion_node_info(7, licensed=True, unmessagable=True).hex(),
+            "22080807120430014801",
+        )
+        self.assertEqual(
+            hil.make_companion_node_info(7, licensed=False, unmessagable=False).hex(),
+            "22080807120430004800",
+        )
+
+    def test_release_message_flow_covers_delete_reordering_and_owner_snapshot(self):
+        source = (ROOT / "scripts/hil.py").read_text()
+        self.assertIn("ui/delete-confirmation-bound-across-incoming-message", source)
+        case = source.split("def delete_confirmation_identity_case():", 1)[1].split("report.check(", 1)[0]
+        self.assertIn("for is_channel in (False, True)", case)
+        self.assertLess(case.index('session.key("\\x08"'), case.index('"must survive"'))
+        self.assertLess(case.index('"must survive"'), case.index('session.key("~"'))
+        self.assertIn('"owner_present": "0"', source)
+        self.assertIn('"owner_licensed": "1"', source)
+
     def test_fnv_matches_firmware_vector(self):
         self.assertEqual(hil.fnv1a32(b"A?B"), "5e7e7f91")
 
@@ -1187,9 +1247,12 @@ class HilRunnerTests(unittest.TestCase):
         waits = []
 
         class FakeTCPInterface:
-            def __init__(self, *, hostname, portNumber, noNodes, timeout):
+            def __init__(self, *, hostname, portNumber, noNodes, timeout, connectNow):
+                assert connectNow is False
                 self.hostname = hostname
                 self.portNumber = portNumber
+
+            def connect(self):
                 self._waitConnected()
 
             def _waitConnected(self, timeout=30):  # noqa: N802 - upstream spelling
@@ -1218,6 +1281,26 @@ class HilRunnerTests(unittest.TestCase):
             ("192.0.2.20", 4403), timeout=hil.PRODUCTION_WIFI_CONNECT_TIMEOUT_SECONDS
         )
         connected.settimeout.assert_called_once_with(None)
+
+    def test_production_wifi_interface_closes_failed_initial_connection(self):
+        instances = []
+
+        class FakeTCPInterface:
+            def __init__(self, **kwargs):
+                self.options = kwargs
+                self.close = mock.Mock()
+                instances.append(self)
+
+            def connect(self):
+                raise OSError("initial stream failed")
+
+        tcp_module = ModuleType("meshtastic.tcp_interface")
+        tcp_module.TCPInterface = FakeTCPInterface
+        with mock.patch.dict(sys.modules, {"meshtastic.tcp_interface": tcp_module}):
+            with self.assertRaisesRegex(OSError, "initial stream failed"):
+                hil.open_production_wifi_interface("192.0.2.20", 4403, 90)
+        self.assertFalse(instances[0].options["connectNow"])
+        instances[0].close.assert_called_once()
 
     def test_display_power_cycles_gate_retained_and_minimum_heap(self):
         samples = [
@@ -1280,6 +1363,72 @@ class HilRunnerTests(unittest.TestCase):
         self.assertTrue(evidence["stable_reboot_counter"])
         self.assertEqual(evidence["mesh_writes"], 0)
         self.assertGreaterEqual(dump.call_count - 2, hil.PRODUCTION_WIFI_MIN_SOAK_DUMPS)
+
+    def test_production_wifi_soak_accepts_bounded_long_duration(self):
+        now = [0.0]
+        snapshot = hil.ProductionWifiSnapshot(reboot_count=7, node_count=40)
+        with mock.patch.object(hil, "production_wifi_dump", return_value=snapshot) as dump:
+            evidence = hil.production_wifi_soak(
+                self.production_fixture(),
+                minimum_seconds=14_400,
+                monotonic=lambda: now[0],
+                sleep=lambda seconds: now.__setitem__(0, now[0] + seconds),
+            )
+
+        self.assertGreaterEqual(evidence["soak_seconds"], 14_400)
+        self.assertEqual(evidence["required_soak_seconds"], 14_400)
+        self.assertGreater(dump.call_count, hil.PRODUCTION_WIFI_MAX_SOAK_DUMPS)
+
+    def test_production_wifi_soak_retains_last_completed_snapshot_on_failure(self):
+        now = [0.0]
+        progress = {}
+        snapshot = hil.ProductionWifiSnapshot(reboot_count=7, node_count=40)
+        with (
+            mock.patch.object(hil, "production_wifi_dump", side_effect=[
+                snapshot, snapshot, hil.ProductionWifiConnectionError("connection lost")
+            ]) as dump,
+            mock.patch("builtins.print"),
+        ):
+            with self.assertRaises(hil.ProductionWifiConnectionError):
+                hil.production_wifi_soak(
+                    self.production_fixture(), progress=progress,
+                    monotonic=lambda: now[0],
+                    sleep=lambda seconds: now.__setitem__(0, now[0] + seconds),
+                )
+        self.assertEqual(dump.call_count, 3)
+        self.assertFalse(progress["validated"])
+        self.assertEqual(progress["config_dump_cycles"], 2)
+        self.assertEqual(progress["baseline_reboot_count"], 7)
+        self.assertEqual(progress["last_reboot_count"], 7)
+        self.assertEqual(progress["last_completed_soak_seconds"], 3)
+        self.assertNotIn("host", progress)
+
+    def test_production_wifi_soak_marks_progress_validated_only_after_final_dump(self):
+        now = [0.0]
+        progress = {}
+        snapshot = hil.ProductionWifiSnapshot(reboot_count=7, node_count=40)
+        with (
+            mock.patch.object(hil, "production_wifi_dump", return_value=snapshot),
+            mock.patch("builtins.print"),
+        ):
+            evidence = hil.production_wifi_soak(
+                self.production_fixture(), progress=progress,
+                monotonic=lambda: now[0],
+                sleep=lambda seconds: now.__setitem__(0, now[0] + seconds),
+            )
+        self.assertTrue(progress["validated"])
+        self.assertEqual(progress["phase"], "completed")
+        self.assertEqual(progress["config_dump_cycles"], evidence["config_dump_cycles"])
+        self.assertEqual(progress["last_completed_soak_seconds"], evidence["soak_seconds"])
+
+    def test_production_wifi_soak_rejects_unbounded_duration(self):
+        for duration in (119, float("nan"), 86_401):
+            with self.subTest(duration=duration):
+                with self.assertRaisesRegex(hil.HilError, "soak duration"):
+                    hil.production_wifi_soak(
+                        self.production_fixture(),
+                        minimum_seconds=duration,
+                    )
 
     def test_production_wifi_soak_uses_persisted_fixture_minimum_not_volatile_pre_hil_count(self):
         now = [0.0]
@@ -1502,6 +1651,7 @@ class HilRunnerTests(unittest.TestCase):
         def soak(_fixture, **kwargs):
             events.append("production-soak")
             self.assertNotIn("expected_before_hil", kwargs)
+            self.assertEqual(kwargs["minimum_seconds"], 14_400)
             return {
                 "validated": True,
                 "config_dump_cycles": 10,
@@ -1537,6 +1687,7 @@ class HilRunnerTests(unittest.TestCase):
                         self.production_fixture(), artifacts, timeout=1, skip_build=True,
                         release_image=Path("/exact.bin"), factory_image=Path("/exact.factory.bin"),
                         production_wifi=True,
+                        production_wifi_soak_seconds=14_400,
                     ),
                     0,
                 )
@@ -1643,6 +1794,8 @@ class HilRunnerTests(unittest.TestCase):
         self.assertTrue(summary["configuration_preserved"])
         self.assertFalse(summary["production_wifi_validated"])
         self.assertEqual(summary["production_wifi_failure_type"], "UnexpectedReboot")
+        self.assertEqual(summary["production_wifi_progress"]["phase"], "failed")
+        self.assertEqual(summary["production_wifi_progress"]["failure_type"], "UnexpectedReboot")
 
     def test_full_run_rejects_production_soak_without_exact_release_before_flash(self):
         with mock.patch.object(hil, "flash") as flash:
@@ -1650,6 +1803,15 @@ class HilRunnerTests(unittest.TestCase):
                 self.local_full_run(
                     self.production_fixture(), Path("/tmp/artifacts"), timeout=1,
                     skip_build=True, production_wifi=True,
+                )
+        flash.assert_not_called()
+
+    def test_full_run_rejects_custom_soak_duration_without_production_wifi(self):
+        with mock.patch.object(hil, "flash") as flash:
+            with self.assertRaisesRegex(hil.HilError, "requires --production-wifi"):
+                self.local_full_run(
+                    self.production_fixture(), Path("/tmp/artifacts"), timeout=1,
+                    skip_build=True, production_wifi_soak_seconds=14_400,
                 )
         flash.assert_not_called()
 

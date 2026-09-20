@@ -1,5 +1,6 @@
 #include "AdvNodeCount.h"
 #include "AdvOrder.h"
+#include "AdvPendingSend.h"
 #include "AdvStorage.h"
 #include "AdvUtf8.h"
 
@@ -7,6 +8,7 @@
 #include <cstddef>
 #include <cstring>
 #include <limits>
+#include <initializer_list>
 
 using namespace advui;
 
@@ -105,6 +107,8 @@ int main()
     assert(!validBleAddress("02-11-22-33-44-55"));
     assert(!validBleAddress("02:11:22:33:44:5g"));
     assert(!validBleAddress("02:11:22:33:44:55:66"));
+    const char unterminatedAddress[18] = {'0','2',':','1','1',':','2','2',':','3','3',':','4','4',':','5','5','x'};
+    assert(!validBleAddress(unterminatedAddress)); // ASan: never read byte 18
     uint8_t bleAddress[6] = {};
     assert(parseBleAddress("02:11:aB:33:44:fF", bleAddress));
     const uint8_t expectedBleAddress[] = {0x02, 0x11, 0xab, 0x33, 0x44, 0xff};
@@ -167,5 +171,40 @@ int main()
     assert(have100 && have200 && have300);
     considerOldestSlot(nullptr, 3, &oldestCount, 0, 0);
     considerOldestSlot(oldest, 0, &oldestCount, 0, 0);
+    NodeOrder near = {10, 100, 0, false, false};
+    NodeOrder recent = {20, 200, 2, false, true};
+    assert(nodeOrderLess(recent, "Zulu", near, "Aaron", 0));
+    assert(nodeOrderLess(recent, "Zulu", near, "Aaron", 1));
+    assert(nodeOrderLess(near, "Aaron", recent, "Zulu", 2));
+    assert(nodeOrderLess(near, "Aaron", recent, "Zulu", 3));
+    near.unread = true;
+    for (int mode = 0; mode < 4; mode++)
+        assert(nodeOrderLess(near, "Aaron", recent, "Zulu", mode));
+    int best[2] = {}, count = 0;
+    for (int value : {30, 20, 40, 10})
+        insertSortedBounded(best, count, 2, value, [](int a, int b) { return a < b; });
+    assert(count == 2 && best[0] == 10 && best[1] == 20);
+
+    PendingSends<2> pending = {};
+    uint32_t id = 0;
+    uint8_t error = 0;
+    assert(pending.add(10, 100, 20));
+    assert(!pending.add(10, 100, 20));
+    assert(pending.add(20, 100, 20));
+    assert(!pending.add(30, 100, 20)); // bounded admission
+    pending.fail(10, 4); // exact GATT failure
+    assert(pending.popFailure(101, 8, &id, &error) && id == 10 && error == 4);
+    assert(!pending.popFailure(101, 8, &id, &error));
+    pending.forget(20); // a delivered packet cannot expire later
+    assert(!pending.popFailure(130, 8, &id, &error));
+    assert(pending.add(30, 0xfffffff0U, 20));
+    assert(!pending.popFailure(3, 8, &id, &error));
+    assert(pending.popFailure(4, 8, &id, &error) && id == 30 && error == 8);
+    assert(pending.add(40, 100, 20));
+    assert(pending.add(50, 100, 20));
+    pending.fail(0, 4); // disconnect preserves both terminal results
+    assert(pending.popFailure(101, 8, &id, &error) && error == 4);
+    assert(pending.popFailure(101, 8, &id, &error) && error == 4);
+    assert(!pending.popFailure(130, 8, &id, &error));
     return 0;
 }

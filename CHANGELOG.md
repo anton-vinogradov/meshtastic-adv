@@ -5,7 +5,68 @@ release notes remain available on the [GitHub Releases page](https://github.com/
 
 ## [Unreleased]
 
-No user-visible changes are pending after 1.1.0.
+## [1.1.1] - 2026-09-20
+
+### Fixed
+
+- Cyrillic input distinguishes `sch` → сч from `w` / `shch` → щ, so `Schyot`
+  produces «Счёт» (#109). Use one-key `w` for щ instead of the former `sch` shortcut;
+  `shh` remains шх so `Ashhabad` still produces «Ашхабад».
+  Digraphs still finish at the UTF-8 byte limit, rejected keys cannot overwrite
+  earlier text, and inserting emoji clears the pending transliteration key.
+- Fn+H opens a complete two-page Cyrillic key map and returns to the unchanged
+  draft, including pending combinations and quotes. It is also available at
+  Settings → Device → RU keys; the compose badge hints at FnH.
+- Chat deletion stays bound to the selected conversation when a new message
+  reorders the list between Del and Enter. Leaving the confirmation cancels it.
+- SD profile discovery distinguishes missing files from I/O errors, so a
+  temporarily unreadable backup cannot be replaced by clean-install defaults.
+  Profile transactions also release their SD mount after allocation failures.
+- The internal profile marker is replaced without first deleting the old one;
+  retries repair a missing marker even when the SD profile is already current.
+- Damaged radio-mode records with an unterminated BLE address are rejected
+  without reading beyond the saved field.
+- Restored favourite IDs reconcile into the onboard node database, including
+  later discoveries. A phone unstar updates the portable set even if the
+  engine's existing flag was already false.
+- Companion owner-name edits preserve the full owner snapshot, including
+  licensed and unmessagable flags. Editing waits until that snapshot arrives.
+- Companion messages report failed GATT writes, disconnects and a ten-minute
+  missing-ACK timeout instead of remaining in the sending state indefinitely.
+  Outstanding sends have a fixed eight-entry capacity and never grow the heap.
+- The node picker includes the full 150-node onboard database, sorts before
+  truncating, and applies Smart / Last heard / Name / Hops consistently in
+  companion mode, including the selected long/short name style.
+- Empty WiFi/MQTT text fields are saved, allowing credentials to be cleared.
+- A completely pinned NodeDB rejects a new identity safely when no slot can be
+  evicted, instead of advancing beyond its allocated storage and rebooting.
+- Long diagnostic log lines are truncated before checking their final byte,
+  preventing an out-of-bounds read (and possible write) in the PhoneAPI formatter.
+
+### Release engineering
+
+- HIL can carry PhoneAPI over an owned SSH tunnel through the Zoo host, without
+  administrator access, Mac route changes or server deployment. Tunnel loss
+  fails the run; USB safety recovery and the original device identity remain enforced.
+- Release HIL now requires an identity-pinned, renewable meshtastic-zoo TCP
+  window. Lost ownership or an unacknowledged return fails the gate without
+  preventing USB safety recovery; no lease secrets enter public evidence.
+- Release host checks now run the production SD transaction code with injected
+  filesystem failures and UI behavior regressions under AddressSanitizer/UBSan,
+  alongside bounded-send, timeout rollover and address-parser checks.
+- Firmware CI exercises the actual patched log formatter at empty, exact-limit
+  and overlong inputs under AddressSanitizer/UBSan.
+- Finishing a failed publication derives the visual HIL matrix size from
+  the exact release tag, including the new RU key-map screens, and explicitly
+  verifies filesystem recovery, WiFi completion, reboot stability and zero writes.
+- The release HIL suite adds deletion-during-arrival scenarios for DMs and
+  channels and verifies companion owner flags and snapshot invalidation.
+- Failed initial production TCP streams explicitly close their host-side
+  connection. Long soaks retain their last completed snapshot on failure and
+  emit bounded progress logs without weakening the no-reconnect release gate.
+- Favourite-row HIL assertions no longer depend on which DM was previously
+  opened. Privacy-safe failure evidence redacts XML values before serialization,
+  so placeholder text cannot break JUnit uploads precisely when a test fails.
 
 ## [1.1.0] - 2026-08-30
 
@@ -424,7 +485,8 @@ The 1.0 release line delivered the following product and release-engineering sco
   cannot reuse stale output, and prereleases cannot enter stable distribution
   channels.
 
-[Unreleased]: https://github.com/anton-vinogradov/meshtastic-adv/compare/v1.1.0...HEAD
+[Unreleased]: https://github.com/anton-vinogradov/meshtastic-adv/compare/v1.1.1...HEAD
+[1.1.1]: https://github.com/anton-vinogradov/meshtastic-adv/compare/v1.1.0...v1.1.1
 [1.1.0]: https://github.com/anton-vinogradov/meshtastic-adv/compare/v1.0.19...v1.1.0
 [1.0.19]: https://github.com/anton-vinogradov/meshtastic-adv/compare/v1.0.18...v1.0.19
 [1.0.18]: https://github.com/anton-vinogradov/meshtastic-adv/compare/v1.0.17...v1.0.18

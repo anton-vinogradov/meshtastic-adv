@@ -39,6 +39,19 @@ def args(**overrides):
 
 
 class VerifyRunnerTests(unittest.TestCase):
+    def test_zoo_and_four_hour_duration_are_forwarded_and_validated(self):
+        selected = args(usb=True, skip_build=True, production_wifi=True, require_zoo_hil=True,
+                        production_wifi_soak_seconds=14400, release_image=Path("/app.bin"),
+                        factory_image=Path("/factory.bin"))
+        verify.validate_args(selected, verify.parser())
+        command = next(s.command for s in verify.build_plan(selected, Path("/tmp/evidence")) if s.hardware)
+        self.assertIn("--require-zoo-hil", command)
+        self.assertEqual(command[command.index("--production-wifi-soak-seconds") + 1], "14400")
+        for invalid in (args(require_zoo_hil=True), args(production_wifi_soak_seconds=14400),
+                        args(production_wifi_soak_seconds=float("nan")), args(production_wifi_soak_seconds=119)):
+            with self.assertRaises(SystemExit):
+                verify.validate_args(invalid, verify.parser())
+
     def test_default_plan_is_complete_and_has_no_hardware(self):
         plan = verify.build_plan(args(), Path("/tmp/evidence"))
         names = [stage.name for stage in plan]

@@ -124,6 +124,7 @@ const char *nodeName(const meshtastic_NodeInfoLite *n)
 constexpr int kMaxFavNodes = 150;
 uint32_t g_favNodes[kMaxFavNodes];
 uint8_t g_favNodeCount = 0;
+bool g_favouritesReady = false;
 
 bool favNodeLocal(uint32_t num)
 {
@@ -136,6 +137,8 @@ bool favNodeLocal(uint32_t num)
 // Returns true when the set actually changed, so callers know whether to persist.
 bool setFavNodeLocal(uint32_t num, bool on)
 {
+    if (!num)
+        return false;
     for (uint8_t i = 0; i < g_favNodeCount; i++) {
         if (g_favNodes[i] != num)
             continue;
@@ -152,7 +155,7 @@ bool setFavNodeLocal(uint32_t num, bool on)
 
 bool isFav(const meshtastic_NodeInfoLite *n)
 {
-    return nodeIsFavorite(n) || (g_favNodeCount && favNodeLocal(n->num));
+    return n && (g_favouritesReady ? favNodeLocal(n->num) : nodeIsFavorite(n) || favNodeLocal(n->num));
 }
 
 // Case-insensitive substring match; empty needle matches everything.
@@ -236,13 +239,13 @@ const char *errName(uint8_t e, bool broadcast)
 constexpr int kMaxMsgs = 32; // shared across all conversations; DMs are protected by the
                              // channel-first eviction (addMsg), not by size, so this stays small
                              // to keep the heap margin — a connected phone + BLE runs it thin
-constexpr int kNumSettings = 21; // the flat item table: Name..Channel, Role..Rebroadcast, UTC, WiFi, MQTT, Screen, Radio, Font, Clock, GPS, Sort, Names, 2nd screen
+constexpr int kNumSettings = 22; // flat settings table, ending with 2nd screen and RU keys
 
 // The Settings menu is two-level: the top lists sections (plus WiFi/MQTT/Radio
 // as direct entries); a section lists indices into the flat item table.
 const uint8_t kSecNode[] = {0, 1};                    // Name, Short
 const uint8_t kSecLora[] = {2, 3, 4, 5, 6, 7, 8, 9};  // Region..Rebroadcast
-const uint8_t kSecDevice[] = {10, 16, 18, 19, 13, 20, 17, 15}; // UTC, Clock, Sort, Names, Screen, 2nd screen, GPS, Font (read-only)
+const uint8_t kSecDevice[] = {10, 16, 18, 19, 13, 20, 17, 15, 21}; // includes read-only Font and RU keys
 
 constexpr int kTopCount = 7;                          // Node, LoRa, WiFi, MQTT, Device, Radio, About
 Msg g_msgs[kMaxMsgs];
@@ -1665,47 +1668,17 @@ void seenReconcile()
     g_seenPendNext = 0;
 }
 
-// Default node ordering: favourites first, then nodes we have a conversation with,
-// then everyone else by hop distance (nearest first; unknown hops last). Ties are
-// broken by most-recently-heard.
+// Every mode pins unread nodes first. Smart then uses favourites, hops and
+// freshness; explicit modes use the same rules in local and companion mode.
 bool nodeLess(uint16_t a, uint16_t b)
 {
     const meshtastic_NodeInfoLite *na = nodeDB->getMeshNodeByIndex(a);
     const meshtastic_NodeInfoLite *nb = nodeDB->getMeshNodeByIndex(b);
-    bool ua = hasUnreadFrom(na->num), ub = hasUnreadFrom(nb->num);
-    if (ua != ub) // unread pinned on top in every mode — it's what the list is for
-        return ua;
-    int ha = na->has_hops_away ? na->hops_away : 255;
-    int hb = nb->has_hops_away ? nb->hops_away : 255;
-    switch (g_nodeSort) {
-    case 1: // freshest first: who's alive on the mesh right now
-        if (na->last_heard != nb->last_heard)
-            return na->last_heard > nb->last_heard;
-        break;
-    case 2: { // alphabetical, by the same name the row shows
-        int c = strcasecmp(nodeName(na), nodeName(nb));
-        if (c != 0)
-            return c < 0;
-        break;
-    }
-    case 3: // nearest first, unknown distance last
-        if (ha != hb)
-            return ha < hb;
-        if (na->last_heard != nb->last_heard)
-            return na->last_heard > nb->last_heard;
-        break;
-    default: { // smart: favourites, then nearest, then freshest
-        bool fa = isFav(na), fb = isFav(nb);
-        if (fa != fb)
-            return fa;
-        if (ha != hb)
-            return ha < hb;
-        if (na->last_heard != nb->last_heard)
-            return na->last_heard > nb->last_heard;
-        break;
-    }
-    }
-    return na->num < nb->num; // stable total order either way
+    const NodeOrder ka = {na->num, na->last_heard, static_cast<uint8_t>(na->has_hops_away ? na->hops_away : 255),
+                          hasUnreadFrom(na->num), g_nodeSort == 0 && isFav(na)};
+    const NodeOrder kb = {nb->num, nb->last_heard, static_cast<uint8_t>(nb->has_hops_away ? nb->hops_away : 255),
+                          hasUnreadFrom(nb->num), g_nodeSort == 0 && isFav(nb)};
+    return nodeOrderLess(ka, nodeName(na), kb, nodeName(nb), g_nodeSort);
 }
 
 // Trim s in place until it fits within budget px in the current font.
@@ -1977,10 +1950,25 @@ void migrateDbFavourites()
     bool changed = false;
     const size_t count = nodeDB->getNumMeshNodes();
     for (size_t i = 0; i < count; i++) {
-        const meshtastic_NodeInfoLite *node = nodeDB->getMeshNodeByIndex(i);
-        if (nodeIsFavorite(node))
+        meshtastic_NodeInfoLite *node = nodeDB->getMeshNodeByIndex(i);
+        if (!node)
+            continue;
+        if (!g_uiCfgPortable && nodeIsFavorite(node))
             changed = setFavNodeLocal(node->num, true) || changed;
     }
+    g_favouritesReady = true;
+    bool dbChanged = false;
+    for (size_t i = 0; i < count; i++) {
+        meshtastic_NodeInfoLite *node = nodeDB->getMeshNodeByIndex(i);
+        if (node && node->is_favorite != favNodeLocal(node->num)) {
+            node->is_favorite = favNodeLocal(node->num);
+            dbChanged = true;
+        }
+    }
+    // Batch the boot reconciliation into one save; the engine's periodic sort
+    // and the UI's own comparator both use these flags from now on.
+    if (dbChanged)
+        nodeDB->saveToDisk(SEGMENT_NODEDATABASE);
     if (changed)
         persistUiCfg();
 }
@@ -2515,7 +2503,7 @@ void msgTimePrefix(uint32_t rxTime, int32_t tzOff, char *out, int cap)
 }
 
 // --- Transliterated Cyrillic input (Fn+L) --------------------------------------
-// Phonetic Latin->Cyrillic with the usual digraphs (sh ш, zh ж, ch ч, sch щ,
+// Phonetic Latin->Cyrillic with the usual digraphs (sh ш, zh ж, ch ч, w/shch щ,
 // ya/yu/yo/ye) and singles j->й, x->ъ, '->ь. A letter is emitted immediately and morphed
 // in place when it turns out to be the head of a digraph.
 uint16_t translitSingle(char l)
@@ -2527,7 +2515,7 @@ uint16_t translitSingle(char l)
     case 'n': return 0x43D; case 'o': return 0x43E; case 'p': return 0x43F; case 'r': return 0x440;
     case 's': return 0x441; case 't': return 0x442; case 'u': return 0x443; case 'f': return 0x444;
     case 'h': return 0x445; case 'c': return 0x446; case 'y': return 0x44B;
-    case 'x': return 0x44A; case 'q': return 0x44F;
+    case 'x': return 0x44A; case 'q': return 0x44F; case 'w': return 0x449;
     default: return 0;
     }
 }
@@ -2555,32 +2543,40 @@ uint16_t translitCase(uint16_t cp, bool upper)
     if (cp >= 0x430 && cp <= 0x44F) return cp - 0x20;
     return cp;
 }
-void appendCp(char *buf, uint8_t &len, size_t cap, uint16_t cp)
+bool appendCp(char *buf, uint8_t &len, size_t cap, uint16_t cp)
 {
-    if ((size_t)len + 2 >= cap) return;
+    if ((size_t)len + 2 >= cap) return false;
     buf[len++] = 0xC0 | (cp >> 6);
     buf[len++] = 0x80 | (cp & 0x3F);
     buf[len] = 0;
+    return true;
 }
+constexpr char kTranslitHelp[2][18][10] = {
+    {"a:а", "b:б", "v:в", "g:г", "d:д", "e:е", "yo:ё", "zh:ж", "z:з",
+     "i:и", "j:й", "k:к", "l:л", "m:м", "n:н", "o:о", "p:п", "r:р"},
+    {"s:с", "t:т", "u:у", "f:ф", "h:х", "c:ц", "ch:ч", "sh:ш", "w:щ",
+     "x:ъ", "y:ы", "':ь", "ye:э", "yu:ю", "ya:я", "q:я", "shch:щ", "sch:сч"},
+};
 // Feeds one typed key through the translit layer; may morph the previous letter.
 void translitFeed(char *buf, uint8_t &len, size_t cap, char raw, char &pending)
 {
     if (pending) {
+        const bool upper = isUp(pending);
         uint16_t cp = translitDigraph(lowerc(pending), lowerc(raw));
-        if (cp) {
-            if (len >= 2) { // drop the single already emitted, replace with the digraph
-                len -= 2;
-                buf[len] = 0;
-            }
-            uint16_t out = translitCase(cp, isUp(pending));
-            // sch -> щ: fold a preceding с/С and this ч (from c+h) into щ/Щ
+        const uint16_t previous = translitCase(translitSingle(lowerc(pending)), upper);
+        if (cp && len >= 2 && (uint8_t)buf[len - 2] == (0xC0 | (previous >> 6)) &&
+            (uint8_t)buf[len - 1] == (0x80 | (previous & 0x3F))) {
+            len -= 2; // replace only the single emitted by this pending key
+            buf[len] = 0;
+            uint16_t out = translitCase(cp, upper);
+            // shch -> щ; leave sch as сч so words like счёт stay typeable.
             if (cp == 0x447 && len >= 2) {
                 uint8_t b0 = (uint8_t)buf[len - 2], b1 = (uint8_t)buf[len - 1];
-                if (b0 == 0xD1 && b1 == 0x81) { // с
+                if (b0 == 0xD1 && b1 == 0x88) { // ш
                     len -= 2;
                     buf[len] = 0;
                     out = 0x449; // щ
-                } else if (b0 == 0xD0 && b1 == 0xA1) { // С
+                } else if (b0 == 0xD0 && b1 == 0xA8) { // Ш
                     len -= 2;
                     buf[len] = 0;
                     out = 0x429; // Щ
@@ -2598,9 +2594,9 @@ void translitFeed(char *buf, uint8_t &len, size_t cap, char raw, char &pending)
     }
     uint16_t cp = translitSingle(lowerc(raw));
     if (cp) {
-        appendCp(buf, len, cap, translitCase(cp, isUp(raw)));
+        const bool appended = appendCp(buf, len, cap, translitCase(cp, isUp(raw)));
         char l = lowerc(raw);
-        pending = (l == 's' || l == 'z' || l == 'c' || l == 'y') ? raw : 0;
+        pending = appended && (l == 's' || l == 'z' || l == 'c' || l == 'y') ? raw : 0;
     } else if ((size_t)len + 1 < cap) {
         buf[len++] = raw; // digits / punctuation pass through literally
         buf[len] = 0;
@@ -3020,8 +3016,10 @@ bool AdvUI::handleFromRadio(const meshtastic_FromRadio &fr)
 {
     if (fr.which_payload_variant == meshtastic_FromRadio_queueStatus_tag) {
         const meshtastic_QueueStatus &status = fr.queueStatus;
-        if (status.mesh_packet_id && status.res != ERRNO_OK)
+        if (status.mesh_packet_id && status.res != ERRNO_OK) {
+            bleForgetPendingSend(status.mesh_packet_id);
             return ackMsg(status.mesh_packet_id, MSG_FAILED, (uint8_t)status.res);
+        }
         return false;
     }
     if (fr.which_payload_variant != meshtastic_FromRadio_packet_tag)
@@ -3038,6 +3036,7 @@ bool AdvUI::handleFromRadio(const meshtastic_FromRadio &fr)
         meshtastic_Routing routing = meshtastic_Routing_init_zero;
         bool ok = pb_decode_from_bytes(p.decoded.payload.bytes, p.decoded.payload.size, &meshtastic_Routing_msg, &routing);
         if (ok && routing.which_variant == meshtastic_Routing_error_reason_tag) {
+            bleForgetPendingSend(p.decoded.request_id);
             bool delivered = routing.error_reason == meshtastic_Routing_Error_NONE;
             return ackMsg(p.decoded.request_id, delivered ? MSG_DELIVERED : MSG_FAILED,
                           (uint8_t)routing.error_reason);
@@ -3167,7 +3166,7 @@ static SendResult sendTextPacket(uint32_t to, const char *text, int chIdx = 0, u
         size_t len = pb_encode_to_bytes(buf, sizeof(buf), &meshtastic_ToRadio_msg, &t);
         if (!len)
             return {0, SendFailure::ENCODE_FAILED, 0};
-        if (!bleQueueToRadio(buf, (uint16_t)len))
+        if (!bleQueueToRadio(buf, (uint16_t)len, p.id))
             return {0, SendFailure::QUEUE_FULL, ERRNO_UNKNOWN};
         return {p.id, SendFailure::NONE, ERRNO_OK};
 #endif
@@ -3333,28 +3332,32 @@ int AdvUI::buildNodeList(uint16_t *out, int max, const char *query)
     if (g_radioCompanion) { // companion: nodes come from the BLE config stream
         struct SortKey {
             uint16_t index;
-            bool unread;
-            uint32_t lastHeard;
+            NodeOrder order;
+            char name[24];
         } keys[kMaxCompNodes];
+        auto less = [](const SortKey &a, const SortKey &b) {
+            return nodeOrderLess(a.order, a.name, b.order, b.name, g_nodeSort);
+        };
         const int total = g_compNodeCount.load();
-        for (int i = 0; i < total && count < max; i++) {
+        for (int i = 0; i < total; i++) {
             CompNode c;
             if (!bleCopyCompNodeAt(i, &c))
                 continue;
             if (c.num == me)
                 continue;
-            if (query && query[0]) {
-                const char *name = c.longName[0] ? c.longName : c.shortName;
-                if (!ciContains(name[0] ? name : "", query))
-                    continue;
-            }
-            keys[count++] = {(uint16_t)i, hasUnreadFrom(c.num), c.lastHeard};
+            const char *name = g_nameShort ? (c.shortName[0] ? c.shortName : c.longName)
+                                          : (c.longName[0] ? c.longName : c.shortName);
+            if (query && query[0] && !ciContains(name, query))
+                continue;
+            SortKey key = {};
+            key.index = (uint16_t)i;
+            key.order = {c.num, c.lastHeard, c.hops, hasUnreadFrom(c.num), favNodeLocal(c.num)};
+            snprintf(key.name, sizeof(key.name), "%s", name);
+            if (count < kMaxCompNodes)
+                keys[count++] = key;
         }
-        std::sort(keys, keys + count, [](const SortKey &a, const SortKey &b) { // unread first, then freshest
-            if (a.unread != b.unread)
-                return a.unread;
-            return a.lastHeard > b.lastHeard;
-        });
+        std::sort(keys, keys + count, less);
+        count = std::max(0, std::min(count, max));
         for (int i = 0; i < count; i++)
             out[i] = keys[i].index;
         return count;
@@ -3363,7 +3366,8 @@ int AdvUI::buildNodeList(uint16_t *out, int max, const char *query)
     if (!nodeDB)
         return 0;
     size_t total = nodeDB->getNumMeshNodes();
-    for (size_t i = 0; i < total && count < max; i++) {
+    const bool boundedSelection = total > static_cast<size_t>(std::max(0, max));
+    for (size_t i = 0; i < total; i++) {
         meshtastic_NodeInfoLite *node = nodeDB->getMeshNodeByIndex(i);
         if (!node)
             continue;
@@ -3374,9 +3378,13 @@ int AdvUI::buildNodeList(uint16_t *out, int max, const char *query)
             if (!ciContains(name[0] ? name : "", query))
                 continue;
         }
-        out[count++] = (uint16_t)i;
+        if (boundedSelection)
+            insertSortedBounded(out, count, max, (uint16_t)i, nodeLess);
+        else
+            out[count++] = (uint16_t)i;
     }
-    std::sort(out, out + count, nodeLess);
+    if (!boundedSelection)
+        std::sort(out, out + count, nodeLess);
     return count;
 }
 
@@ -3673,6 +3681,19 @@ void AdvUI::buildConversations()
         conv[found].order = i; // arrival order; higher = more recent
     }
     std::sort(conv, conv + convCount, [](const Conv &a, const Conv &b) { return a.order > b.order; });
+    if (confirmDel) {
+        bool found = false;
+        for (int i = 0; i < convCount; i++) {
+            if (conv[i].isChan == pendingDelete.isChan &&
+                (pendingDelete.isChan ? conv[i].ch == pendingDelete.ch : conv[i].node == pendingDelete.node)) {
+                sel = i; // keep the highlighted row bound to the confirmation
+                found = true;
+                break;
+            }
+        }
+        if (!found)
+            confirmDel = false; // the target disappeared; never substitute a row
+    }
     if (sel >= convCount)
         sel = convCount ? convCount - 1 : 0;
     if (sel < 0)
@@ -4467,12 +4488,14 @@ void AdvUI::drawNode()
             shown += el > 0 ? el : utf8Decode(shown).bytes;
         }
         printLineEmotes(g, 4, 118, shown, 0xFFE0); // yellow, emoji inline
-        g->fillRect(216, 116, 24, 13, 0x0000); // input-mode badge (Fn+L toggles)
+        g->fillRect(216, 116, 24, 19, 0x0000); // input-mode badge (Fn+L toggles)
         g->setFont(&lgfx::fonts::Font0);
         g->setTextSize(1);
         g->setTextColor(g_ruMode ? 0x07FF : 0x630C);
-        g->setCursor(220, 119);
+        g->setCursor(220, 117);
         g->print(g_ruMode ? "RU" : "EN");
+        g->setCursor(218, 126);
+        g->print("FnH");
     } else {
         if (reactStrip) { // quick-reaction strip over the bottom of the feed
             const int sy = 88;
@@ -4530,7 +4553,10 @@ void AdvUI::drawSetName()
     g->print(editTitle(editTarget));
     g->drawFastHLine(0, 13, 240, 0x39C7);
 
-    g->setFont(&lgfx::fonts::FreeSansBold9pt7b);
+    if (editTarget == 0 || editTarget == 1 || editTarget == 3)
+        g->setFont(&cyrFont);
+    else
+        g->setFont(&lgfx::fonts::FreeSansBold9pt7b);
     g->setTextSize(1);
     g->setTextColor(0xFFFF);
     char field[sizeof(nameBuf) + 2];
@@ -4547,7 +4573,7 @@ void AdvUI::drawSetName()
     g->setCursor(6, 74);
     g->printf("%u / %u", (unsigned)nameLen, editMax(editTarget));
 
-    drawFooter(g, editTarget == 2 ? "blank = auto   ENTER save" : "type   ENTER save   ESC cancel");
+    drawFooter(g, editTarget == 2 ? "blank = auto   ENTER save" : "ENTER save  ESC cancel  Fn+H keys");
 
     if (haveCanvas)
         pushFrame();
@@ -4640,17 +4666,14 @@ bool AdvUI::applyName()
         meshtastic_AdminMessage adm = meshtastic_AdminMessage_init_default;
         adm.which_payload_variant = meshtastic_AdminMessage_set_owner_tag;
         meshtastic_User &u = adm.set_owner;
-        CompNode node;
-        if (!bleCopyCompNode(g_linkMyNode.load(), &node))
+        if (!bleCopyCompOwner(&u))
             return false;
-        snprintf(u.long_name, sizeof(u.long_name), "%s", node.longName);
-        snprintf(u.short_name, sizeof(u.short_name), "%s", node.shortName);
         if (editTarget == 1)
             utf8CopyValid(u.short_name, sizeof(u.short_name), nameBuf);
         else
             utf8CopyValid(u.long_name, sizeof(u.long_name), nameBuf);
         if (sendAdminToNode(adm)) // mirror locally so Settings shows it at once
-            bleUpdateCompNodeNames(node.num, u.long_name, u.short_name);
+            bleUpdateCompNodeNames(g_linkMyNode.load(), u.long_name, u.short_name);
         return false;
     }
     if (editTarget == 1) {
@@ -4826,7 +4849,7 @@ void AdvUI::drawSettings()
                                         "Channel", "Role",     "Hops",   "Power",  "Rebroadcast",
                                         "UTC",     "WiFi",     "MQTT",   "Screen", "Radio",
                                         "Font",    "Clock",    "GPS",    "Sort",  "Names",
-                                        "2nd screen"};
+                                        "2nd screen", "RU keys"};
     char vals[kNumSettings][24];
     meshtastic_Config_LoRaConfig compLora = meshtastic_Config_LoRaConfig_init_default;
     meshtastic_Config_DeviceConfig compDevice = meshtastic_Config_DeviceConfig_init_default;
@@ -4923,6 +4946,7 @@ void AdvUI::drawSettings()
     // Says why it is unavailable rather than silently showing "Off": these pins belong
     // to the radio, so the answer depends on which radio mode the node is running.
     strcpy(vals[20], !g_radioCompanion ? "companion only" : optName(kExtOpts, kExtCount, (int)g_extRot));
+    strcpy(vals[21], "Fn+H");
 
     // What the current level shows: top = sections + direct entries (with a
     // representative value as the preview), sub = the section's flat items.
@@ -5515,7 +5539,7 @@ const char *AdvUI::hilModeName() const
 {
     static const char *names[] = {"chats",   "nodes",   "picker", "node",    "compose",
                                   "setname", "settings", "picklist", "reboot", "emoji",
-                                  "netpage", "blescan", "blepin", "blelink", "btpin"};
+                                  "netpage", "blescan", "blepin", "blelink", "btpin", "inputhelp"};
     const unsigned index = static_cast<unsigned>(mode);
     return index < sizeof(names) / sizeof(names[0]) ? names[index] : "unknown";
 }
@@ -5589,12 +5613,18 @@ void AdvUI::hilState()
     // Keep diagnostics on their own bounded CDC record. Extending @@COMP past
     // the native-USB TX buffer's comfortable line size made query-heavy HIL
     // runs retain transport buffers and eventually starve the companion arena.
+    meshtastic_User compOwner = meshtastic_User_init_default;
+    const bool haveOwner = bleCopyCompOwner(&compOwner);
     Serial.printf("@@CHEAP buffers=%u ingress_first=%u ingress_last=%u ingress_count=%u ingress_pre=%u "
-                  "ingress_direct=%d ingress_max=%u\n",
+                  "ingress_direct=%d ingress_max=%u owner_present=%u owner_licensed=%u "
+                  "owner_unmessagable_present=%u owner_unmessagable=%u\n",
                   bleHilBuffersReady() ? 1U : 0U,
                   (unsigned)bleHilIngressFirstHeap(), (unsigned)bleHilIngressLastHeap(),
                   (unsigned)bleHilIngressCount(), (unsigned)bleHilIngressLastBeforeHeap(),
-                  (int)bleHilIngressDirectDelta(), (unsigned)bleHilIngressMaxDrop());
+                  (int)bleHilIngressDirectDelta(), (unsigned)bleHilIngressMaxDrop(),
+                  haveOwner ? 1U : 0U, haveOwner && compOwner.is_licensed ? 1U : 0U,
+                  haveOwner && compOwner.has_is_unmessagable ? 1U : 0U,
+                  haveOwner && compOwner.is_unmessagable ? 1U : 0U);
     Serial.flush();
 }
 
@@ -6127,6 +6157,14 @@ void AdvUI::runDemoDump()
     pinLen = 0;
     pinBuf[0] = 0;
 
+    mode = MODE_INPUTHELP;
+    inputHelpPage = 0;
+    drawInputHelp();
+    screenshot("ru1");
+    inputHelpPage = 1;
+    drawInputHelp();
+    screenshot("ru2");
+
     // --- Usage-scenario frames (a01..) for the animated hero.
     beginDemoIdentity();
     me = myNodeNum();
@@ -6331,6 +6369,11 @@ void AdvUI::applyLoRa(int target, int value)
 // Opens the editor/picker for one flat settings item (see the labels table).
 void AdvUI::openSetting(int item)
 {
+    pendingLat = 0;
+    if (item == 21) {
+        openInputHelp();
+        return;
+    }
     meshtastic_Config_LoRaConfig compLora = meshtastic_Config_LoRaConfig_init_default;
     meshtastic_Config_DeviceConfig compDevice = meshtastic_Config_DeviceConfig_init_default;
     meshtastic_Channel compPrimary = meshtastic_Channel_init_default;
@@ -6353,9 +6396,11 @@ void AdvUI::openSetting(int item)
     if (item <= 1) { // 0 = long name, 1 = short name
         editTarget = item;
         const char *cur;
+        meshtastic_User compOwner = meshtastic_User_init_default;
         if (g_radioCompanion) { // editing the linked node's names (remote admin)
-            meshtastic_NodeInfoLite *lm = g_linkMyNode ? nodeByNum(g_linkMyNode) : nullptr;
-            cur = lm ? (item == 1 ? nodeShortName(lm) : nodeLongName(lm)) : "";
+            if (!bleCopyCompOwner(&compOwner))
+                return; // never edit against a partial/default owner snapshot
+            cur = item == 1 ? compOwner.short_name : compOwner.long_name;
         } else {
             cur = (item == 1) ? owner.short_name : owner.long_name;
         }
@@ -6454,6 +6499,34 @@ void AdvUI::openSetting(int item)
     }
 }
 
+void AdvUI::openInputHelp()
+{
+    inputHelpReturn = mode;
+    inputHelpPage = 0;
+    mode = MODE_INPUTHELP;
+}
+
+void AdvUI::drawInputHelp()
+{
+    lgfx::LGFXBase *g = haveCanvas ? static_cast<lgfx::LGFXBase *>(&canvas) : static_cast<lgfx::LGFXBase *>(&display);
+    g->fillScreen(0x0000);
+    g->setFont(&lgfx::fonts::Font0);
+    g->setTextSize(1);
+    g->setTextColor(0x07FF);
+    g->setCursor(4, 3);
+    g->printf("RU keys %u/2    Fn+L RU/EN", (unsigned)inputHelpPage + 1);
+    g->drawFastHLine(0, 13, 240, 0x39C7);
+    g->setFont(&cyrFont);
+    g->setTextColor(0xFFFF);
+    for (unsigned i = 0; i < 18; ++i) {
+        g->setCursor(4 + (i % 3) * 80, 17 + (i / 3) * 17);
+        g->print(kTranslitHelp[inputHelpPage][i]);
+    }
+    drawFooter(g, "<> page  ESC back  Shift=CAPS");
+    if (haveCanvas)
+        pushFrame();
+}
+
 void AdvUI::handleKey(char ch)
 {
     unsigned char c = (unsigned char)ch;
@@ -6467,7 +6540,23 @@ void AdvUI::handleKey(char ch)
     bool tab = c == 0x09;   // TAB   -> emoji picker
     bool printable = c >= 0x20 && c < 0x7f;
 
+    if (mode == MODE_INPUTHELP) {
+        if (esc || enter || c == AdvKeyboard::kInputHelp || c == AdvKeyboard::kLongEsc)
+            mode = inputHelpReturn;
+        else if (left || up)
+            inputHelpPage = 0;
+        else if (right || down || tab)
+            inputHelpPage = 1;
+        return;
+    }
+    if (c == AdvKeyboard::kInputHelp) {
+        if (mode != MODE_REBOOT && mode != MODE_BTPIN && mode != MODE_BLEPIN && mode != MODE_BLESCAN)
+            openInputHelp();
+        return;
+    }
+
     if (c == AdvKeyboard::kLongEsc) { // long-press ESC opens settings from anywhere
+        confirmDel = false;
         setSel = 0;
         setScroll = 0;
         setSection = -1;
@@ -6491,9 +6580,9 @@ void AdvUI::handleKey(char ch)
         if (esc) {
             mode = nameReturn;
         } else if (enter) {
-            // Blank channel/frequency values are legitimate: the preset supplies
-            // the channel name and a zero override restores automatic frequency.
-            bool rebooting = (nameLen || editTarget == 2 || editTarget == 3) && applyName();
+            // Blank channel/frequency values use the preset; blank network
+            // fields clear credentials rather than silently retaining old text.
+            bool rebooting = (nameLen || editTarget == 2 || editTarget == 3 || editTarget >= 20) && applyName();
             if (!rebooting)
                 mode = nameReturn;
         } else if (bksp) {
@@ -6504,7 +6593,7 @@ void AdvUI::handleKey(char ch)
                 if (nameLen)
                     nameBuf[--nameLen] = 0;
             }
-        } else if (g_ruMode && !numeric && editTarget < 20 && printable && nameLen < maxLen) {
+        } else if (g_ruMode && !numeric && editTarget < 20 && printable) {
             translitFeed(nameBuf, nameLen, maxLen + 1, c, pendingLat); // limits are UTF-8 bytes on the wire
         } else if (printable && nameLen < maxLen &&
                    (!numeric || (c >= '0' && c <= '9') || c == (editTarget == 4 ? ':' : '.'))) {
@@ -6912,6 +7001,7 @@ void AdvUI::handleKey(char ch)
     }
 
     if (mode == MODE_EMOJI) {
+        pendingLat = 0;
         if (esc) {
             mode = emojiReturn;
         } else if (left) {
@@ -6970,7 +7060,7 @@ void AdvUI::handleKey(char ch)
                 msgBuf[--msgLen] = 0; // drop UTF-8 continuation bytes, then the lead byte
             if (msgLen)
                 msgBuf[--msgLen] = 0;
-        } else if (g_ruMode && printable && msgLen + 2 < sizeof(msgBuf)) {
+        } else if (g_ruMode && printable) {
             sendFailure = SendFailure::NONE;
             translitFeed(msgBuf, msgLen, sizeof(msgBuf), c, pendingLat);
         } else if (printable && msgLen < sizeof(msgBuf) - 1) {
@@ -6985,13 +7075,16 @@ void AdvUI::handleKey(char ch)
     if (mode == MODE_CHATS) {
         buildConversations();
         if (bksp) { // Del arms the delete confirmation
-            if (sel < convCount)
+            if (!confirmDel && sel >= 0 && sel < convCount) {
+                pendingDelete = conv[sel];
                 confirmDel = true;
+            }
             return;
         }
         if (confirmDel) { // pending delete: Enter confirms, any other key cancels
-            if (enter && sel < convCount) {
-                deleteConversation(conv[sel]);
+            if (enter) {
+                deleteConversation(pendingDelete);
+                confirmDel = false;
                 buildConversations();
                 if (sel >= convCount)
                     sel = convCount ? convCount - 1 : 0;
@@ -7393,6 +7486,14 @@ int32_t AdvUI::runOnce()
                 uiDirty = handleFromRadio(fr) || uiDirty; // messages, reactions, delivery ACKs only
             }
         }
+        uint32_t packetId;
+        uint8_t error;
+        while (bleNextSendFailure(&packetId, &error)) {
+            // A transport error must never regress a confirmed delivery.
+            for (int i = 0; i < g_msgCount; i++)
+                if (g_msgs[i].id == packetId && g_msgs[i].status == MSG_SENDING)
+                    uiDirty = ackMsg(packetId, MSG_FAILED, error) || uiDirty;
+        }
     }
 
 #ifdef HAS_I2S
@@ -7647,6 +7748,8 @@ int32_t AdvUI::runOnce()
         drawNode();
     else if (mode == MODE_SETNAME)
         drawSetName();
+    else if (mode == MODE_INPUTHELP)
+        drawInputHelp();
     else if (mode == MODE_SETTINGS)
         drawSettings();
     else if (mode == MODE_NETPAGE)
@@ -7761,6 +7864,11 @@ void advuiFavouriteChanged(uint32_t nodeNum, bool favourite)
 {
     if (setFavNodeLocal(nodeNum, favourite))
         persistUiCfg();
+}
+
+bool advuiRestoreFavourite(uint32_t nodeNum, bool current)
+{
+    return g_favouritesReady ? favNodeLocal(nodeNum) : current;
 }
 
 } // namespace advui

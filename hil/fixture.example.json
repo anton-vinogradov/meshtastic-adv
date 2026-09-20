@@ -1,5 +1,6 @@
 {
   "schema": 2,
+  "production_wifi_transport": "direct",
   "devices": {
     "dut": {
       "kind": "m5stack-cardputer-adv",

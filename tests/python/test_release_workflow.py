@@ -1,3 +1,4 @@
+import json
 import os
 import re
 import subprocess
@@ -21,6 +22,74 @@ def job(name: str) -> str:
 
 
 class ReleaseWorkflowTests(unittest.TestCase):
+    def test_firmware_ci_checks_actual_log_formatter_after_overlay_sync(self):
+        block = job("firmware")
+        self.assertIn("python tests/native/test_stream_log.py", block)
+        self.assertLess(block.index("scripts/verify.py --firmware-only"),
+                        block.index("python tests/native/test_stream_log.py"))
+
+    def test_release_requires_zoo_coordination_and_manual_finish_cannot_bypass_it(self):
+        block = job("release-hil")
+        run = block.split("- name: Release behavioral HIL", 1)[1].split("- name: Recover production", 1)[0]
+        self.assertIn("--require-zoo-hil", run)
+        for flag in ("required", "validated", "ownership_preserved", "release_acknowledged"):
+            self.assertIn(f".zoo_hil.{flag} == true", FINISH_WORKFLOW)
+
+    def test_finish_evidence_rejects_incomplete_recovery_wifi_or_writes(self):
+        expression = re.search(
+            r"jq -e '(\s*\.failures == 0.*?)'\s+finish-hil/usb/summary.json",
+            FINISH_WORKFLOW, re.S,
+        ).group(1)
+        valid = {
+            "failures": 0, "hil_flash_attempted": True, "production_restored": True,
+            "configuration_preserved": True, "filesystem_captured": True, "filesystem_restored": True,
+            "production_wifi_requested": True, "production_wifi_validated": True,
+            "production_wifi": {"validated": True, "stable_reboot_counter": True,
+                                "soak_seconds": 14415, "required_soak_seconds": 14400,
+                                "mesh_writes": 0, "admin_writes": 0, "chat_writes": 0},
+            "zoo_hil": {"required": True, "validated": True, "ownership_preserved": True,
+                        "release_acknowledged": True},
+        }
+
+        def check(payload, expected):
+            result = subprocess.run(["jq", "-e", expression], input=json.dumps(payload),
+                                    text=True, capture_output=True)
+            self.assertEqual(result.returncode, expected, result.stderr)
+
+        check(valid, 0)
+        transport = {"kind": "zoo-ssh", "started": True, "healthy": True, "closed": True, "validated": True}
+        check(dict(valid, production_wifi_transport=transport), 0)
+        for field in ("started", "healthy", "closed", "validated"):
+            check(dict(valid, production_wifi_transport=dict(transport, **{field: False})), 1)
+        check(dict(valid, production_wifi_transport=dict(transport, kind="unknown")), 1)
+        changes = [(key, False) for key in (
+            "filesystem_captured", "filesystem_restored", "production_wifi_requested", "production_wifi_validated")]
+        changes += [("production_wifi", None)]
+        for key, value in changes:
+            with self.subTest(key=key):
+                check(dict(valid, **{key: value}), 1)
+        for key, value in (("validated", False), ("stable_reboot_counter", False),
+                           ("soak_seconds", 14399), ("soak_seconds", "14415"),
+                           ("required_soak_seconds", 119), ("required_soak_seconds", "14400"),
+                           ("mesh_writes", 1), ("admin_writes", 1), ("chat_writes", 1)):
+            with self.subTest(key=key, value=value):
+                check(dict(valid, production_wifi=dict(valid["production_wifi"], **{key: value})), 1)
+
+    def test_finish_visual_count_is_bound_to_exact_tag_not_old_35(self):
+        self.assertIn('scripts \\\n            | tar -x -C /tmp/tag-source', FINISH_WORKFLOW)
+        expression = re.search(
+            r'jq -e --argjson expected_frames "\$expected_frames" \'(.*?)\'\s+finish-hil/usb/visual/report.json',
+            FINISH_WORKFLOW, re.S,
+        ).group(1)
+        for expected, actual in ((35, 35), (37, 37), (37, 35), (35, 37)):
+            payload = {"cases": [{"name": "visual/demo-matrix", "data": {
+                "frames": actual, "unique": actual,
+                "post_reboot": {"radio_tx": "0", "backend": "onboard", "mode": "chats"},
+            }}]}
+            result = subprocess.run(["jq", "-e", "--argjson", "expected_frames", str(expected), expression],
+                                    input=json.dumps(payload), text=True, capture_output=True)
+            self.assertEqual(result.returncode, int(expected != actual), result.stderr)
+
     def test_manual_flash_stops_on_overlay_sync_failure(self):
         script = (ROOT / "scripts/flash.sh").read_text()
         self.assertIn("set -euo pipefail", script)
@@ -475,7 +544,9 @@ class ReleaseWorkflowTests(unittest.TestCase):
             '([.results[].name] | unique | length) == (.results | length)',
             FINISH_WORKFLOW,
         )
-        self.assertIn('.data.frames == 35 and .data.unique == 35', FINISH_WORKFLOW)
+        self.assertIn('PYTHONPATH=/tmp/tag-source/scripts python -c', FINISH_WORKFLOW)
+        self.assertIn('print(len(hil.EXPECTED_DEMO_FRAMES))', FINISH_WORKFLOW)
+        self.assertIn('.data.frames == $expected_frames and .data.unique == $expected_frames', FINISH_WORKFLOW)
         self.assertIn('test ! -e finish-hil/usb/visual/frames', FINISH_WORKFLOW)
         self.assertIn("python scripts/m5burner_publish.py", FINISH_WORKFLOW)
         self.assertGreaterEqual(

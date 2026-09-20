@@ -2,6 +2,7 @@
 
 #include "mesh/generated/meshtastic/channel.pb.h"
 #include "mesh/generated/meshtastic/config.pb.h"
+#include "mesh/generated/meshtastic/mesh.pb.h"
 #include <atomic>
 #include <cstddef>
 #include <cstdint>
@@ -94,6 +95,7 @@ extern std::atomic<int> g_linkRssi;        // BLE link RSSI in dBm (0 unknown)
 // through these helpers so protobuf structs and node names cannot tear mid-frame.
 bool bleCopyCompNodeAt(int index, CompNode *out);
 bool bleCopyCompNode(uint32_t num, CompNode *out);
+bool bleCopyCompOwner(meshtastic_User *out);
 bool bleUpdateCompNodeNames(uint32_t num, const char *longName, const char *shortName);
 bool bleCopyCompChannel(int index, meshtastic_Channel *out);
 bool bleUpdateCompChannel(int index, const meshtastic_Channel &channel);
@@ -110,7 +112,9 @@ struct BleFrame {
     uint8_t data[kBleFrameMax];
 };
 bool bleNextPacket(BleFrame *frame); // pop one, false when empty (UI thread)
-bool bleQueueToRadio(const uint8_t *buf, uint16_t len); // UI thread enqueues, pump writes
+bool bleQueueToRadio(const uint8_t *buf, uint16_t len, uint32_t packetId = 0); // UI enqueues, pump writes
+void bleForgetPendingSend(uint32_t packetId); // ACK/NAK consumed by UI
+bool bleNextSendFailure(uint32_t *packetId, uint8_t *error); // GATT failure, disconnect or ACK timeout
 uint32_t bleRxDrops(); // queue-full/oversize counters, reset on every connection
 uint32_t bleTxDrops();
 

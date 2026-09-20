@@ -71,6 +71,8 @@ TOKEN_ALLOWLIST = {
     "expected_node_id", "min_nodes", "name", "port", "production_wifi",
     "protected_devices", "read-only", "region", "schema", "test", "tx_power",
     "usb_serial", "wifi_peers",
+    "zoo_hil", "transport", "socket", "ssh_host", "python", "helper", "unix", "ssh",
+    "production_wifi_transport", "zoo-ssh", "direct",
 }
 
 
@@ -577,6 +579,9 @@ def fixture_tokens(path: Path | None) -> list[str]:
             values.add(value)
 
     visit(fixture)
+    zoo = fixture.get("zoo_hil") if isinstance(fixture, dict) else None
+    if isinstance(zoo, dict) and isinstance(zoo.get("ssh_host"), str):
+        identity_names.add(zoo["ssh_host"])
     devices = fixture.get("devices") if isinstance(fixture, dict) else None
     if isinstance(devices, dict):
         for device in devices.values():
@@ -656,7 +661,19 @@ def stage_evidence(source: Path, media: Path | None, fixture: Path | None, outpu
                 raw = path.read_text(encoding="utf-8")
             except (OSError, UnicodeError) as exc:
                 raise MediaError(f"public evidence is not UTF-8 text: {relative}") from exc
-            clean = redact_text(raw, tokens)
+            if path.suffix.lower() == ".xml":
+                # Redact values before serialization so placeholders remain escaped XML.
+                root = ET.fromstring(raw)
+                for element in root.iter():
+                    for key, value in list(element.attrib.items()):
+                        element.set(key, redact_text(value, tokens))
+                    if element.text:
+                        element.text = redact_text(element.text, tokens)
+                    if element.tail:
+                        element.tail = redact_text(element.tail, tokens)
+                clean = ET.tostring(root, encoding="unicode")
+            else:
+                clean = redact_text(raw, tokens)
             for token in tokens:
                 if re.search(token_pattern(token), clean, re.IGNORECASE):
                     raise MediaError(f"fixture token survived evidence redaction: {relative}")

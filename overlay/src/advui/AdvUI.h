@@ -24,7 +24,7 @@ enum class SendFailure : uint8_t {
  *
  * Runs as an OSThread (scheduler-driven, no main-loop edits). Screens:
  *  - splash (branded boot screen while the mesh comes up)
- *  - node list (overview): sorted favourites -> conversations -> by hops
+ *  - node list: unread first; Smart uses favourites -> hops -> freshness
  *  - contact picker (ESC / type): query bar + filtered node list, a moving
  *    selection cursor (up/down), Enter opens the node
  *  - node view (per-node detail; the future conversation lives here)
@@ -57,7 +57,8 @@ class AdvUI : public concurrency::OSThread
         MODE_BLESCAN, // companion: find a Meshtastic node over BLE
         MODE_BLEPIN,  // companion: enter the pairing PIN shown on the node
         MODE_BLELINK, // companion: link status (connecting/pairing/connected)
-        MODE_BTPIN    // local: show the PIN a pairing phone must enter (we ARE the node)
+        MODE_BTPIN,   // local: show the PIN a pairing phone must enter (we ARE the node)
+        MODE_INPUTHELP
     };
 
     struct Conv {         // a recent conversation (a channel or a node DM)
@@ -84,6 +85,8 @@ class AdvUI : public concurrency::OSThread
     void drawPickList();
     void drawReboot();
     void drawEmoji();
+    void openInputHelp();
+    void drawInputHelp();
     void drawNetPage();        // WiFi / MQTT sub-settings
     void drawBleScan();        // companion: node scan list
     void drawBlePin();         // companion: pairing-PIN entry
@@ -138,10 +141,12 @@ class AdvUI : public concurrency::OSThread
     lgfx::LGFX_Sprite canvas{&display}; // off-screen frame buffer
 
     Mode mode = MODE_CHATS;
+    Mode inputHelpReturn = MODE_CHATS;
+    uint8_t inputHelpPage = 0;
     char query[24] = {0};
     uint8_t queryLen = 0;
 
-    static constexpr int kMaxFiltered = 128;
+    static constexpr int kMaxFiltered = 150; // all nodes in the supported onboard hot store
     uint16_t filtered[kMaxFiltered] = {}; // node DB indices, sorted + query-matched (picker)
     int filteredCount = 0;
     uint8_t chanList[8] = {}; // enabled channel indices shown above the nodes
@@ -216,7 +221,8 @@ class AdvUI : public concurrency::OSThread
     uint32_t bleRetryMs = 0;      // last auto-reconnect attempt (backoff timer)
     bool linkJumped = false;      // already auto-jumped to Chats for this link session
     bool companionEntered = false; // jumped to the scan screen after the splash yet
-    bool confirmDel = false;       // Del pressed once on a chat -> next Del confirms delete
+    bool confirmDel = false;       // Del arms; Enter confirms the captured identity
+    Conv pendingDelete = {};
     Mode btPinReturn = MODE_CHATS; // where the phone-pairing PIN screen returns
 
     bool inited = false;
@@ -235,5 +241,6 @@ class AdvUI : public concurrency::OSThread
 
 void advuiSetup();
 void advuiFavouriteChanged(uint32_t nodeNum, bool favourite); // NodeDB/phone writes join the portable ADV profile
+bool advuiRestoreFavourite(uint32_t nodeNum, bool current); // reconcile discovered nodes after profile load
 
 } // namespace advui

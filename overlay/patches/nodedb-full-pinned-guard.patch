@@ -1,0 +1,15 @@
+diff --git a/src/mesh/NodeDB.cpp b/src/mesh/NodeDB.cpp
+--- a/src/mesh/NodeDB.cpp
++++ b/src/mesh/NodeDB.cpp
+@@ -2170,5 +2170,11 @@ meshtastic_NodeInfoLite *NodeDB::getOrCreateMeshNode(NodeNum n)
+                 (numMeshNodes)--;
+             }
+         }
++        // All entries may be pinned: eviction is not guaranteed to free a slot.
++        // advui-inject-pinned-capacity: never advance the count or index past it.
++        if (numMeshNodes >= meshNodes->size()) {
++            LOG_WARN("Node database has no replaceable slot; ignoring new node");
++            return nullptr;
++        }
+         // add the node at the end
+         lite = &meshNodes->at((numMeshNodes)++);

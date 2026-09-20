@@ -54,7 +54,10 @@ class ProfileSyncTests(unittest.TestCase):
         restore = self.profile.split("RestoreAttempt attemptRestore()", 1)[1].split(
             "bool syncProfile()", 1
         )[0]
-        self.assertIn("if (!mountSd(&owned))", restore)
+        self.assertIn("SdSession sd;", restore)
+        self.assertIn("if (!sd.begin())", restore)
+        self.assertIn("if (unavailable)", restore)
+        self.assertIn("errno == ENOENT", self.profile)
         self.assertIn("RestoreResult::Unavailable", restore)
         self.assertIn("anySlot ? RestoreResult::Corrupt", restore)
         self.assertIn("writeInternalMarker(0) ? RestoreResult::Initialized", restore)

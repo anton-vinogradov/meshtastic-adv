@@ -116,9 +116,16 @@ the middle, the compose bar sits at the bottom.
   wipes its archive too.
 - **Type** and hit **Enter** to send. **Fn+L** toggles the Cyrillic transliteration layer
   (the `RU`/`EN` badge on the compose bar; the choice persists). It's phonetic:
-  `zh`→ж · `sh`→ш · `ch`→ч · `sch`→щ · `ya`→я · `yu`→ю · `yo`→ё · `ye`→э · `y`→ы ·
+  `zh`→ж · `sh`→ш · `ch`→ч · `sch`→сч · `w`/`shch`→щ · `ya`→я · `yu`→ю · `yo`→ё · `ye`→э · `y`→ы ·
   `j`→й · `x`→ъ · `'`→ь · `h`→х · `c`→ц · `e`→е · `q`→я. **Tab** opens the emoji
   palette (~24 icons, arrows + Enter to insert; emoji render inline in text).
+  For example, `Schyot` → «Счёт» and `Wuka` → «Щука». Since v1.1.1, use
+  `w` (or `shch`) instead of `sch` for щ; `shh` stays шх (`Ashhabad` → «Ашхабад»).
+  The same rules apply to node/channel name editors.
+- **Fn+H** opens the complete two-page Cyrillic key map without changing the draft,
+  quote or pending letter; **← / →** switch pages and **Esc** returns to the exact
+  editor. Also available at **Settings → Device → RU keys**. Shift capitalizes the
+  first letter of a combination (`Shch` → Щ, or simply `W`); digits and punctuation pass through.
 - **← / →** enter *message pick* mode: ↑/↓ choose a received message, then
   - **→ reaction** — a quick strip of tapbacks (`</>` pick, Enter sends). Reactions from
     others (including phone apps) show under the message they refer to.

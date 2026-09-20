@@ -24,6 +24,10 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Callable
 
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import zoo_hil
+import hil_tunnel
+
 
 ROOT = Path(__file__).resolve().parents[1]
 FIRMWARE = ROOT / "firmware"
@@ -31,12 +35,13 @@ HIL_ENV = "m5stack-cardputer-adv-advui-hil"
 RELEASE_ENV = "m5stack-cardputer-adv-advui"
 EXPECTED_DEMO_FRAMES = [
     "splash", "nodes", "chat", "react", "chats", "emoji", "settings", "lora", "utc",
-    "wifi", "mqtt", "unicode", "stress", "bscan", "bpin", "blink",
+    "wifi", "mqtt", "unicode", "stress", "bscan", "bpin", "blink", "ru1", "ru2",
     *[f"a{i:02d}" for i in range(1, 20)],
 ]
 PRODUCTION_WIFI_MIN_SOAK_DUMPS = 8
 PRODUCTION_WIFI_MAX_SOAK_DUMPS = 64
 PRODUCTION_WIFI_MIN_SOAK_SECONDS = 120.0
+PRODUCTION_WIFI_MAX_SOAK_SECONDS = 86_400.0
 PRODUCTION_WIFI_READY_SECONDS = 180.0
 PRODUCTION_WIFI_CLOSE_SETTLE_SECONDS = 3.0
 PRODUCTION_WIFI_FINAL_QUIET_SECONDS = 15.0
@@ -285,6 +290,8 @@ def make_companion_node_info(
     hops: int | None = None,
     battery: int | None = None,
     public_key: bytes = b"",
+    licensed: bool | None = None,
+    unmessagable: bool | None = None,
 ) -> bytes:
     user = b""
     if long_name:
@@ -293,6 +300,10 @@ def make_companion_node_info(
         user += protobuf_bytes(3, short_name.encode("utf-8"))
     if public_key:
         user += protobuf_bytes(8, public_key)
+    if licensed is not None:
+        user += protobuf_uint(6, int(licensed))
+    if unmessagable is not None:
+        user += protobuf_uint(9, int(unmessagable))
     info = protobuf_uint(1, node)
     if user:
         info += protobuf_bytes(2, user)
@@ -383,6 +394,9 @@ def load_fixture(path: Path) -> dict[str, object]:
     production_wifi = dut.get("production_wifi")
     if production_wifi is not None:
         validate_production_wifi_config(production_wifi)
+    if "zoo_hil" in fixture:
+        zoo_hil.validate_config(fixture["zoo_hil"], require_production_wifi_config(fixture))
+    hil_tunnel.validate_fixture(fixture)
 
     # Schema 1 called the second USB device a peer. Treat it as protected when
     # loading old local fixtures: current HIL never opens or mutates it.
@@ -482,6 +496,7 @@ def require_usb_wifi_node_identity(dut: dict[str, object], state: dict[str, str]
 
 
 def resolve_role(fixture: dict[str, object], role: str) -> dict[str, object]:
+    zoo_hil.checkpoint()
     expected = fixture["devices"][role]
     visible = ports()
     matches = [item for item in visible if item["usb_serial"] == expected["usb_serial"]]
@@ -496,6 +511,7 @@ def wait_for_usb_serial(usb_serial: str, timeout: float = 20) -> dict[str, objec
     expected = normalize_serial(usb_serial)
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
+        zoo_hil.checkpoint()
         matches = [item for item in ports() if item["usb_serial"] == expected]
         if len(matches) == 1:
             return matches[0]
@@ -527,6 +543,7 @@ def kick_device(usb_serial: str) -> dict[str, object]:
         # deterministic margin and discard every private boot-log byte.
         deadline = time.monotonic() + USB_BOOT_SETTLE_SECONDS
         while time.monotonic() < deadline:
+            zoo_hil.checkpoint()
             handle.read(512)
         handle.close()
     except Exception:
@@ -570,14 +587,31 @@ def open_production_wifi_interface(host: str, port: int, timeout: int) -> object
     except ImportError as exc:
         raise HilError("Meshtastic Python is required (install the hash-locked HIL requirements)") from exc
 
+    lease = zoo_hil.CURRENT.get()
+    tunnel = zoo_hil.GUARD.get()
+
     class FailClosedTCPInterface(TCPInterface):
         def myConnect(self) -> None:  # noqa: N802 - upstream API spelling
-            connected = socket.create_connection(
-                (self.hostname, self.portNumber),
-                timeout=min(timeout, PRODUCTION_WIFI_CONNECT_TIMEOUT_SECONDS),
-            )
+            if lease is not None:
+                lease.check()
+            connect_timeout = min(timeout, PRODUCTION_WIFI_CONNECT_TIMEOUT_SECONDS)
+            connected = (tunnel.connect(self.hostname, self.portNumber, connect_timeout)
+                         if tunnel is not None else socket.create_connection(
+                             (self.hostname, self.portNumber), timeout=connect_timeout))
             connected.settimeout(None)
             self.socket = connected
+
+        def _writeBytes(self, data: bytes) -> None:
+            if lease is not None:
+                lease.check()
+            if tunnel is not None:
+                tunnel.check()
+            super()._writeBytes(data)
+
+        def close(self) -> None:
+            if lease is not None:
+                self.noProto = True  # cleanup cannot require or send on a lost lease
+            super().close()
 
         def _waitConnected(self, _upstream_default: float = 30.0) -> None:  # noqa: N802
             # meshtastic-python 2.7 hard-codes a separate 30-second initial
@@ -595,12 +629,22 @@ def open_production_wifi_interface(host: str, port: int, timeout: int) -> object
             self._wantExit = True
             raise ConnectionError("production WiFi soak forbids PhoneAPI reconnect")
 
-    return FailClosedTCPInterface(
+    interface = FailClosedTCPInterface(
         hostname=host,
         portNumber=port,
         noNodes=False,
         timeout=timeout,
+        connectNow=False,
     )
+    try:
+        interface.connect()
+    except Exception:
+        # Keep ownership even when initial config fails; constructor-based
+        # connection can otherwise leave an unreachable socket/reader behind.
+        with contextlib.suppress(Exception):
+            interface.close()
+        raise
+    return interface
 
 
 def production_wifi_dump(
@@ -610,6 +654,7 @@ def production_wifi_dump(
     enforce_configured_minimum: bool = True,
 ) -> ProductionWifiSnapshot:
     """Receive and validate one full production config dump without persisting it."""
+    zoo_hil.checkpoint()
     config = validate_production_wifi_config(config)
     open_interface = opener or open_production_wifi_interface
     interface: object | None = None
@@ -620,6 +665,8 @@ def production_wifi_dump(
                 int(config["port"]),
                 PRODUCTION_WIFI_CONFIG_TIMEOUT_SECONDS,
             )
+        except (zoo_hil.ZooLeaseError, hil_tunnel.TunnelError):
+            raise
         except Exception as exc:
             raise ProductionWifiConnectionError(
                 f"production PhoneAPI config dump failed ({type(exc).__name__})"
@@ -662,6 +709,7 @@ def production_wifi_dump(
 
             if reboot_count < 0:
                 raise HilError("production PhoneAPI did not report a valid reboot counter")
+            zoo_hil.checkpoint()
             return ProductionWifiSnapshot(
                 reboot_count=reboot_count,
                 node_count=min(reported_nodes, received_nodes),
@@ -674,6 +722,7 @@ def production_wifi_dump(
                     raise ProductionWifiConnectionError(
                         f"production PhoneAPI close failed ({type(exc).__name__})"
                     ) from None
+            zoo_hil.checkpoint()
 
 
 def production_wifi_ready_dump(
@@ -688,6 +737,7 @@ def production_wifi_ready_dump(
     config = require_production_wifi_config(fixture)
     ready_deadline = monotonic() + PRODUCTION_WIFI_READY_SECONDS
     while True:
+        zoo_hil.checkpoint()
         try:
             return production_wifi_dump(
                 config,
@@ -703,15 +753,39 @@ def production_wifi_ready_dump(
             sleep(min(PRODUCTION_WIFI_CLOSE_SETTLE_SECONDS, remaining))
 
 
+def validate_production_wifi_soak_seconds(value: object) -> float:
+    """Keep unattended production soak requests finite and operationally bounded."""
+    try:
+        seconds = float(value)
+    except (TypeError, ValueError):
+        raise HilError("production WiFi soak duration is not numeric") from None
+    if (
+        seconds != seconds
+        or seconds < PRODUCTION_WIFI_MIN_SOAK_SECONDS
+        or seconds > PRODUCTION_WIFI_MAX_SOAK_SECONDS
+    ):
+        raise HilError(
+            "production WiFi soak duration must be between "
+            f"{PRODUCTION_WIFI_MIN_SOAK_SECONDS:g} and {PRODUCTION_WIFI_MAX_SOAK_SECONDS:g} seconds"
+        )
+    return seconds
+
+
 def production_wifi_soak(
     fixture: dict[str, object],
     *,
+    minimum_seconds: float = PRODUCTION_WIFI_MIN_SOAK_SECONDS,
     opener: Callable[[str, int, int], object] | None = None,
     monotonic: Callable[[], float] = time.monotonic,
     sleep: Callable[[float], None] = time.sleep,
+    progress: dict[str, object] | None = None,
 ) -> dict[str, object]:
     """Prove repeated full production config dumps do not reboot or lose NodeDB state."""
+    minimum_seconds = validate_production_wifi_soak_seconds(minimum_seconds)
     config = require_production_wifi_config(fixture)
+    if progress is not None:
+        progress.update(phase="awaiting-baseline", validated=False,
+                        required_soak_seconds=minimum_seconds, config_dump_cycles=0)
     baseline = production_wifi_ready_dump(
         fixture,
         opener=opener,
@@ -726,11 +800,39 @@ def production_wifi_soak(
     started = monotonic()
     soak_dumps = 0
     minimum_node_count = baseline.node_count
+    last_progress_print = started
+
+    def checkpoint(phase: str, snapshot: ProductionWifiSnapshot, cycles: int) -> None:
+        nonlocal last_progress_print
+        if progress is None:
+            return
+        now = monotonic()
+        progress.update(
+            phase=phase, config_dump_cycles=cycles,
+            last_completed_soak_seconds=round(now - started, 3),
+            baseline_reboot_count=baseline.reboot_count,
+            last_reboot_count=snapshot.reboot_count,
+            minimum_node_count=minimum_node_count,
+            last_node_count=snapshot.node_count,
+        )
+        if phase != "running" or cycles == 1 or now - last_progress_print >= 60:
+            print("production WiFi progress: " + json.dumps(progress, sort_keys=True), flush=True)
+            last_progress_print = now
+
+    checkpoint("running", baseline, 1)
+    # The short release gate needs only a small hard cap. A deliberately long
+    # leak soak can legitimately perform thousands of complete read-only
+    # streams, so derive a bounded cap from its requested wall-clock duration.
+    max_soak_dumps = max(
+        PRODUCTION_WIFI_MAX_SOAK_DUMPS,
+        int(minimum_seconds / PRODUCTION_WIFI_CLOSE_SETTLE_SECONDS)
+        + PRODUCTION_WIFI_MIN_SOAK_DUMPS + 2,
+    )
     while (
         soak_dumps < PRODUCTION_WIFI_MIN_SOAK_DUMPS
-        or monotonic() - started < PRODUCTION_WIFI_MIN_SOAK_SECONDS
+        or monotonic() - started < minimum_seconds
     ):
-        if soak_dumps >= PRODUCTION_WIFI_MAX_SOAK_DUMPS:
+        if soak_dumps >= max_soak_dumps:
             raise HilError("production WiFi soak did not reach its minimum duration")
         sleep(PRODUCTION_WIFI_CLOSE_SETTLE_SECONDS)
         current = production_wifi_dump(
@@ -740,6 +842,7 @@ def production_wifi_soak(
         )
         soak_dumps += 1
         minimum_node_count = min(minimum_node_count, current.node_count)
+        checkpoint("running", current, 1 + soak_dumps)
         if current.node_count < required_nodes:
             raise HilError("production PhoneAPI NodeDB shrank during soak")
         if current.reboot_count != baseline.reboot_count:
@@ -752,10 +855,15 @@ def production_wifi_soak(
         enforce_configured_minimum=True,
     )
     minimum_node_count = min(minimum_node_count, final.node_count)
+    checkpoint("final-check", final, 1 + soak_dumps + 1)
     if final.node_count < required_nodes:
         raise HilError("production PhoneAPI NodeDB shrank after soak")
     if final.reboot_count != baseline.reboot_count:
         raise UnexpectedReboot("production firmware rebooted after the WiFi config-dump soak")
+
+    if progress is not None:
+        progress["validated"] = True
+        checkpoint("completed", final, 1 + soak_dumps + 1)
 
     return {
         "validated": True,
@@ -764,6 +872,7 @@ def production_wifi_soak(
         "wifi_capability_verified": True,
         "config_dump_cycles": 1 + soak_dumps + 1,
         "soak_seconds": round(monotonic() - started, 3),
+        "required_soak_seconds": minimum_seconds,
         "minimum_node_count": minimum_node_count,
         "required_node_count": required_nodes,
         "configured_minimum_node_count": int(config["min_nodes"]),
@@ -808,10 +917,12 @@ def find_meshtastic_cli() -> str:
 
 
 def run_checked(command: list[str], cwd: Path = ROOT, redact_output: bool = False) -> None:
+    zoo_hil.checkpoint()
     rendered = " ".join(command)
     print("+", redact_lab_details(rendered) if redact_output else rendered, flush=True)
     if not redact_output:
         subprocess.run(command, cwd=cwd, check=True)
+        zoo_hil.checkpoint()
         return
     try:
         result = subprocess.run(
@@ -824,9 +935,11 @@ def run_checked(command: list[str], cwd: Path = ROOT, redact_output: bool = Fals
         print(redact_lab_details(result.stdout), end="", flush=True)
     if result.returncode != 0:
         raise HilError(f"identity-bound flash command failed with exit code {result.returncode}")
+    zoo_hil.checkpoint()
 
 
 def run_captured(command: list[str], cwd: Path = ROOT, redact_command: bool = False) -> str:
+    zoo_hil.checkpoint()
     rendered = " ".join(command)
     print("+", redact_lab_details(rendered) if redact_command else rendered, flush=True)
     try:
@@ -842,6 +955,7 @@ def run_captured(command: list[str], cwd: Path = ROOT, redact_command: bool = Fa
         if redact_command:
             raise HilError("identity check could not start") from None
         raise
+    zoo_hil.checkpoint()
     return result.stdout
 
 
@@ -1231,6 +1345,7 @@ def capture_config_fingerprint(
     environment.setdefault("MESHTASTIC_BACKUP_TIMEOUT", "90")
     previous: bytes | None = None
     for sample in range(1, 4):
+        zoo_hil.checkpoint()
         device = resolve_role(fixture, "dut")
         sample_port = str(device["port"])
         destination = temporary_root / f"{label}-{sample}"
@@ -1562,16 +1677,18 @@ class Report:
 
     def check(self, name: str, fn: Callable[[], dict[str, object] | None]) -> None:
         started = time.monotonic()
-        fatal: UnexpectedReboot | None = None
+        fatal: Exception | None = None
         try:
+            zoo_hil.checkpoint()
             data = fn()
+            zoo_hil.checkpoint()
             case = Case(name, "passed", time.monotonic() - started, data=data)
             print(f"PASS {name}", flush=True)
         except Exception as exc:  # every failed assertion belongs in the evidence report
             message = self.redact(str(exc))
             case = Case(name, "failed", time.monotonic() - started, message)
             print(f"FAIL {name}: {message}", flush=True)
-            if isinstance(exc, UnexpectedReboot):
+            if isinstance(exc, (UnexpectedReboot, zoo_hil.ZooLeaseError, hil_tunnel.TunnelError)):
                 fatal = exc
         self.cases.append(case)
         if fatal is not None:
@@ -1621,6 +1738,7 @@ def dut_evidence(device: dict[str, object]) -> dict[str, object]:
 
 class HilSession:
     def __init__(self, port: str):
+        zoo_hil.checkpoint()
         serial, _ = require_serial()
         self.serial = serial.Serial()
         self.serial.port = port
@@ -1642,12 +1760,14 @@ class HilSession:
         self.close()
 
     def send(self, data: bytes) -> None:
+        zoo_hil.checkpoint()
         self.serial.write(data)
         self.serial.flush()
 
     def line_until(self, prefix: str, timeout: float) -> str:
         deadline = time.monotonic() + timeout
         while time.monotonic() < deadline:
+            zoo_hil.checkpoint()
             line = self.serial.readline().decode("ascii", "replace").strip()
             # Firmware logs and HIL replies share native USB CDC. A log write
             # can race the reply and prefix it on the same physical line; the
@@ -1787,7 +1907,8 @@ class HilSession:
     def seed_favourite_nodes(self) -> dict[str, str]:
         result = parse_fields(self.exchange(b"Z", "@@FSEED"), "@@FSEED")
         require_fields(result, {"ok": "1", "target": "00fa7702", "selected": "00fa7702"})
-        self.wait_state({"mode": "nodes", "selected": "00000000"})
+        # @@FSEED checks the actual list cursor; @@STATE.selected is the last open DM.
+        self.wait_state({"mode": "nodes"})
         return result
 
     def reaction_state(self) -> dict[str, str]:
@@ -1851,6 +1972,7 @@ class HilSession:
         frames: list[dict[str, object]] = []
         transport_error: DemoCaptureTransportError | None = None
         while time.monotonic() < deadline:
+            zoo_hil.checkpoint()
             line = self.serial.readline().decode("ascii", "replace").strip()
             if line.startswith("@@SHOT "):
                 parts = line.split()
@@ -2087,6 +2209,25 @@ def smoke(fixture: dict[str, object], artifacts: Path) -> Report:
 
             report.check("ui/about", about_case)
 
+            def input_help_case():
+                session.key("!", {"mode": "settings", "set_sel": "0"})
+                for selected in range(1, 5):
+                    session.key("D", {"mode": "settings", "set_sel": str(selected)})
+                session.key("~", {"mode": "settings", "set_section": "2"})
+                for selected in range(1, 9):
+                    session.key("D", {"mode": "settings", "set_sel": str(selected)})
+                session.key("~", {"mode": "inputhelp"})
+                first = session.frame("inputhelp")
+                session.key(">", {"mode": "inputhelp"})
+                second = session.frame("inputhelp")
+                if first["fnv"] == second["fnv"]:
+                    raise HilError("RU help page did not change")
+                returned = session.key("^", {"mode": "settings", "set_section": "2", "set_sel": "8"})
+                session.home()
+                return {"pages": [first, second], "returned": returned}
+
+            report.check("ui/input-help/settings-pages-back", input_help_case)
+
             def distinct_frames_case():
                 unique = len(set(digests))
                 if unique < 5:
@@ -2189,6 +2330,69 @@ def message_flow(fixture: dict[str, object], artifacts: Path) -> Report:
             return {"collision_retained": collided, "isolated_cleanup": cleared}
 
         report.check("ingress/packet-id-deduplication-is-per-sender", per_sender_packet_id_case)
+
+        def delete_confirmation_identity_case():
+            results = []
+            for is_channel in (False, True):
+                session.clear()
+                to = broadcast if is_channel else me
+                session.inject(make_text_frame(source, to, 0xDA01, "delete target", channel=2))
+                session.home()
+                session.key("\x08", {"mode": "chats"})
+                # This arrival changes the sorted row index between Del/Enter.
+                session.inject(make_text_frame(colliding_source, to, 0xDA02, "must survive", channel=3))
+                result = session.key("~", {"mode": "chats", "messages": "1"})
+                require_fields(result, {"from": f"{colliding_source:08x}", "id": "0000da02"})
+                results.append(result)
+            session.clear()
+            return {"dm_and_channel": results}
+
+        report.check("ui/delete-confirmation-bound-across-incoming-message", delete_confirmation_identity_case)
+
+        def cyrillic_input_case():
+            session.clear()
+            session.inject(make_text_frame(source, me, 0x1090, "transliteration fixture"))
+            session.home()
+            session.key("~", {"mode": "node"})
+            probe = session.key("a", {"mode": "compose"})
+            if probe.get("compose") not in ("1", "2"):
+                raise HilError("cannot determine the original input language")
+            was_ru = probe["compose"] == "2"
+            session.key("^", {"mode": "node"})
+            if not was_ru:
+                session.key("\x0e", {"mode": "node"})  # physical Fn+L
+            results = []
+            try:
+                for keys, text in (
+                    ("s\x0f>\x1bch Schyot sch Shchuka shch SCH SHCH Wuka w Ashhabad", "сч Счёт сч Щука щ СЧ Щ Щука щ Ашхабад"),
+                    ("shch\x08sch s\t\rch", "сч с👍ч"),
+                    ("a" * 98 + "shch.sh", "а" * 98 + "ш."),
+                ):
+                    for key in keys:
+                        session.key(key, {})
+                    encoded = text.encode("utf-8")
+                    require_fields(session.query(), {"mode": "compose", "compose": str(len(encoded))})
+                    session.key("\x0f", {"mode": "inputhelp"})  # Fn+H never changes the draft
+                    first = session.frame("inputhelp")
+                    session.key(">", {"mode": "inputhelp"})
+                    second = session.frame("inputhelp")
+                    if first["fnv"] == second["fnv"]:
+                        raise HilError("RU help pages render identically")
+                    session.key("^", {"mode": "compose", "compose": str(len(encoded))})
+                    # The HIL transport constructs a local bubble but cannot radiate it.
+                    result = session.key("~", {"mode": "node", "radio_tx": "0"})
+                    require_fields(result, {"text_len": str(len(encoded)), "text_fnv": fnv1a32(encoded)})
+                    session.inject(make_routing_frame(source, me, int(result["id"], 16), 0))
+                    session.wait_state({"sending": "0"})
+                    results.append(result)
+            finally:
+                if not was_ru:
+                    session.key("\x0e", {})
+                session.clear()
+                session.home()
+            return {"drafts": results, "radio_tx": 0}
+
+        report.check("ui/cyrillic-sch-shch-editing-and-byte-limit", cyrillic_input_case)
 
         def incoming_case():
             text = "Привет из FromRadio 👋"
@@ -2482,7 +2686,8 @@ def message_flow(fixture: dict[str, object], artifacts: Path) -> Report:
 
         def companion_nodes_case():
             session.inject_companion(
-                make_companion_node_info(companion_me, battery=87, hops=0, last_heard=1_700_000_000)
+                make_companion_node_info(companion_me, long_name="Fixture radio", battery=87, hops=0,
+                                         last_heard=1_700_000_000, licensed=True, unmessagable=True)
             )
             for index in range(1, 66):
                 session.inject_companion(
@@ -2501,6 +2706,8 @@ def message_flow(fixture: dict[str, object], artifacts: Path) -> Report:
                     "nodes": "64", "seen": "66", "batt": "87",
                     "last": f"{companion_peer:08x}", "hops": "2", "key": "1",
                     "name_fnv": fnv1a32(b"Fixture 63"),
+                    "owner_present": "1", "owner_licensed": "1",
+                    "owner_unmessagable_present": "1", "owner_unmessagable": "1",
                 },
             )
             require_companion_ingress_heap(state)
@@ -2539,6 +2746,7 @@ def message_flow(fixture: dict[str, object], artifacts: Path) -> Report:
                     "my": f"{companion_me:08x}", "nodes": "0", "seen": "0",
                     "done": "0", "batt": "-1", "channel_present": "0",
                     "lora": "0", "preset": "0", "device": "0",
+                    "owner_present": "0",
                 },
             )
             session.inject_companion(
@@ -2884,12 +3092,33 @@ def full_run(
     fixture: dict[str, object], artifacts: Path, timeout: float, skip_build: bool = False,
     release_image: Path | None = None, factory_image: Path | None = None,
     config_backup: Path | None = None, production_wifi: bool = False,
+    production_wifi_soak_seconds: float = PRODUCTION_WIFI_MIN_SOAK_SECONDS,
+    require_zoo_hil: bool = False,
 ) -> int:
     """Run the complete safe suite and always put production firmware back."""
+    if require_zoo_hil and not production_wifi:
+        raise HilError("--require-zoo-hil requires --production-wifi")
+    if require_zoo_hil and "zoo_hil" not in fixture:
+        raise HilError("release HIL requires private zoo_hil coordination configuration")
+    lease = None
+    if "zoo_hil" in fixture:
+        lease = zoo_hil.Lease(fixture["zoo_hil"], require_production_wifi_config(fixture))
+    transport_mode = hil_tunnel.validate_fixture(fixture)
+    if transport_mode == "zoo-ssh" and not production_wifi:
+        raise HilError("zoo-ssh transport requires --production-wifi")
+    tunnel = (hil_tunnel.Tunnel(fixture["zoo_hil"], require_production_wifi_config(fixture), lease)
+              if transport_mode == "zoo-ssh" else None)
     if production_wifi:
+        production_wifi_soak_seconds = validate_production_wifi_soak_seconds(
+            production_wifi_soak_seconds
+        )
         require_production_wifi_config(fixture)
+        if lease is not None and production_wifi_soak_seconds + zoo_hil.RECOVERY_MARGIN >= zoo_hil.MAX_WINDOW:
+            raise HilError("production soak leaves insufficient room within Zoo's six-hour window")
         if release_image is None:
             raise HilError("production WiFi soak requires an exact --release-image")
+    elif production_wifi_soak_seconds != PRODUCTION_WIFI_MIN_SOAK_SECONDS:
+        raise HilError("--production-wifi-soak-seconds requires --production-wifi")
     if release_image is not None and factory_image is None:
         raise HilError("an exact --release-image requires its matching --factory-image")
     exact_release = validate_app_image(release_image) if release_image is not None else None
@@ -2911,6 +3140,7 @@ def full_run(
     configuration_restored = False
     configuration_check_failure_type: str | None = None
     production_wifi_evidence: dict[str, object] | None = None
+    production_wifi_progress: dict[str, object] = {}
     production_wifi_before: ProductionWifiSnapshot | None = None
     production_wifi_failure_type: str | None = None
     production_wifi_skipped = False
@@ -2918,7 +3148,7 @@ def full_run(
     filesystem_backup = filesystem_backup_for(configuration_backup)
     filesystem_captured = False
     filesystem_restored = False
-    with configuration_temporary_directory("meshtastic-adv-hil-config-") as temporary:
+    with configuration_temporary_directory("meshtastic-adv-hil-config-") as temporary, zoo_hil.scope(lease, tunnel):
         configuration_before: bytes | None = None
         staged_release: Path | None = None
         staged_factory: Path | None = None
@@ -2933,6 +3163,13 @@ def full_run(
             staged_factory, flash_layout, factory_sha256 = stage_factory_image(
                 exact_factory, staged_release, Path(temporary)
             )
+            if lease is not None:
+                print("acquiring exclusive Zoo HIL window", flush=True)
+                lease.start()
+                if tunnel is not None:
+                    print("opening private SSH PhoneAPI transport via Zoo", flush=True)
+                    tunnel.start()
+                zoo_hil.checkpoint()
             if production_wifi:
                 print("validating production WiFi NodeDB persistence floor", flush=True)
                 production_wifi_before = production_wifi_ready_dump(
@@ -2955,20 +3192,26 @@ def full_run(
                 fixture, filesystem_backup, flash_layout
             )
             filesystem_captured = True
+            zoo_hil.checkpoint()
             write_flash_marker(
                 configuration_backup, staged_release, staged_factory, filesystem_backup
             )
             flash_attempted = True
             flash(fixture, release=False)
+            zoo_hil.checkpoint()
             before = smoke(fixture, artifacts / "smoke-before")
             failures += before.failed
+            zoo_hil.checkpoint()
             messages = message_flow(fixture, artifacts / "message-flow")
             failures += messages.failed
+            zoo_hil.checkpoint()
             matrix = visual(fixture, artifacts / "visual", timeout)
             failures += matrix.failed
+            zoo_hil.checkpoint()
             after = smoke(fixture, artifacts / "smoke-after")
             failures += after.failed
-        except Exception as exc:
+            zoo_hil.checkpoint()
+        except BaseException as exc:
             # Keep evidence useful without copying exception text that could contain
             # fixture paths, identities or other lab-local details.
             failure_type = type(exc).__name__
@@ -2984,8 +3227,8 @@ def full_run(
                         raise HilError("production recovery image was not staged")
                     if staged_factory is None or not filesystem_captured:
                         raise HilError("production filesystem recovery image was not staged")
-                    restore_production_state(
-                        fixture, staged_release, staged_factory, filesystem_backup
+                    zoo_hil.recovery_call(
+                        restore_production_state, fixture, staged_release, staged_factory, filesystem_backup
                     )
                     restored = True
                     filesystem_restored = True
@@ -2996,27 +3239,33 @@ def full_run(
                 if restored and production_wifi:
                     if failure_type is None and failures == 0:
                         try:
+                            zoo_hil.checkpoint()
                             print("soaking restored production WiFi PhoneAPI", flush=True)
                             production_wifi_evidence = production_wifi_soak(
                                 fixture,
+                                minimum_seconds=production_wifi_soak_seconds,
+                                progress=production_wifi_progress,
                             )
+                            zoo_hil.checkpoint()
                         except Exception as exc:
                             production_wifi_failure_type = type(exc).__name__
+                            production_wifi_progress["phase"] = "failed"
+                            production_wifi_progress["failure_type"] = type(exc).__name__
                             production_wifi_error = exc
                     else:
                         production_wifi_skipped = True
 
                 if restored:
                     try:
-                        configuration_after = capture_config_fingerprint(
-                            fixture, Path(temporary), "after"
+                        configuration_after = zoo_hil.recovery_call(
+                            capture_config_fingerprint, fixture, Path(temporary), "after"
                         )
                         configuration_preserved = configuration_before == configuration_after
                         if not configuration_preserved:
                             print("restoring verified node configuration backup", flush=True)
-                            restore_config_backup(fixture, configuration_backup)
-                            repaired = capture_config_fingerprint(
-                                fixture, Path(temporary), "after-recovery"
+                            zoo_hil.recovery_call(restore_config_backup, fixture, configuration_backup)
+                            repaired = zoo_hil.recovery_call(
+                                capture_config_fingerprint, fixture, Path(temporary), "after-recovery"
                             )
                             configuration_restored = configuration_before == repaired
                             if not configuration_restored:
@@ -3028,6 +3277,23 @@ def full_run(
                         configuration_check_failure_type = type(exc).__name__
                         configuration_error = exc
 
+            if tunnel is not None:
+                tunnel.finish()  # Close every forwarding path before Zoo resumes.
+            transport_evidence = tunnel.evidence() if tunnel is not None else None
+            transport_failed = transport_evidence is not None and not transport_evidence["validated"]
+            if lease is not None:
+                # Every production dump closes in finally. USB restore/config
+                # cleanup has now finished; release must not precede any of it.
+                lease.finish()
+            zoo_evidence = lease.evidence() if lease is not None else None
+            zoo_failed = zoo_evidence is not None and not zoo_evidence["validated"]
+            if zoo_failed or transport_failed:
+                production_wifi_evidence = None
+                if production_wifi_progress:
+                    production_wifi_progress.update(validated=False, phase="failed",
+                                                    failure_type="ZooLeaseError" if zoo_failed else "TunnelError")
+                if failure_type is None:
+                    failure_type = "ZooLeaseError" if zoo_failed else "TunnelError"
             artifacts.mkdir(parents=True, exist_ok=True)
             summary_path = artifacts / "summary.json"
             summary = {
@@ -3046,6 +3312,10 @@ def full_run(
                 "production_wifi_skipped_after_hil_failure": production_wifi_skipped,
                 "production_wifi_failure_type": production_wifi_failure_type,
             }
+            if zoo_evidence is not None:
+                summary["zoo_hil"] = {**zoo_evidence, "required": require_zoo_hil}
+            if transport_evidence is not None:
+                summary["production_wifi_transport"] = transport_evidence
             if production_wifi_before is not None:
                 summary["production_wifi_before"] = {
                     "node_count": production_wifi_before.node_count,
@@ -3053,6 +3323,8 @@ def full_run(
                 }
             if production_wifi_evidence is not None:
                 summary["production_wifi"] = production_wifi_evidence
+            if production_wifi_progress:
+                summary["production_wifi_progress"] = production_wifi_progress
             if release_sha256 is not None:
                 summary["release_image_sha256"] = release_sha256
             if factory_sha256 is not None:
@@ -3071,6 +3343,10 @@ def full_run(
                 raise configuration_error
             if production_wifi_error is not None:
                 raise production_wifi_error
+            if zoo_failed and failure_type == "ZooLeaseError":
+                raise zoo_hil.ZooLeaseError("Zoo HIL ownership or release was not verified; run failed")
+            if transport_failed and failure_type == "TunnelError":
+                raise hil_tunnel.TunnelError("SSH transport or cleanup was not verified; run failed")
     return failures
 
 
@@ -3161,6 +3437,15 @@ def make_parser() -> argparse.ArgumentParser:
     run_cmd.add_argument(
         "--production-wifi", action="store_true",
         help="soak the restored exact production image with read-only full PhoneAPI config dumps",
+    )
+    run_cmd.add_argument(
+        "--require-zoo-hil", action="store_true",
+        help="fail before hardware unless the private fixture configures Zoo lease coordination",
+    )
+    run_cmd.add_argument(
+        "--production-wifi-soak-seconds", type=float,
+        default=PRODUCTION_WIFI_MIN_SOAK_SECONDS,
+        help="read-only production leak-soak duration (120..86400 seconds; default: 120)",
     )
     return parser
 
@@ -3267,10 +3552,12 @@ def main() -> int:
                 release_image=args.release_image, factory_image=args.factory_image,
                 config_backup=args.config_backup,
                 production_wifi=args.production_wifi,
+                production_wifi_soak_seconds=args.production_wifi_soak_seconds,
+                require_zoo_hil=args.require_zoo_hil,
             )
             print(f"artifacts: {artifacts}")
             return 1 if failures else 0
-    except (HilError, subprocess.CalledProcessError) as exc:
+    except (HilError, zoo_hil.ZooLeaseError, hil_tunnel.TunnelError, subprocess.CalledProcessError) as exc:
         print(f"HIL ERROR: {redact_lab_details(str(exc))}", file=sys.stderr)
         return 2
     return 2

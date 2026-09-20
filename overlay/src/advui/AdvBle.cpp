@@ -1,6 +1,7 @@
 #include "AdvBle.h"
 #include "AdvNodeCount.h"
 #include "AdvStorage.h"
+#include "AdvPendingSend.h"
 #include "BluetoothCommon.h" // MESH_SERVICE_UUID + characteristic UUIDs
 #include "DebugConfiguration.h"
 #include "Throttle.h"
@@ -70,6 +71,7 @@ portMUX_TYPE g_stateMux = portMUX_INITIALIZER_UNLOCKED;
 constexpr int kRxDepth = 6;
 constexpr int kTxDepth = 4, kTxSlot = 300;
 struct TxFrame {
+    uint32_t packetId;
     uint16_t len;
     uint8_t data[kTxSlot];
 };
@@ -79,6 +81,9 @@ struct CompanionBuffers {
     meshtastic_Channel channels[8];
     meshtastic_Config_LoRaConfig lora;
     meshtastic_Config_DeviceConfig device;
+    meshtastic_User owner;
+    bool ownerValid;
+    PendingSends<8> pending; // no heap growth; at most eight unacknowledged sends
     StaticQueue_t rxQueueState;
     uint8_t rxQueueStorage[kRxDepth * sizeof(BleFrame)];
     StaticQueue_t txQueueState;
@@ -197,6 +202,10 @@ bool bleUpdateCompNodeNames(uint32_t num, const char *longName, const char *shor
     if (!g_buffers)
         return false;
     StateGuard guard;
+    if (num == g_linkMyNode.load(std::memory_order_relaxed) && g_buffers->ownerValid) {
+        snprintf(g_buffers->owner.long_name, sizeof(g_buffers->owner.long_name), "%s", longName ? longName : "");
+        snprintf(g_buffers->owner.short_name, sizeof(g_buffers->owner.short_name), "%s", shortName ? shortName : "");
+    }
     const int count = g_compNodeCount.load(std::memory_order_relaxed);
     for (int i = 0; i < count; i++)
         if (g_buffers->nodes[i].num == num) {
@@ -215,6 +224,17 @@ bool bleCopyCompChannel(int index, meshtastic_Channel *out)
         return false;
     StateGuard guard;
     *out = g_buffers->channels[index];
+    return true;
+}
+
+bool bleCopyCompOwner(meshtastic_User *out)
+{
+    if (!out || !g_buffers)
+        return false;
+    StateGuard guard;
+    if (!g_buffers->ownerValid)
+        return false;
+    *out = g_buffers->owner;
     return true;
 }
 
@@ -273,7 +293,7 @@ bool bleNextPacket(BleFrame *frame)
     return frame && g_rxQueue && xQueueReceive(g_rxQueue, frame, 0) == pdTRUE;
 }
 
-bool bleQueueToRadio(const uint8_t *buf, uint16_t len)
+bool bleQueueToRadio(const uint8_t *buf, uint16_t len, uint32_t packetId)
 {
 #ifdef ADVUI_HIL
     // USB HIL may exercise the companion decoder, but it must never enqueue a
@@ -281,17 +301,28 @@ bool bleQueueToRadio(const uint8_t *buf, uint16_t len)
     // reach a bonded node and make that node transmit into the live mesh.
     (void)buf;
     (void)len;
+    (void)packetId;
     g_txDrops.fetch_add(1);
     return false;
 #else
-    if (!g_txQueue || !buf || len > kTxSlot) {
+    if (!g_txQueue || !buf || !len || len > kTxSlot || g_linkState != BLE_CONNECTED) {
         g_txDrops.fetch_add(1);
         return false;
     }
-    TxFrame frame{len, {0}};
+    // Serialize admission with disconnect/reset, so no send escapes the failure
+    // sweep. Queue send is nonblocking and never performs GATT work here.
+    StateGuard guard;
+    if (g_linkState != BLE_CONNECTED ||
+        (packetId && !g_buffers->pending.add(packetId, millis(), 10 * 60 * 1000UL))) {
+        g_txDrops.fetch_add(1);
+        return false;
+    }
+    TxFrame frame{packetId, len, {0}};
     memcpy(frame.data, buf, len);
     if (xQueueSend(g_txQueue, &frame, 0) == pdTRUE)
         return true;
+    if (packetId)
+        g_buffers->pending.forget(packetId);
     g_txDrops.fetch_add(1);
     return false;
 #endif
@@ -299,6 +330,22 @@ bool bleQueueToRadio(const uint8_t *buf, uint16_t len)
 
 uint32_t bleRxDrops() { return g_rxDrops.load(); }
 uint32_t bleTxDrops() { return g_txDrops.load(); }
+
+void bleForgetPendingSend(uint32_t packetId)
+{
+    if (!g_buffers || !packetId)
+        return;
+    StateGuard guard;
+    g_buffers->pending.forget(packetId);
+}
+
+bool bleNextSendFailure(uint32_t *packetId, uint8_t *error)
+{
+    if (!g_buffers || !packetId || !error)
+        return false;
+    StateGuard guard;
+    return g_buffers->pending.popFailure(millis(), meshtastic_Routing_Error_NO_RESPONSE, packetId, error);
+}
 
 namespace
 {
@@ -327,8 +374,10 @@ void resetCompanionState()
         g_compNodeCount.store(0, std::memory_order_relaxed);
         g_compNodesSeen.store(0, std::memory_order_relaxed);
         if (haveBuffers) {
+            g_buffers->pending.fail(0, meshtastic_Routing_Error_NO_INTERFACE);
             memset(g_buffers->nodes, 0, sizeof(g_buffers->nodes));
             memset(g_buffers->channels, 0, sizeof(g_buffers->channels));
+            g_buffers->ownerValid = false;
         }
         g_compPreset.store(0, std::memory_order_relaxed);
         if (haveBuffers)
@@ -362,6 +411,7 @@ void beginCompanionConfigStream(uint32_t myNode)
     StateGuard guard;
     memset(g_buffers->nodes, 0, sizeof(g_buffers->nodes));
     memset(g_buffers->channels, 0, sizeof(g_buffers->channels));
+    g_buffers->ownerValid = false;
     const meshtastic_Config_LoRaConfig freshLora = meshtastic_Config_LoRaConfig_init_default;
     const meshtastic_Config_DeviceConfig freshDevice = meshtastic_Config_DeviceConfig_init_default;
     g_buffers->lora = freshLora;
@@ -599,6 +649,10 @@ bool routeFromRadio(const uint8_t *bytes, uint16_t len)
     case meshtastic_FromRadio_node_info_tag: {
         const meshtastic_NodeInfo &ni = fr.node_info;
         StateGuard guard;
+        if (ni.num == g_linkMyNode.load(std::memory_order_relaxed) && ni.has_user) {
+            g_buffers->owner = ni.user;
+            g_buffers->ownerValid = true;
+        }
         const int nodeCount = g_compNodeCount.load(std::memory_order_relaxed);
         int slot = -1;
         for (int i = 0; i < nodeCount; i++)
@@ -696,8 +750,13 @@ void pumpLoop()
         while (g_toRadio && g_txQueue && xQueueReceive(g_txQueue, &tx, 0) == pdTRUE) { // outbound first
             bool ok = g_toRadio->writeValue(tx.data, tx.len, true);
             LOG_INFO("advui: toRadio write %s (%u bytes)", ok ? "ok" : "FAILED", (unsigned)tx.len);
-            if (!ok)
+            if (!ok) {
                 g_txDrops.fetch_add(1);
+                if (tx.packetId) {
+                    StateGuard guard;
+                    g_buffers->pending.fail(tx.packetId, meshtastic_Routing_Error_NO_INTERFACE);
+                }
+            }
         }
         if (g_fromNumPing.exchange(false)) {
             int n = 0;

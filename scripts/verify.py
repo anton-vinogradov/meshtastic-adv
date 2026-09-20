@@ -42,6 +42,14 @@ def parser() -> argparse.ArgumentParser:
         help="after USB HIL, soak the restored exact production image through read-only PhoneAPI dumps",
     )
     result.add_argument(
+        "--require-zoo-hil", action="store_true",
+        help="require exclusive Zoo coordination for the USB/production-WiFi release gate",
+    )
+    result.add_argument(
+        "--production-wifi-soak-seconds", type=float, default=120,
+        help="minimum production WiFi soak duration, forwarded to the HIL runner",
+    )
+    result.add_argument(
         "--release-image", type=Path,
         help="exact production app artifact restored after USB HIL (requires --usb)",
     )
@@ -84,6 +92,13 @@ def validate_args(args: argparse.Namespace, source: argparse.ArgumentParser) -> 
         source.error("--production-wifi requires --usb")
     if args.production_wifi and args.release_image is None:
         source.error("--production-wifi requires --release-image")
+    if getattr(args, "require_zoo_hil", False) and not args.production_wifi:
+        source.error("--require-zoo-hil requires --production-wifi")
+    seconds = getattr(args, "production_wifi_soak_seconds", 120)
+    if not 120 <= seconds <= 86400:
+        source.error("--production-wifi-soak-seconds must be in 120..86400")
+    if seconds != 120 and not args.production_wifi:
+        source.error("--production-wifi-soak-seconds requires --production-wifi")
     if args.rf and args.backup_root is None:
         source.error("--rf requires --backup-root")
     if (
@@ -166,6 +181,9 @@ def build_plan(args: argparse.Namespace, artifacts: Path) -> list[Stage]:
             usb_command.extend(("--config-backup", str(args.config_backup)))
         if args.production_wifi:
             usb_command.append("--production-wifi")
+            usb_command.extend(("--production-wifi-soak-seconds", str(getattr(args, "production_wifi_soak_seconds", 120))))
+        if getattr(args, "require_zoo_hil", False):
+            usb_command.append("--require-zoo-hil")
         stages.append(Stage("hardware/usb-cardputer", tuple(usb_command), hardware=True))
     if args.rf:
         rf_command = [
@@ -226,6 +244,7 @@ def run_stage(stage: Stage, log_path: Path) -> tuple[int, float]:
         for line in process.stdout:
             print(line, end="")
             log.write(line)
+            log.flush()
         return process.wait(), time.monotonic() - started
 
 

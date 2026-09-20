@@ -7,6 +7,18 @@ the suite allocates the complete companion arena, its local NodeDB uses the same
 its normal 100/150-slot profile and never allocates that arena. The
 published firmware never contains that protocol.
 
+Release host checks additionally execute the production SD transaction code
+against a fault-injecting filesystem (read failures, allocation failures, marker
+commit failures and retry), and selected production UI functions with host
+fixtures under AddressSanitizer/UBSan. These are not substitutes for physical
+SD/USB tests. The USB message-flow suite covers a new message arriving between
+Del and Enter for both DMs and channels, and companion owner snapshot flags.
+It also types `sch`/`w`/`shch` through the real RU keyboard path, exercises backspace
+and emoji insertion, and fills the compose buffer to its UTF-8 byte limit.
+The resulting local bubbles are checked byte-for-byte by length/hash; physical
+RF and BLE transmissions remain disabled. Fn+H page switching and return to an
+unchanged draft are exercised; both key-map pages are in the visual matrix.
+
 The HIL image leaves the user's LoRa configuration untouched, has an immutable
 final guard in `RadioLibInterface::send()`, and makes its ADV receive module ignore
 live RF. It also compiles the physical BLE-companion scan, connect, queue and
@@ -98,7 +110,130 @@ deadline inside a 180-second readiness window. Once the first complete snapshot
 is accepted, reconnects remain forbidden: a disconnect or reboot during the
 two-minute soak fails the release.
 
+Failed initial TCP streams are closed even when configuration never completes.
+Long soaks emit aggregate progress about once per minute and retain the last
+completed cycle, NodeDB count and reboot counter in `production_wifi_progress`
+when a later dump fails. Progress is diagnostic only: publication still requires
+the final `production_wifi.validated` evidence and all restoration/configuration
+checks. Keep other WiFi PhoneAPI clients disconnected during HIL: the embedded
+server supports one TCP client and a new connection replaces the previous one.
+
+### Sharing the Cardputer with meshtastic-zoo
+
+The release workflow requires `--require-zoo-hil`: Zoo must explicitly reserve
+the same DUT before the first TCP baseline. The local release fixture contains
+the control location, **never a lease token**. Add a top-level object such as:
+
+```json
+"zoo_hil": {
+  "transport": "ssh",
+  "ssh_host": "lab-zoo",
+  "python": "/opt/meshtastic-zoo/.venv/bin/python",
+  "helper": "/opt/meshtastic-zoo/collector/hilctl.py",
+  "socket": "/run/meshtastic-zoo-hil/control.sock"
+}
+```
+
+These are placeholders. `ssh_host` is a preconfigured SSH host alias for the
+service account; authentication and known host keys must already be provisioned
+on the trusted runner. The client uses batch mode and strict host-key checking,
+never auto-accepts keys, and never changes Zoo's configuration or restarts it.
+Zoo must already have its opt-in HIL server enabled, with the exact
+`production_wifi.host`/`expected_node_id` pair allowlisted. This integration
+supports an explicit IPv4 address on TCP 4403, not DNS/subnet discovery. For a
+runner on the same machine, use only
+`{"transport":"unix","socket":"/run/meshtastic-zoo-hil/control.sock"}`.
+
+The runner builds/stages its recovery images first, acquires the window before
+any DUT TCP baseline, and renews it independently every 30 seconds with a
+120-second TTL. Only explicit `busy` replies may be retried during acquisition
+(up to 30 seconds); transport errors and ambiguous replies stop the attempt.
+After acquisition, **no reacquisition or retry can hide lost ownership**.
+Tokens exist only in memory and JSON stdin/private replies, not in SSH command
+arguments, fixture files or evidence. Summary contains only aggregate booleans
+and a renewal count under `zoo_hil`.
+The ownership clock also counts host suspension; a backwards clock step fails
+closed instead of accidentally extending a window after sleep or clock correction.
+
+Ownership covers USB HIL, production/LittleFS restoration, the unchanged strict
+WiFi soak and final configuration comparison. Device TCP sessions close before
+release. A lost lease, late/wrong receipt, Zoo restart, or missing release
+acknowledgement fails the run even if behavioral assertions had passed. The
+manual release-finish workflow also requires this evidence; earlier runs without
+Zoo coordination are not sufficient for this updated gate.
+
+Tests stop at guarded operation boundaries; an already-running flash or bounded
+configuration-export subprocess is not forcibly killed mid-operation. SDK
+connection/config waits keep their existing bounded timeouts. Crucially, USB
+production/filesystem/configuration **safety recovery remains allowed after
+lease loss**; successful recovery cannot turn that failed test into a pass.
+An abrupt process kill cannot run Python cleanup: Zoo's TTL resumes monitoring
+attempts, while the existing identity-bound CI recovery step and durable flash
+marker protect the device. No token is persisted for later takeover.
+
+Zoo caps a window at six hours. The runner rejects requested soak durations that
+leave less than its 30-minute reserve; actual setup/recovery time still counts
+toward the cap. Four-hour local soaks are supported. The tag workflow retains its
+existing 120-second minimum WiFi gate and 150-minute job timeout; changing that
+job into a four-hour gate also requires increasing its timeout/recovery budget.
+
+#### Route-independent WiFi testing through Zoo
+
+When USB belongs to the Mac but the Zoo host has the appropriate LAN path to the
+DUT, set this top-level field in the **private** runner fixture (including
+`HIL_FIXTURE_JSON` for CI):
+
+```json
+"production_wifi_transport": "zoo-ssh"
+```
+
+The existing `zoo_hil` must use SSH. In this mode its `ssh_host` must be a real
+resolvable hostname or address, not an alias defined only in `~/.ssh/config`.
+The forwarding process ignores SSH configuration files to prevent unrelated
+forwardings or local commands. It uses the current account's default keys/agent
+and existing known-hosts file, with batch authentication and strict host-key
+checking. Provision that access once; no administrator password, Mac route
+change, remote installation or Zoo restart is required for a run.
+
+One SSH connection starts **after** Zoo admission and forwards a private local
+Unix socket to the same fixture-pinned DUT TCP 4403. There is no network listener
+on the Mac. The HIL code, SDK, original node-ID checks, timeouts and exact release
+image remain unchanged; only the socket path differs. A `/bin/cat` lifetime
+channel on the server receives no data or files and exits when its controller's
+pipe closes. The controller does not daemonize the tunnel.
+
+Tunnel loss is sticky and aborts the test at the next guarded operation; there
+is no reconnect or fallback to a direct connection. USB safety recovery remains
+available after tunnel or lease loss. All PhoneAPI connections and the tunnel
+close before the Zoo window is released. The summary adds aggregate
+`production_wifi_transport` evidence (`started`, `healthy`, `closed`, `validated`),
+without hostnames, socket paths, credentials or payloads. Both the ordinary gate
+and manual publication finishing reject a failed transport.
+
+Omitting the field, or setting it to `direct`, retains the original local TCP
+transport. Selecting `zoo-ssh` does not turn an earlier direct-path failure into
+a pass: the exact candidate must complete a fresh HIL run on the selected path.
+This setup still needs the Mac awake and the Cardputer attached for USB work;
+it removes the manual Terminal authorization step, not that physical dependency.
+
+`--require-zoo-hil` fails before hardware if coordination is missing. A configured
+`zoo_hil` is used automatically even without that flag. A local fixture without
+the object preserves standalone development behavior, but cannot pass the new
+tag gate. Recovery-only `hil.py restore` does not acquire a new window or claim a
+successful HIL run.
+
+Enabling/updating the Zoo server is a separate, operator-approved deployment: its
+one-time restart briefly disconnects all Zoo sessions. Once enabled, the window
+affects only the pinned DUT. Other Meshtastic applications remain outside Zoo's
+control and can still interfere; this is not a global network lock. Release
+acknowledgement proves Zoo accepted the return, not that an offline device has
+already reconnected; physical acceptance must check its subsequent status.
+
 ## Run
+
+Host verification needs Python, a C++17 compiler with AddressSanitizer/UBSan,
+and `jq` on PATH. The workflow tests run the real JSON evidence filters,
+including rejection of incomplete filesystem recovery or a failed WiFi soak.
 
 ```sh
 # All safe local checks, both firmware images and both size budgets. Hardware is
@@ -117,6 +252,24 @@ python3 scripts/verify.py --rf --usb \
 
 # Complete fail-safe cycle: build both images, test, and always restore release.
 python3 scripts/hil.py run
+
+# Extended production leak soak after the same fail-safe HIL cycle. The exact
+# production app and LittleFS are restored first; then read-only full PhoneAPI
+# dumps exercise connection teardown for four hours while reboot count and the
+# persisted NodeDB floor remain gated. No mesh, admin or chat write is sent.
+python3 scripts/hil.py run \
+  --release-image /absolute/path/to/firmware.bin \
+  --factory-image /absolute/path/to/firmware.factory.bin \
+  --config-backup /owner-only/recovery/config-before.yaml \
+  --production-wifi --require-zoo-hil --production-wifi-soak-seconds 14400
+
+# The same options are forwarded through the aggregate verification runner.
+# All firmware/host checks must already have passed before --hardware-only.
+python3 scripts/verify.py --hardware-only --skip-build --usb \
+  --release-image /absolute/path/to/firmware.bin \
+  --factory-image /absolute/path/to/firmware.factory.bin \
+  --config-backup /owner-only/recovery/config-before.yaml \
+  --production-wifi --require-zoo-hil --production-wifi-soak-seconds 14400
 
 # Release-equivalent run: after restoring these exact app bytes, receive full
 # config/NodeDB streams over WiFi and prove that the reboot counter stays fixed.
@@ -286,7 +439,7 @@ leaving a thread and the explicit persistence path still flush synchronously.
 This is deliberately a hybrid fixture model. Behavioral input scenarios live on the host
 and are encoded as ordinary `FromRadio` protobufs; the device consumes them in
 RAM and, where persistence is under test, writes only its HIL namespace. Direct
-`Msg` array seeding is reserved for the 35-screen visual/stress matrix, where the
+`Msg` array seeding is reserved for the 37-screen visual/stress matrix, where the
 decoder is not the subject and dense state is useful. Writing production storage
 files directly would skip exactly the parsing, deduplication and migration logic
 the release gate is meant to verify.

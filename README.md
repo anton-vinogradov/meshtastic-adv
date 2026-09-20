@@ -11,7 +11,7 @@
 A from-scratch on-device UI focused on one thing: making it genuinely comfortable to **message people over the mesh** from a pocket QWERTY device — no phone required — while keeping the proven Meshtastic radio stack underneath. No LoRa cap? [Companion mode](#companion-mode-drive-another-node-over-ble) turns the Cardputer into a terminal for a Heltec / T-Beam / RAK you already own.
 
 <p align="center">
-  <img src="docs/img/demo.gif?sha256=26ee131a27ec1cbf4493ad4dcddf4df02b4b8a8adce2a5975e34390c60be8ccc" width="72%" alt="Meshtastic ADV: opening an unread chat, typing with emoji, receiving an acknowledgement and reply, reacting, then sending a quoted Cyrillic reply"/>
+  <img src="docs/img/demo.gif?sha256=788297130a811d3d1fd3bc6bdb2acdd835e52146473aacfbbbebb37011ae179e" width="72%" alt="Meshtastic ADV: opening an unread chat, typing with emoji, receiving an acknowledgement and reply, reacting, then sending a quoted Cyrillic reply"/>
   <br/><sub>16-second demo · real firmware UI with a synthetic conversation</sub>
 </p>
 

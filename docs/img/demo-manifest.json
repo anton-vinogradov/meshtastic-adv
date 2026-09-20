@@ -20,25 +20,25 @@
       "name": "a03",
       "label": "compose-o",
       "delay_ms": 220,
-      "sha256": "f74852d875c26f580b97da66840788c1deebae50d77ff9a80688bc436bc4be2f"
+      "sha256": "d79990ec868ffa67562c9cd9f4de85807bc909ca1aefe6e6c3117b7f54416480"
     },
     {
       "name": "a04",
       "label": "compose-on-m",
       "delay_ms": 220,
-      "sha256": "bca269e9873208d87533daf4b82a4d6190a3aa19afd0fafd95f4abc0eb55da69"
+      "sha256": "486a78350c94f8f9c58d21fb4f94dbd49f078df8e0d9d226e01ffec3a1522a8f"
     },
     {
       "name": "a05",
       "label": "compose-on-my-w",
       "delay_ms": 220,
-      "sha256": "820ad4816374e35ba0aa64c6d561fa00df1f4f5b5c93d8d770d971cb18b61461"
+      "sha256": "29ea7462bcb45413cc76e4416278e14f63a49ccef3a0ff5b358f5638b53f2738"
     },
     {
       "name": "a06",
       "label": "compose-on-my-way",
       "delay_ms": 400,
-      "sha256": "2d89914c19a1c3580f792a2d8b142317848d3a6dd80aa90d21a7d1898abcc9b9"
+      "sha256": "aad5cd8fed2b87b952553c1c2e6c271e1bc2cc66d5a127a3f194a630a36879d1"
     },
     {
       "name": "a07",
@@ -50,7 +50,7 @@
       "name": "a08",
       "label": "compose-with-emoji",
       "delay_ms": 600,
-      "sha256": "0e4e71b4309bed745fed71dd61216ff98c6b7ec3c3a5cd3c3839c5de843265ac"
+      "sha256": "a43b850adf1d5bad9af70318618f73406bb577f88a64f6f73500c4b1661d44be"
     },
     {
       "name": "a09",
@@ -86,19 +86,19 @@
       "name": "a14",
       "label": "quoted-compose-start",
       "delay_ms": 600,
-      "sha256": "ca655505e7e4a56d3e9200f0974a69389897b0aa1a757714ef6a2f4d04f84a58"
+      "sha256": "bd4cafbe861ed6a3b7c19f38c0a62bf207f1b92f7ee88bd20eb06d1a3677da18"
     },
     {
       "name": "a15",
       "label": "quoted-compose-cyrillic",
       "delay_ms": 300,
-      "sha256": "6bbe79da9762146621748ffb68daf95b9cc3cb56b358c7b5aa17486f5936f81f"
+      "sha256": "3aac3f545fbe5c2f3e7a90a10cb9907ff23350cec4a9b33476f3c11e05addf12"
     },
     {
       "name": "a16",
       "label": "quoted-compose-complete",
       "delay_ms": 700,
-      "sha256": "2ed1afe451819661cb3fc437abea554fa6c3e9caf93c07b23b2f31241ddb4f90"
+      "sha256": "2cca88afb62e2da780c599206b68a1e0464ced91f8c1d6935c9d32ab7e7ade34"
     },
     {
       "name": "a17",
@@ -122,15 +122,15 @@
   "outputs": {
     "hero": {
       "filename": "hero.gif",
-      "sha256": "3fa23ceffba3cde3c096444171154ff7ce81274406b153a9384b1b29d40d8768",
-      "bytes": 405729,
+      "sha256": "2face3e109f2975987768fd4690f92093d88799849c8a5c6b7454c96a4276c34",
+      "bytes": 405937,
       "width": 900,
       "height": 600
     },
     "screen": {
       "filename": "demo.gif",
-      "sha256": "26ee131a27ec1cbf4493ad4dcddf4df02b4b8a8adce2a5975e34390c60be8ccc",
-      "bytes": 168315,
+      "sha256": "788297130a811d3d1fd3bc6bdb2acdd835e52146473aacfbbbebb37011ae179e",
+      "bytes": 169147,
       "width": 960,
       "height": 540
     },

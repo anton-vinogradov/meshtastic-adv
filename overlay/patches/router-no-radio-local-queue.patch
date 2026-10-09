@@ -1,0 +1,16 @@
+diff --git a/src/mesh/Router.cpp b/src/mesh/Router.cpp
+--- a/src/mesh/Router.cpp
++++ b/src/mesh/Router.cpp
+@@ -231,7 +231,11 @@ meshtastic_QueueStatus Router::getQueueStatus()
+ {
+     if (!iface) {
+         meshtastic_QueueStatus qs;
+-        qs.res = qs.mesh_packet_id = qs.free = qs.maxlen = 0;
++        // advui-inject-no-radio-local-queue: local API requests still work.
++        // A zero-capacity status makes clients wait forever before sending them.
++        qs.res = qs.mesh_packet_id = 0;
++        qs.free = fromRadioQueue.numFree();
++        qs.maxlen = MAX_RX_FROMRADIO;
+         return qs;
+     } else
+         return iface->getQueueStatus();

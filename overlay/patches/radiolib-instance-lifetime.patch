@@ -1,0 +1,29 @@
+diff --git a/src/mesh/RadioLibInterface.cpp b/src/mesh/RadioLibInterface.cpp
+--- a/src/mesh/RadioLibInterface.cpp
++++ b/src/mesh/RadioLibInterface.cpp
+@@ -55,6 +55,15 @@ RadioLibInterface::RadioLibInterface(LockingArduinoHal *hal, RADIOLIB_PIN_TYPE cs, R
+ #endif
+ }
+ 
++RadioLibInterface::~RadioLibInterface()
++{
++    // advui-inject-radio-instance-lifetime: failed hardware probes are deleted.
++    // The main-loop poll must not keep a pointer to a freed radio. An older
++    // probe must not clear the singleton belonging to a newer live instance.
++    if (instance == this)
++        instance = nullptr;
++}
++
+ #ifdef ARCH_ESP32
+ // ESP32 doesn't use that flag
+ #define YIELD_FROM_ISR(x) portYIELD_FROM_ISR()
+diff --git a/src/mesh/RadioLibInterface.h b/src/mesh/RadioLibInterface.h
+--- a/src/mesh/RadioLibInterface.h
++++ b/src/mesh/RadioLibInterface.h
+@@ -166,5 +166,6 @@ class RadioLibInterface : public RadioInterface, public concurrency::NotifiedWorke
+   public:
+     RadioLibInterface(LockingArduinoHal *hal, RADIOLIB_PIN_TYPE cs, RADIOLIB_PIN_TYPE irq, RADIOLIB_PIN_TYPE rst,
+                       RADIOLIB_PIN_TYPE busy, PhysicalLayer *iface = NULL);
++    ~RadioLibInterface() override;
+ 
+     virtual ErrorCode send(meshtastic_MeshPacket *p) override;

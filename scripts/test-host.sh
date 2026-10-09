@@ -24,4 +24,5 @@ trap 'rm -rf "$build_dir"' EXIT
   -o "$build_dir/test_profile"
 "$build_dir/test_profile"
 "${PYTHON:-python3}" "$repo_dir/tests/native/test_ui.py"
+"${PYTHON:-python3}" "$repo_dir/tests/native/test_latin_rendering.py"
 echo "host hardening tests: OK"

@@ -3,6 +3,7 @@
 #include "AdvBle.h"
 #include "AdvVersion.h"
 #include "AdvFont.h"
+#include "AdvLatinFont.h"
 #include "AdvMeshCompat.h"
 #include "AdvOrder.h"
 #include "AdvStorage.h"
@@ -73,6 +74,12 @@ File openAdvFile(const char *path, const char *mode)
 
 // LovyanGFX wrapper for the embedded Cyrillic font — used for message text.
 const lgfx::U8g2font cyrFont(u8g2_font_9x15_t_cyrillic);
+
+int lineWidthEmotes(lgfx::LGFXBase *g, const char *s);
+int printLineEmotes(lgfx::LGFXBase *g, int x, int y, const char *s, uint16_t color, int emojiDy = 0);
+bool textNeedsUnicode(const char *s);
+int labelWidth(lgfx::LGFXBase *g, const char *s);
+void printLabel(lgfx::LGFXBase *g, int x, int y, const char *s, uint16_t color);
 
 extern uint8_t g_nameShort;
 
@@ -1684,8 +1691,36 @@ bool nodeLess(uint16_t a, uint16_t b)
 // Trim s in place until it fits within budget px in the current font.
 void fitWidth(lgfx::LGFXBase *g, char *s, int budget)
 {
-    while (s[0] && g->textWidth(s) > budget)
+    if (textNeedsUnicode(s))
+        g->setFont(&cyrFont);
+    while (s[0] && labelWidth(g, s) > budget)
         utf8TrimLast(s);
+}
+
+bool textNeedsUnicode(const char *s)
+{
+    while (*s)
+        if ((unsigned char)*s++ >= 0x80)
+            return true;
+    return false;
+}
+
+int labelWidth(lgfx::LGFXBase *g, const char *s)
+{
+    return textNeedsUnicode(s) ? lineWidthEmotes(g, s) : g->textWidth(s);
+}
+
+// Keep the existing proportional style for ASCII labels, but route Unicode
+// names through the same glyphs and advances as message text.
+void printLabel(lgfx::LGFXBase *g, int x, int y, const char *s, uint16_t color)
+{
+    if (textNeedsUnicode(s)) {
+        printLineEmotes(g, x, y, s, color);
+    } else {
+        g->setTextColor(color);
+        g->setCursor(x, y);
+        g->print(s);
+    }
 }
 
 // SNR -> 0..4 signal bars. 0 means no direct SNR (node heard only via relays).
@@ -2283,16 +2318,14 @@ void drawNodeRow(lgfx::LGFXBase *g, const meshtastic_NodeInfoLite *n, int y, boo
     char nm[28];
     const char *name = nodeName(n);
     if (name[0])
-        snprintf(nm, sizeof(nm), "%s", name);
+        utf8CopyValid(nm, sizeof(nm), name);
     else
         snprintf(nm, sizeof(nm), "!%08x", (unsigned)n->num);
 
     g->setFont(&lgfx::fonts::FreeSansBold9pt7b);
     g->setTextSize(1);
     fitWidth(g, nm, xBars - 6 - nameX);
-    g->setTextColor(fav ? 0xFFE0 : 0xFFFF); // favourite = yellow
-    g->setCursor(nameX, y + 2);
-    g->print(nm);
+    printLabel(g, nameX, y + 2, nm, fav ? 0xFFE0 : 0xFFFF); // favourite = yellow
 }
 
 void drawFooter(lgfx::LGFXBase *g, const char *hint, uint16_t color = 0x630c)
@@ -2639,6 +2672,19 @@ int emoteMatch(const char *s, const graphics::Emote **em)
 }
 
 bool cpInvisible(uint32_t cp);
+bool flashFontCovers(uint32_t cp);
+
+int bitmapGlyphWidth(uint32_t cp)
+{
+    int width = latinGlyphWidth(cp);
+    return width ? width : sdGlyphWidth(cp);
+}
+
+int bitmapGlyph(uint32_t cp, uint8_t *out)
+{
+    int width = latinGlyph(cp, out);
+    return width ? width : sdGlyph(cp, out);
+}
 
 // Copies the leading run of `s` that fits `maxW` px in the current font into `out`
 // (breaking at a space when the line overflows), and returns how many bytes of `s`
@@ -2664,7 +2710,8 @@ int wrapLine(lgfx::LGFXBase *g, const char *s, int maxW, char *out, int outCap)
                 cb[0] = '?';
                 cb[1] = 0;
             }
-            tw = cpInvisible(rune.codepoint) ? 0 : g->textWidth(cb);
+            int gw = !flashFontCovers(rune.codepoint) ? bitmapGlyphWidth(rune.codepoint) : 0;
+            tw = cpInvisible(rune.codepoint) ? 0 : gw ? gw + 1 : g->textWidth(cb);
         }
         if (consumed > 0 && w + tw > maxW)
             break; // doesn't fit -> wrap here
@@ -2721,7 +2768,7 @@ int lineWidthEmotes(lgfx::LGFXBase *g, const char *s)
                 cb[1] = 0;
             }
             if (!cpInvisible(rune.codepoint)) {
-                int gw = !flashFontCovers(rune.codepoint) ? sdGlyphWidth(rune.codepoint) : 0;
+                int gw = !flashFontCovers(rune.codepoint) ? bitmapGlyphWidth(rune.codepoint) : 0;
                 w += gw ? gw + 1 : g->textWidth(cb);
             }
             s += rune.bytes;
@@ -2734,7 +2781,7 @@ int lineWidthEmotes(lgfx::LGFXBase *g, const char *s)
 // returns the x after the last glyph (for multi-colour spans on one line).
 // emojiDy nudges the bitmaps down to sit on the text's visual band (the 9x15 font
 // keeps ~3px of ascender space, so a 16px emoji rides high without it).
-int printLineEmotes(lgfx::LGFXBase *g, int x, int y, const char *s, uint16_t color, int emojiDy = 0)
+int printLineEmotes(lgfx::LGFXBase *g, int x, int y, const char *s, uint16_t color, int emojiDy)
 {
     g->setFont(&cyrFont);
     g->setTextSize(1);
@@ -2761,7 +2808,7 @@ int printLineEmotes(lgfx::LGFXBase *g, int x, int y, const char *s, uint16_t col
                 continue;
             }
             uint8_t bits[32];
-            int gw = !flashFontCovers(rune.codepoint) ? sdGlyph(rune.codepoint, bits) : 0;
+            int gw = !flashFontCovers(rune.codepoint) ? bitmapGlyph(rune.codepoint, bits) : 0;
             if (gw) { // unicode glyph, aligned onto the emoji band
                 g->drawBitmap(cx, y + (17 - 16) / 2 + emojiDy, bits, gw, 16, color);
                 cx += gw + 1;
@@ -2783,8 +2830,8 @@ void utf8Copy(char *out, const char *s, int maxBytes)
     utf8CopyValid(out, (size_t)maxBytes + 1, s);
 }
 
-// Strips codepoints we can't actually draw (anything beyond ASCII, Cyrillic and the
-// stock emoji bitmaps) — the 9x15 font renders those as boxes. In place.
+// Strips codepoints unavailable without the optional full font. The embedded
+// Latin bitmap subset and Cyrillic font must survive this compact-name filter.
 void sanitizeDisplay(char *s)
 {
     if (sdFontReady())
@@ -2805,8 +2852,8 @@ void sanitizeDisplay(char *s)
         bool ok = false;
         if (rune.valid && len == 1) {
             ok = (unsigned char)*p >= 0x20 && (unsigned char)*p < 0x7F;
-        } else if (rune.valid && len == 2) { // the font also covers Cyrillic
-            ok = rune.codepoint >= 0x400 && rune.codepoint <= 0x45F;
+        } else if (rune.valid) {
+            ok = flashFontCovers(rune.codepoint) || latinGlyphWidth(rune.codepoint);
         }
         if (ok) {
             memcpy(out + o, p, len);
@@ -2824,7 +2871,7 @@ void shortNameOf(uint32_t num, char *out, size_t cap)
 {
     meshtastic_NodeInfoLite *n = nodeByNum(num);
     if (n && nodeShortName(n)[0]) {
-        snprintf(out, cap, "%s", nodeShortName(n));
+        utf8CopyValid(out, cap, nodeShortName(n));
         sanitizeDisplay(out);
         if (out[0])
             return;
@@ -3419,13 +3466,12 @@ void AdvUI::drawChannelRow(int chIdx, int y)
         nameX = 18;
     }
     char nm[24];
-    snprintf(nm, sizeof(nm), "#%s", chanName(chIdx));
+    nm[0] = '#';
+    utf8CopyValid(nm + 1, sizeof(nm) - 1, chanName(chIdx));
     g->setFont(&lgfx::fonts::FreeSansBold9pt7b);
     g->setTextSize(1);
     fitWidth(g, nm, 232 - nameX);
-    g->setTextColor(chanFav(chIdx) ? 0xFFE0 : 0x07FF); // favourite = yellow, else cyan
-    g->setCursor(nameX, y + 2);
-    g->print(nm);
+    printLabel(g, nameX, y + 2, nm, chanFav(chIdx) ? 0xFFE0 : 0x07FF);
 }
 
 // Opens the combined-list entry (channels first, then filtered nodes).
@@ -3835,21 +3881,20 @@ void AdvUI::drawChats()
         // name
         char nm[40];
         if (c.isChan) {
-            snprintf(nm, sizeof(nm), "#%s", chanName(c.ch));
+            nm[0] = '#';
+            utf8CopyValid(nm + 1, sizeof(nm) - 1, chanName(c.ch));
         } else {
             meshtastic_NodeInfoLite *n = nodeByNum(c.node);
             const char *nn = n ? nodeName(n) : "";
             if (nn[0])
-                snprintf(nm, sizeof(nm), "%s", nn);
+                utf8CopyValid(nm, sizeof(nm), nn);
             else
                 snprintf(nm, sizeof(nm), "!%08x", (unsigned)c.node);
         }
         g->setFont(&lgfx::fonts::FreeSansBold9pt7b);
         g->setTextSize(1);
         fitWidth(g, nm, 236 - nameX - (tw ? tw + 6 : 0));
-        g->setTextColor(fav ? 0xFFE0 : (c.isChan ? 0x07FF : 0xFFFF));
-        g->setCursor(nameX, y);
-        g->print(nm);
+        printLabel(g, nameX, y, nm, fav ? 0xFFE0 : (c.isChan ? 0x07FF : 0xFFFF));
         // preview (second line): "> " for our own last message, sender name for channel
         // messages (many senders), inline emoji, truncated
         char pv[80];
@@ -4540,6 +4585,14 @@ void AdvUI::drawNode()
         pushFrame();
 }
 
+// Scroll only on complete UTF-8 codepoints, keeping the rightmost cursor visible.
+const char *visibleFieldTail(lgfx::LGFXBase *g, const char *s, bool unicode, int maxWidth)
+{
+    while (s[0] && (unicode ? lineWidthEmotes(g, s) : g->textWidth(s)) > maxWidth)
+        s += utf8Decode(s).bytes;
+    return s;
+}
+
 void AdvUI::drawSetName()
 {
     lgfx::LGFXBase *g = haveCanvas ? static_cast<lgfx::LGFXBase *>(&canvas) : static_cast<lgfx::LGFXBase *>(&display);
@@ -4553,7 +4606,8 @@ void AdvUI::drawSetName()
     g->print(editTitle(editTarget));
     g->drawFastHLine(0, 13, 240, 0x39C7);
 
-    if (editTarget == 0 || editTarget == 1 || editTarget == 3)
+    const bool unicodeField = editTarget == 0 || editTarget == 1 || editTarget == 3;
+    if (unicodeField)
         g->setFont(&cyrFont);
     else
         g->setFont(&lgfx::fonts::FreeSansBold9pt7b);
@@ -4561,11 +4615,13 @@ void AdvUI::drawSetName()
     g->setTextColor(0xFFFF);
     char field[sizeof(nameBuf) + 2];
     snprintf(field, sizeof(field), "%s_", nameBuf);
-    const char *shown = field; // keep the cursor visible for 64-byte WiFi/MQTT fields
-    while (shown[0] && g->textWidth(shown) > 228)
-        shown += utf8Decode(shown).bytes;
-    g->setCursor(6, 44);
-    g->print(shown);
+    const char *shown = visibleFieldTail(g, field, unicodeField, 228);
+    if (unicodeField)
+        printLineEmotes(g, 6, 44, shown, 0xFFFF);
+    else {
+        g->setCursor(6, 44);
+        g->print(shown);
+    }
 
     g->setFont(&lgfx::fonts::Font0);
     g->setTextSize(1);
@@ -4857,8 +4913,8 @@ void AdvUI::drawSettings()
     const bool compDeviceValid = g_radioCompanion && bleCopyCompDevice(&compDevice);
     if (g_radioCompanion) { // rows 0-5 show (and remote-admin edit) the linked node
         meshtastic_NodeInfoLite *me = g_linkMyNode ? nodeByNum(g_linkMyNode) : nullptr;
-        snprintf(vals[0], sizeof(vals[0]), "%s", me && nodeLongName(me)[0] ? nodeLongName(me) : "?");
-        snprintf(vals[1], sizeof(vals[1]), "%s", me && nodeShortName(me)[0] ? nodeShortName(me) : "?");
+        utf8CopyValid(vals[0], sizeof(vals[0]), me && nodeLongName(me)[0] ? nodeLongName(me) : "?");
+        utf8CopyValid(vals[1], sizeof(vals[1]), me && nodeShortName(me)[0] ? nodeShortName(me) : "?");
         snprintf(vals[2], sizeof(vals[2]), "%s", compLoraValid ? regionName(compLora.region) : "?");
         if (compLoraValid)
             snprintf(vals[3], sizeof(vals[3]), "%s", compLora.use_preset ? presetName(compLora.modem_preset) : "custom");
@@ -4868,10 +4924,10 @@ void AdvUI::drawSettings()
             snprintf(vals[4], sizeof(vals[4]), "%.3f", (double)compLora.override_frequency);
         else
             strcpy(vals[4], compLoraValid ? "auto" : "?");
-        snprintf(vals[5], sizeof(vals[5]), "%s", chanName(0));
+        utf8CopyValid(vals[5], sizeof(vals[5]), chanName(0));
     } else {
-        snprintf(vals[0], sizeof(vals[0]), "%s", owner.long_name[0] ? owner.long_name : "(unset)");
-        snprintf(vals[1], sizeof(vals[1]), "%s", owner.short_name[0] ? owner.short_name : "(unset)");
+        utf8CopyValid(vals[0], sizeof(vals[0]), owner.long_name[0] ? owner.long_name : "(unset)");
+        utf8CopyValid(vals[1], sizeof(vals[1]), owner.short_name[0] ? owner.short_name : "(unset)");
         snprintf(vals[2], sizeof(vals[2]), "%s", regionName(config.lora.region));
         snprintf(vals[3], sizeof(vals[3]), "%s", config.lora.use_preset ? presetName(config.lora.modem_preset) : "custom");
         if (config.lora.override_frequency > 0)
@@ -4883,7 +4939,7 @@ void AdvUI::drawSettings()
             snprintf(vals[4], sizeof(vals[4]), "%.3f", (double)RadioLibInterface::instance->getFreq());
         else
             strcpy(vals[4], "auto");
-        snprintf(vals[5], sizeof(vals[5]), "%s", channels.getName(0));
+        utf8CopyValid(vals[5], sizeof(vals[5]), channels.getName(0));
     }
     if (g_radioCompanion) { // LoRa/device rows mirror the linked node too
         snprintf(vals[6], sizeof(vals[6]), "%s",
@@ -4998,11 +5054,9 @@ void AdvUI::drawSettings()
         int lw = g->textWidth(rowLabel[i]);
 
         char vbuf[24];
-        snprintf(vbuf, sizeof(vbuf), "%s", rowVal[i]);
+        utf8CopyValid(vbuf, sizeof(vbuf), rowVal[i]);
         fitWidth(g, vbuf, 230 - (6 + lw));
-        g->setTextColor(0x9CD3);
-        g->setCursor(236 - g->textWidth(vbuf), y + 1);
-        g->print(vbuf);
+        printLabel(g, 236 - labelWidth(g, vbuf), y + 1, vbuf, 0x9CD3);
     }
 
     drawFooter(g, setSection < 0 ? "up/dn   ENTER open   ESC back" : "up/dn   ENTER edit   ESC sections");
@@ -5104,14 +5158,12 @@ void AdvUI::drawNetPage()
                 memset(v, '*', n);
                 v[n] = 0;
             } else {
-                strncpy(v, t, sizeof(v));
-                v[sizeof(v) - 1] = 0;
+                utf8CopyValid(v, sizeof(v), t);
             }
         }
         g->setTextColor(on ? 0x07E0 : 0x9CD3); // green when a toggle is on
         fitWidth(g, v, 230 - (6 + lw));
-        g->setCursor(236 - g->textWidth(v), y + 1);
-        g->print(v);
+        printLabel(g, 236 - labelWidth(g, v), y + 1, v, on ? 0x07E0 : 0x9CD3);
     }
 
 #if HAS_WIFI
@@ -5232,12 +5284,10 @@ void AdvUI::drawBleScan()
         g->setFont(&lgfx::fonts::FreeSansBold9pt7b);
         g->setTextSize(1);
         char nm[24];
-        snprintf(nm, sizeof(nm), "%s", hits[i].name[0] ? hits[i].name : hits[i].addr);
+        utf8CopyValid(nm, sizeof(nm), hits[i].name[0] ? hits[i].name : hits[i].addr);
         fitWidth(g, nm, 180);
         bool saved = g_peerAddr[0] && !strcmp(g_peerAddr, hits[i].addr);
-        g->setTextColor(saved ? 0xFFE0 : 0xFFFF); // the saved peer shows yellow
-        g->setCursor(6, y + 1);
-        g->print(nm);
+        printLabel(g, 6, y + 1, nm, saved ? 0xFFE0 : 0xFFFF); // the saved peer shows yellow
         char rb[10];
         snprintf(rb, sizeof(rb), "%ddB", hits[i].rssi);
         g->setFont(&lgfx::fonts::Font0);
@@ -5359,9 +5409,9 @@ void AdvUI::drawBleLink()
     g->setTextColor(0xFFFF);
     g->setCursor(6, 24);
     char nm[26];
-    snprintf(nm, sizeof(nm), "%s", g_peerName[0] ? g_peerName : g_peerAddr);
+    utf8CopyValid(nm, sizeof(nm), g_peerName[0] ? g_peerName : g_peerAddr);
     fitWidth(g, nm, 228);
-    g->print(nm);
+    printLabel(g, 6, 24, nm, 0xFFFF);
 
     const char *st;
     uint16_t sc;
@@ -6093,6 +6143,21 @@ void AdvUI::runDemoDump()
     mode = MODE_NODE;
     drawNode();
     screenshot("unicode");
+
+    // Nordic names and messages use the built-in Latin subset even with the
+    // optional full font installed. Identity/data here are RAM-only fixtures.
+    const uint8_t savedNameShort = g_nameShort;
+    beginDemoIdentity();
+    nodeSetNames(&g_demoPeerNode, "ÅÄÖ Nordic", "ÅÖ");
+    g_nameShort = 0;
+    g_msgCount = 0;
+    addMsg(kDemoPeer, kDemoMe, 0, t - 120, false, "Ä Å Ö / ä å ö", 0, MSG_IN);
+    addMsg(kDemoMe, kDemoPeer, 0, t - 60, false, "Æ Ø æ ø / É ñ ß", 0, MSG_DELIVERED);
+    selectedNum = kDemoPeer;
+    drawNode();
+    screenshot("nordic");
+    g_demoActive = false;
+    g_nameShort = savedNameShort;
 
     // Worst-case wrapping: 32 long messages produce far more than the 96-line
     // display ring. This exercises its eviction/anchor path on every release
@@ -7442,6 +7507,11 @@ int32_t AdvUI::runOnce()
             hilReactionState();
         } else if (sc == 'T') {
             hilMemoryState();
+        } else if (sc == 'U') {
+            // On-demand only: no extra traffic on the query-heavy @@STATE path.
+            Serial.printf("@@RADIO v=1 present=%u uptime=%u\n",
+                          RadioLibInterface::instance ? 1U : 0U, (unsigned)millis());
+            Serial.flush();
         } else if (sc == 'W') {
             const uint32_t before = ESP.getFreeHeap();
             screenSleep();

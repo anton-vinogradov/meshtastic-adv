@@ -20,6 +20,29 @@ SPEC.loader.exec_module(hil)
 
 
 class HilRunnerTests(unittest.TestCase):
+    def test_optional_radio_diagnostic_is_explicit_and_fail_closed(self):
+        state = {"v": "1", "present": "0", "uptime": "2200"}
+        self.assertEqual(hil.require_radio_presence(state, False), state)
+        with self.assertRaises(hil.HilError):
+            hil.require_radio_presence(state, True)
+        for invalid in ({}, {**state, "present": "yes"}, {**state, "uptime": "?"}, {**state, "v": "2"}):
+            with self.subTest(invalid=invalid), self.assertRaises(hil.HilError):
+                hil.require_radio_presence(invalid)
+
+    def test_fixture_radio_expectation_requires_a_boolean(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "fixture.json"
+            for value in (False, True, 0, 1, "false", None):
+                fixture = {"schema": 2, "devices": {"dut": {
+                    "usb_serial": "AA:BB:CC:DD:EE:FF", "expected_radio_present": value,
+                }}}
+                path.write_text(json.dumps(fixture))
+                if isinstance(value, bool):
+                    self.assertEqual(hil.load_fixture(path)["devices"]["dut"]["expected_radio_present"], value)
+                else:
+                    with self.assertRaises(hil.HilError):
+                        hil.load_fixture(path)
+
     def local_full_run(self, *args, **kwargs):
         """Exercise local defaults without inheriting the CI process identity."""
         with mock.patch.dict(hil.os.environ, {"GITHUB_ACTIONS": ""}):
@@ -602,8 +625,8 @@ class HilRunnerTests(unittest.TestCase):
         source = (ROOT / "overlay/src/advui/AdvUI.cpp").read_text()
         editor = source.split("void AdvUI::drawSetName()", 1)[1].split("bool AdvUI::applyName()", 1)[0]
         self.assertIn("char field[sizeof(nameBuf) + 2]", editor)
-        self.assertIn("while (shown[0] && g->textWidth(shown) > 228)", editor)
-        self.assertIn("shown += utf8Decode(shown).bytes", editor)
+        self.assertIn("visibleFieldTail(g, field, unicodeField, 228)", editor)
+        self.assertIn("printLineEmotes(g, 6, 44, shown, 0xFFFF)", editor)
 
     def test_advisory_epoch_write_cannot_overlap_a_message_burst(self):
         source = (ROOT / "overlay/src/advui/AdvUI.cpp").read_text()
@@ -659,23 +682,24 @@ class HilRunnerTests(unittest.TestCase):
         )
         self.assertEqual(hil.EXPECTED_DEMO_FRAMES[-19:], story_names)
         self.assertEqual(hil.EXPECTED_DEMO_FRAMES[-21:-19], ["ru1", "ru2"])
-        self.assertEqual(len(hil.EXPECTED_DEMO_FRAMES), 37)
+        self.assertIn("nordic", hil.EXPECTED_DEMO_FRAMES)
+        self.assertEqual(len(hil.EXPECTED_DEMO_FRAMES), 38)
 
     def test_visual_retries_one_transport_loss_after_a_proven_reboot(self):
         capture_one = mock.MagicMock()
-        capture_one.query.return_value = {"node": "00000001", "backend": "onboard", "boot": "one"}
+        capture_one.wait_ready.return_value = {"node": "00000001", "backend": "onboard", "boot": "one"}
         capture_one.demo_frames.side_effect = hil.DemoCaptureTransportError("lost row")
         verify_one = mock.MagicMock()
-        verify_one.wait_state.return_value = {"boot": "two"}
+        verify_one.wait_ready.return_value = {"boot": "two"}
         capture_two = mock.MagicMock()
-        capture_two.query.return_value = {"node": "00000001", "backend": "onboard", "boot": "two"}
+        capture_two.wait_ready.return_value = {"node": "00000001", "backend": "onboard", "boot": "two"}
         frames = [
             {"name": name, "sha256": f"{index:064x}", "colors": 4}
             for index, name in enumerate(hil.EXPECTED_DEMO_FRAMES, 1)
         ]
         capture_two.demo_frames.return_value = frames
         verify_two = mock.MagicMock()
-        verify_two.wait_state.return_value = {"boot": "three"}
+        verify_two.wait_ready.return_value = {"boot": "three"}
         sessions = [capture_one, verify_one, capture_two, verify_two]
         for session in sessions:
             session.__enter__.return_value = session

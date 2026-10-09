@@ -5,6 +5,40 @@ release notes remain available on the [GitHub Releases page](https://github.com/
 
 ## [Unreleased]
 
+## [1.1.2] - 2026-10-09
+
+### Fixed
+
+- Failed optional LoRa probes clear the RadioLib singleton before destroying
+  the driver, preventing a main-loop use-after-free when Cap LoRa-1262 is
+  absent (#110). The BLE companion no longer depends on a dangling radio pointer.
+- Without Cap, PhoneAPI reports the available local-request queue instead of a
+  permanently zero-capacity RF queue, preventing CLI/config-export stalls. Remote
+  transmissions still fail with `NO_INTERFACE`; no radio capability is simulated.
+- Nordic and other Latin-1 / Latin Extended-A letters render from a 3 KiB
+  built-in bitmap subset, without an SD mount or a separate Unicode partition
+  (#111). Node/channel names, compact sender labels and name editing use the
+  same Unicode rendering path as messages. Glyph widths also agree with line
+  wrapping, truncation and right-aligned settings values.
+
+### Tests
+
+- ASan/UBSan regressions execute the patched upstream radio constructor,
+  destructor and periodic poll across 2,000 failed probes and overlapping
+  instance lifetimes; a separate upstream reproducer confirms the original UAF.
+- A sanitizer test exercises the actual absent-radio queue-status function and
+  the pinned Python sender, including early status replies and an already empty
+  RF queue; the unpatched firmware reproduces the local API stall deterministically.
+- Native tests verify glyph provenance, exact Nordic bitmaps, font-independent
+  rendering, UTF-8-safe clipping and compact names. Every release HIL includes
+  Nordic UTF-8 ingress and a name/message frame, bringing the visual matrix to
+  38 frames. A private fixture can explicitly require Cap present/absent; the
+  on-demand diagnostic gates singleton lifetime across periodic main-loop polls.
+- Every USB HIL session waits for application readiness before mutating fixtures
+  or starting the demo capture. Slow absent-Cap startup has a bounded 60-second
+  window; a changed boot nonce still fails immediately, including outside a
+  named test case. Startup failure does not trigger fixture cleanup commands.
+
 ## [1.1.1] - 2026-09-20
 
 ### Fixed
@@ -485,7 +519,8 @@ The 1.0 release line delivered the following product and release-engineering sco
   cannot reuse stale output, and prereleases cannot enter stable distribution
   channels.
 
-[Unreleased]: https://github.com/anton-vinogradov/meshtastic-adv/compare/v1.1.1...HEAD
+[Unreleased]: https://github.com/anton-vinogradov/meshtastic-adv/compare/v1.1.2...HEAD
+[1.1.2]: https://github.com/anton-vinogradov/meshtastic-adv/compare/v1.1.1...v1.1.2
 [1.1.1]: https://github.com/anton-vinogradov/meshtastic-adv/compare/v1.1.0...v1.1.1
 [1.1.0]: https://github.com/anton-vinogradov/meshtastic-adv/compare/v1.0.19...v1.1.0
 [1.0.19]: https://github.com/anton-vinogradov/meshtastic-adv/compare/v1.0.18...v1.0.19

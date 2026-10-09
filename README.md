@@ -30,7 +30,7 @@ You get a device that boots straight into a usable messenger: pick a contact, ty
 - **📢 Channels** — read and broadcast to any channel, right alongside your DMs.
 - **✅ Delivery status** — every sent message shows *sending* (dot) → *delivered* (green check, from the routing ACK) → *failed* (red ✗ with the reason). For channel broadcasts, the check is an implicit mesh acknowledgement: a neighbour was heard relaying the packet.
 - **⌨️ Cyrillic input + 😀 emoji** — type Russian on the Latin keyboard via a live transliteration layer (**Fn+L**); receive/render non-Latin text and inline emoji bitmaps; a **Tab** palette inserts emoji.
-- **🈶 Broad Unicode glyph coverage** — CJK, Greek, Hebrew, Arabic and the rest of the Basic Multilingual Plane, plus emoji blocks, via a GNU Unifont partition the installer flashes automatically. The renderer is intentionally simple: complex-script shaping and bidirectional layout are not implemented, so Arabic/Hebrew display in code-point order (Latin/Cyrillic stay on the fast embedded font).
+- **🈶 Broad Unicode glyph coverage** — ASCII, Cyrillic and Latin-1 / Latin Extended-A letters (including Ä/Å/Ö) are built in, even without SD or a Unicode partition. CJK, Greek, Hebrew, Arabic and the rest of the Basic Multilingual Plane, plus emoji blocks, use the GNU Unifont partition the installer flashes automatically. The renderer is intentionally simple: complex-script shaping and bidirectional layout are not implemented, so Arabic/Hebrew display in code-point order.
 - **📇 Node list** — press **Tab** for the nodes currently known on-device, with a signal-bar meter (from SNR), hop count, last-heard age and role, in fixed columns.
 - **🔎 Contact search** — start typing to find a known node and start a new chat.
 - **⭐ Favourites** — flag contacts and channels; they get priority alerts.
@@ -52,7 +52,7 @@ Every `v*` tag is held until the exact source passes the hardware-free tests,
 both firmware builds and size budgets, then a real Cardputer ADV on a trusted
 runner. The physical gate is radio-silent and identity-bound; it replays ordinary
 serialized `FromRadio` traffic through the production decoder, drives the real UI,
-overflows and reloads persistent history, checks 37 framebuffer captures, reboots,
+overflows and reloads persistent history, checks 38 framebuffer captures, reboots,
 and finally restores and verifies the exact application bytes users will receive.
 That restored production image must then survive repeated complete, read-only WiFi
 config/NodeDB downloads for at least two minutes without a reconnect or reboot.
@@ -64,7 +64,7 @@ Release hardening changes and migration notes are kept in the [changelog](CHANGE
 
 The easiest way is the **[web installer](https://anton-vinogradov.github.io/meshtastic-adv/)** (ESP Web Tools):
 
-1. Attach the **LoRa antenna** to the Cap first — *never power the PA without it.*
+1. If using a Cap, attach its **LoRa antenna** first — *never power the PA without it.* The Cap is optional in BLE companion mode.
 2. Export your Meshtastic configuration from the official app before any full erase.
 3. Open the page in desktop **Chrome** or **Edge**, plug the Cardputer in with a **data** USB-C cable.
 4. Click **Install**. If the device isn't listed, hold **G0/BOOT** while connecting, then release.

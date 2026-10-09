@@ -35,7 +35,7 @@ HIL_ENV = "m5stack-cardputer-adv-advui-hil"
 RELEASE_ENV = "m5stack-cardputer-adv-advui"
 EXPECTED_DEMO_FRAMES = [
     "splash", "nodes", "chat", "react", "chats", "emoji", "settings", "lora", "utc",
-    "wifi", "mqtt", "unicode", "stress", "bscan", "bpin", "blink", "ru1", "ru2",
+    "wifi", "mqtt", "unicode", "nordic", "stress", "bscan", "bpin", "blink", "ru1", "ru2",
     *[f"a{i:02d}" for i in range(1, 20)],
 ]
 PRODUCTION_WIFI_MIN_SOAK_DUMPS = 8
@@ -48,6 +48,11 @@ PRODUCTION_WIFI_FINAL_QUIET_SECONDS = 15.0
 PRODUCTION_WIFI_CONNECT_TIMEOUT_SECONDS = 5
 PRODUCTION_WIFI_CONFIG_TIMEOUT_SECONDS = 90
 USB_BOOT_SETTLE_SECONDS = 20.0
+# Native USB may reset the S3 when a new host session opens. Failed optional
+# radio probes make that startup substantially slower than the attached-Cap
+# path (~36 s observed). Wait for the application, not merely USB enumeration,
+# before issuing fixture mutations or the non-idempotent demo command.
+HIL_USB_READY_SECONDS = 60.0
 DISPLAY_POWER_CYCLE_COUNT = 12
 DISPLAY_POWER_CYCLE_RETAINED_TOLERANCE = 512
 MAX_APP_IMAGE_BYTES = 3_000_000
@@ -381,6 +386,8 @@ def load_fixture(path: Path) -> dict[str, object]:
     if not isinstance(dut, dict) or not dut.get("usb_serial"):
         raise HilError("fixture is missing devices.dut.usb_serial")
     dut["usb_serial"] = normalize_serial(str(dut["usb_serial"]))
+    if "expected_radio_present" in dut and not isinstance(dut["expected_radio_present"], bool):
+        raise HilError("devices.dut.expected_radio_present must be a boolean")
     if "expected_region" in dut:
         region = str(dut["expected_region"]).strip().upper()
         if region not in REGION_CODES:
@@ -1730,7 +1737,7 @@ def dut_evidence(device: dict[str, object]) -> dict[str, object]:
         "kind": device.get("kind", "unknown"),
         "identity_verified": True,
     }
-    for name in ("expected_region", "expected_tx_power"):
+    for name in ("expected_region", "expected_tx_power", "expected_radio_present"):
         if name in device:
             evidence[name] = device[name]
     return evidence
@@ -1837,6 +1844,13 @@ class HilSession:
             time.sleep(0.2)
         raise HilError(f"state mismatch: expected {expected}, got {last}")
 
+    def wait_ready(self) -> dict[str, str]:
+        self.serial.reset_input_buffer()
+        # query binds the first observed boot nonce. A restart while waiting,
+        # or later in this session, still fails immediately; this is not a
+        # retry/reset policy and never sends a reboot or configuration write.
+        return self.wait_state({"splash": "1", "backend": "onboard"}, timeout=HIL_USB_READY_SECONDS)
+
     def home(self) -> dict[str, str]:
         for _ in range(3):
             self.send(b"X")
@@ -1916,6 +1930,9 @@ class HilSession:
 
     def memory_state(self) -> dict[str, str]:
         return parse_fields(self.exchange(b"T", "@@MEM"), "@@MEM")
+
+    def radio_state(self) -> dict[str, str]:
+        return parse_fields(self.exchange(b"U", "@@RADIO"), "@@RADIO")
 
     def display_power_cycle(self) -> dict[str, str]:
         result = parse_fields(self.exchange(b"W", "@@POWER", timeout=8), "@@POWER")
@@ -2124,6 +2141,15 @@ def require_scoped_heap_headroom(
     return values
 
 
+def require_radio_presence(state: dict[str, str], expected: bool | None = None) -> dict[str, str]:
+    require_fields(state, {"v": "1"})
+    if state.get("present") not in ("0", "1") or not state.get("uptime", "").isdigit():
+        raise HilError(f"invalid optional-radio diagnostic: {state}")
+    if expected is not None:
+        require_fields(state, {"present": "1" if expected else "0"})
+    return state
+
+
 def smoke(fixture: dict[str, object], artifacts: Path) -> Report:
     dut = resolve_role(fixture, "dut")
     report = Report("cardputer-adv-hil-smoke")
@@ -2134,7 +2160,7 @@ def smoke(fixture: dict[str, object], artifacts: Path) -> Report:
             state_box: dict[str, dict[str, str]] = {}
 
             def boot_case():
-                state = session.wait_state({"splash": "1"}, timeout=30)
+                state = session.wait_ready()
                 report.protect_node_id(state.get("node"))
                 state_box["boot"] = state
                 require_usb_wifi_node_identity(dut, state)
@@ -2155,6 +2181,19 @@ def smoke(fixture: dict[str, object], artifacts: Path) -> Report:
                 return state
 
             report.check("boot/protocol/peripherals", boot_case)
+
+            def radio_lifetime_case():
+                expected = dut.get("expected_radio_present")
+                before = require_radio_presence(session.radio_state(), expected)
+                # Cross multiple one-second main-loop IRQ polls, where #110 froze.
+                time.sleep(2.2)
+                after = require_radio_presence(session.radio_state(), expected)
+                if before["present"] != after["present"] or int(after["uptime"]) <= int(before["uptime"]):
+                    raise HilError("optional-radio lifetime/uptime changed unexpectedly")
+                state = session.query()  # HilSession also enforces the original boot nonce.
+                return {"before": before, "after": after, "boot": state.get("boot")}
+
+            report.check("boot/optional-radio-lifetime", radio_lifetime_case)
 
             def home_case():
                 state = session.home()
@@ -2251,6 +2290,8 @@ def smoke(fixture: dict[str, object], artifacts: Path) -> Report:
     except Exception as exc:
         message = report.redact(str(exc))
         if isinstance(exc, UnexpectedReboot):
+            if not report.cases or report.cases[-1].status != "failed" or report.cases[-1].message != message:
+                report.cases.append(Case("session", "failed", 0, message))
             print(f"ABORT session after unexpected reboot: {message}", flush=True)
         else:
             report.cases.append(Case("session", "failed", 0, message))
@@ -2272,10 +2313,20 @@ def message_flow(fixture: dict[str, object], artifacts: Path) -> Report:
     colliding_source = 0x000BEEF2
     broadcast = 0xFFFFFFFF
     session: HilSession | None = None
+    session_ready = False
     expected_after_persist: dict[str, str] = {}
     boot_before_persist = ""
     try:
         session = HilSession(str(dut["port"]))
+        startup_started = time.monotonic()
+        startup = session.wait_ready()
+        report.protect_node_id(startup.get("node"))
+        require_usb_wifi_node_identity(dut, startup)
+        session_ready = True
+        metadata["session_startup"] = {
+            "boot": startup["boot"],
+            "wait_seconds": round(time.monotonic() - startup_started, 3),
+        }
 
         def clean_start_case():
             state = session.clear()
@@ -2393,6 +2444,26 @@ def message_flow(fixture: dict[str, object], artifacts: Path) -> Report:
             return {"drafts": results, "radio_tx": 0}
 
         report.check("ui/cyrillic-sch-shch-editing-and-byte-limit", cyrillic_input_case)
+
+        def nordic_incoming_case():
+            session.clear()
+            try:
+                text = "Ä Å Ö ä å ö / Æ Ø æ ø / É ñ ß"
+                encoded = text.encode("utf-8")
+                session.inject(make_text_frame(source, me, 0x1110, text))
+                state = session.wait_state({"messages": "1", "incoming": "1"})
+                require_fields(state, {"text_len": str(len(encoded)), "text_fnv": fnv1a32(encoded)})
+                session.home()
+                session.key("~", {"mode": "node"})
+                frame = session.frame("node")
+                return {"state": state, "frame": frame}
+            finally:
+                # This case must not contaminate the next one after a failed
+                # digest/capture: its fixture and read flags are independent.
+                session.clear()
+                session.home()
+
+        report.check("ingress/incoming-nordic-dm", nordic_incoming_case)
 
         def incoming_case():
             text = "Привет из FromRadio 👋"
@@ -2996,13 +3067,15 @@ def message_flow(fixture: dict[str, object], artifacts: Path) -> Report:
         report.check("storage/persist-before-reboot", persist_case)
         session.close()
         session = None
+        session_ready = False
         time.sleep(3)
 
         def reboot_case():
-            nonlocal session
+            nonlocal session, session_ready
             live = wait_for_usb_serial(str(dut["usb_serial"]), timeout=20)
             session = HilSession(str(live["port"]))
-            restored = session.wait_state({"backend": "onboard"}, timeout=30)
+            restored = session.wait_ready()
+            session_ready = True
             require_fields(restored, expected_after_persist)
             restored_reactions = require_fields(
                 session.reaction_state(), {"react_exact": "2", "react_ambiguous": "0"}
@@ -3021,12 +3094,14 @@ def message_flow(fixture: dict[str, object], artifacts: Path) -> Report:
     except Exception as exc:
         message = report.redact(str(exc))
         if isinstance(exc, UnexpectedReboot):
+            if not report.cases or report.cases[-1].status != "failed" or report.cases[-1].message != message:
+                report.cases.append(Case("session", "failed", 0, message))
             print(f"ABORT session after unexpected reboot: {message}", flush=True)
         else:
             report.cases.append(Case("session", "failed", 0, message))
             print(f"FAIL session: {message}", flush=True)
     finally:
-        if session is not None:
+        if session is not None and session_ready:
             try:
                 # A reboot is fatal to the scenario, but the new boot still
                 # needs its isolated HIL files removed before production is
@@ -3037,6 +3112,7 @@ def message_flow(fixture: dict[str, object], artifacts: Path) -> Report:
                 message = report.redact(str(exc))
                 report.cases.append(Case("fixtures/final-cleanup", "failed", 0, message))
                 print(f"FAIL fixtures/final-cleanup: {message}", flush=True)
+        if session is not None:
             session.close()
     report.write(artifacts, metadata)
     return report
@@ -3055,9 +3131,9 @@ def visual(fixture: dict[str, object], artifacts: Path, timeout: float) -> Repor
         for attempt in range(2):
             capture_error: DemoCaptureTransportError | None = None
             with HilSession(str(live["port"])) as session:
-                state = session.query()
+                state = session.wait_ready()
                 report.protect_node_id(state.get("node"))
-                require_fields(state, {"backend": "onboard"})
+                require_usb_wifi_node_identity(dut, state)
                 boot_before = state["boot"]
                 try:
                     frame_data = session.demo_frames(artifacts / "frames", timeout)
@@ -3066,7 +3142,7 @@ def visual(fixture: dict[str, object], artifacts: Path, timeout: float) -> Repor
             time.sleep(3)  # runDemoDump ends with a transactional reboot
             live = wait_for_usb_serial(str(dut["usb_serial"]), timeout=20)
             with HilSession(str(live["port"])) as session:
-                restored = session.wait_state({"splash": "1", "backend": "onboard"}, timeout=30)
+                restored = session.wait_ready()
             if restored.get("boot") == boot_before:
                 raise HilError(f"visual reboot was not proven: boot nonce stayed {boot_before}")
             if capture_error is None:

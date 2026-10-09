@@ -81,7 +81,7 @@ class ReleaseWorkflowTests(unittest.TestCase):
             r'jq -e --argjson expected_frames "\$expected_frames" \'(.*?)\'\s+finish-hil/usb/visual/report.json',
             FINISH_WORKFLOW, re.S,
         ).group(1)
-        for expected, actual in ((35, 35), (37, 37), (37, 35), (35, 37)):
+        for expected, actual in ((35, 35), (37, 37), (38, 38), (37, 35), (35, 37), (38, 37), (37, 38)):
             payload = {"cases": [{"name": "visual/demo-matrix", "data": {
                 "frames": actual, "unique": actual,
                 "post_reboot": {"radio_tx": "0", "backend": "onboard", "mode": "chats"},

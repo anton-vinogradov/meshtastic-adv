@@ -135,6 +135,15 @@ if [ -f "$SAVE_PROTO_DB" ] && ! grep -q 'advui-inject-safe-write-result' "$SAVE_
 fi
 test "$(grep -c 'advui-inject-safe-write-result' "$SAVE_PROTO_DB" || true)" -eq 1
 
+# Failed optional-radio probes must not leave the main loop polling freed memory.
+RI="$FW/src/mesh/RadioLibInterface.cpp"
+if ! grep -q 'advui-inject-radio-instance-lifetime' "$RI"; then
+  git -C "$FW" apply "$ROOT/overlay/patches/radiolib-instance-lifetime.patch"
+  echo "injected failed-radio singleton lifetime handling"
+fi
+test "$(grep -c 'advui-inject-radio-instance-lifetime' "$RI" || true)" -eq 1
+grep -q '~RadioLibInterface() override;' "$FW/src/mesh/RadioLibInterface.h"
+
 # RadioLibInterface.cpp: USB HIL is an isolated test transport, never a radio
 # transmitter. USERPREFS_LORA_TX_DISABLED makes the ordinary boot config
 # receive-only, while this final interface guard is immutable even if a bonded
@@ -457,5 +466,13 @@ if grep -q '^void MeshService::sendToMesh' "$MS"; then
 fi
 grep -q '^ErrorCode MeshService::sendToMesh' "$MS"
 grep -q '^    ErrorCode sendToMesh' "$MSH"
+
+# Without an RF interface, PhoneAPI must advertise the local request queue.
+ROUTER="$FW/src/mesh/Router.cpp"
+if ! grep -q 'advui-inject-no-radio-local-queue' "$ROUTER"; then
+  git -C "$FW" apply "$ROOT/overlay/patches/router-no-radio-local-queue.patch"
+  echo "injected absent-radio local API queue status"
+fi
+test "$(grep -c 'advui-inject-no-radio-local-queue' "$ROUTER" || true)" -eq 1
 
 echo "overlay synced into $FW"

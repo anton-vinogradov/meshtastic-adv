@@ -84,6 +84,18 @@ the generator restricts the local file to its owner (`0600`). Merely
 listing a WiFi endpoint does not authorize transmissions or configuration
 changes: `init` records every endpoint as `read-only`.
 
+Optional-radio regression (#110): the boot suite requests a short, on-demand
+`@@RADIO` diagnostic and verifies that the singleton/uptime survives multiple
+one-second main-loop polls. To explicitly test a physically disconnected Cap,
+set `devices.dut.expected_radio_present` to `false` in a private fixture; use
+`true` for the attached-Cap pass. A mismatch fails, rather than silently testing
+the wrong hardware state. Power off before removing or attaching the Cap.
+The full suite also checks Nordic UTF-8 ingress and a `nordic` name/message
+frame; those letters come from an embedded 3 KiB subset, not SD allocation.
+Firmware CI also exercises the absent-radio local queue under sanitizers and
+the pinned Python sender. Local configuration reads must not wait for nonexistent
+RF queue capacity; outbound RF requests still fail with `NO_INTERFACE`.
+
 For an exact-release production soak, add this object below `devices.dut` in
 the private fixture (never commit the real values):
 
@@ -439,7 +451,7 @@ leaving a thread and the explicit persistence path still flush synchronously.
 This is deliberately a hybrid fixture model. Behavioral input scenarios live on the host
 and are encoded as ordinary `FromRadio` protobufs; the device consumes them in
 RAM and, where persistence is under test, writes only its HIL namespace. Direct
-`Msg` array seeding is reserved for the 37-screen visual/stress matrix, where the
+`Msg` array seeding is reserved for the 38-screen visual/stress matrix, where the
 decoder is not the subject and dense state is useful. Writing production storage
 files directly would skip exactly the parsing, deduplication and migration logic
 the release gate is meant to verify.
